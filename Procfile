@@ -1,0 +1,1 @@
+worker: python Cleaned11.py --api-key $API_KEY --api-secret $API_SECRET --symbol ETHUSDT --risk-pct 0.5
