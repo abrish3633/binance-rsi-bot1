@@ -1,1 +1,1 @@
-worker: python Cleaned11.py --api-key $API_KEY --api-secret $API_SECRET --symbol ETHUSDT --risk-pct 0.5
+worker: python "Enhanced Binance Futures Trading Bot.py" --symbol "BTCUSDT" --timeframe "5m" --max-trades 3 --risk-pct 1.0 --max-loss-pct 5.0 --tp-mult 3.5
