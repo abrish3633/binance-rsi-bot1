@@ -12,6 +12,9 @@ from telegram import Bot
 import asyncio
 import math
 from decimal import Decimal
+import hmac
+import hashlib
+from urllib.parse import urlencode
 
 # Configure logging
 logging.basicConfig(
@@ -53,9 +56,22 @@ class BinanceClient:
                 time.sleep(1)
         return 0.0
 
+    def _generate_signature(self, params: Dict) -> str:
+        query_string = urlencode(params)
+        return hmac.new(
+            self.api_secret.encode('utf-8'),
+            query_string.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+
     def _request(self, method: str, endpoint: str, params: Dict = None, signed: bool = False) -> Dict:
+        if params is None:
+            params = {}
         headers = {"X-MBX-APIKEY": self.api_key}
         url = urljoin(self.base_url, endpoint)
+        if signed:
+            params['timestamp'] = int((time.time() - self.time_offset) * 1000)
+            params['signature'] = self._generate_signature(params)
         try:
             response = requests.request(method, url, headers=headers, params=params)
             response.raise_for_status()
@@ -79,7 +95,8 @@ class BinanceClient:
 
     def set_leverage(self, symbol: str, leverage: int) -> None:
         endpoint = "/fapi/v1/leverage"
-        params = {"symbol": symbol, "leverage": leverage}
+        params = {"symbol": symbol, "leverage": leverage, "timestamp": int((time.time() - self.time_offset) * 1000)}
+        params['signature'] = self._generate_signature(params)
         self._request("POST", endpoint, params, signed=True)
         logger.info(f"Leverage set to {leverage}x for {symbol}")
 
@@ -90,9 +107,11 @@ class BinanceClient:
             "side": side,
             "type": order_type,
             "quantity": f"{quantity:.2f}",
+            "timestamp": int((time.time() - self.time_offset) * 1000)
         }
         if price:
             params["price"] = f"{price:.2f}"
+        params['signature'] = self._generate_signature(params)
         return self._request("POST", endpoint, params, signed=True)
 
 class TradingBot:
