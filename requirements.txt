@@ -1,4 +1,4 @@
 requests==2.32.3
-python-telegram-bot==13.15  # Or your version; check with pip show python-telegram-bot
+python-telegram-bot==21.4
 schedule==1.2.2
 certifi==2024.8.30
