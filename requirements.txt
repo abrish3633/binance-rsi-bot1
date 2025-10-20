@@ -1,4 +1,4 @@
-requests==2.32.3
-python-telegram-bot==21.4
-schedule==1.2.2
-certifi==2024.8.30
+requests==2.31.0
+python-telegram-bot==20.7
+schedule==1.2.0
+backoff==2.2.1
