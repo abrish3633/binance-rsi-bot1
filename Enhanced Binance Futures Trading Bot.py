@@ -656,8 +656,8 @@ def trading_loop(
             is_red = close_price < open_price
 
             logger.info(
-                f"Candle: open={open_price:.4f}, close={close_price:.4f}, RSI={rsi:.2f if rsi else 'N/A'}, "
-                f"MACD={macd_line:.4f if macd_line else 'N/A'}, Signal={macd_signal:.4f if macd_signal else 'N/A'}, Vol={curr_vol:.2f}, SMA15={vol_sma:.2f if vol_sma else 'N/A'}, "
+                f"Candle: open={open_price:.4f}, close={close_price:.4f}, RSI={'N/A' if rsi is None else f'{rsi:.2f}'}, "
+                f"MACD={'N/A' if macd_line is None else f'{macd_line:.4f}'}, Signal={'N/A' if macd_signal is None else f'{macd_signal:.4f}'}, Vol={curr_vol:.2f}, SMA15={'N/A' if vol_sma is None else f'{vol_sma:.2f}'}, "
                 f"{'Green' if is_green else 'Red' if is_red else 'Neutral'}"
             )
 
