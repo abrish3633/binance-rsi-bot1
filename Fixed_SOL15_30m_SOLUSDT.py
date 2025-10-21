@@ -596,11 +596,108 @@ logger.addHandler(file_handler)
 log = logger.info
 
 # -------- TRADE MONITORING ----------
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
+
+def place_trailing_stop(client: BinanceClient, symbol: str, side: str, activation_price, callback_rate, qty, sl_price, R):
+    """
+    Place a trailing stop that aims to maintain trail_distance = 2 * R.
+    - Ensures closePosition=true and reduceOnly=true.
+    - Handles immediate stopPrice==0 (Binance computes actual stop later).
+    - Re-queries open orders shortly after placement to get confirmed stopPrice.
+    """
+    filters = get_symbol_filters(client, symbol)
+    tick_size = filters['tickSize']
+    activation_price_quant = quantize_price(Decimal(str(activation_price)), tick_size)
+    qty_quant = quantize_qty(qty, filters['stepSize'])
+    callback_rate_dec = min(max(Decimal(str(callback_rate)).quantize(Decimal('0.01')), CALLBACK_RATE_MIN), CALLBACK_RATE_MAX)
+
+    trail_distance = (Decimal('2') * Decimal(str(R))).quantize(tick_size)
+    # expected initial stop (activation - 2R for LONG close=SELL, activation + 2R for SHORT close=BUY)
+    if side == "SELL":
+        expected_initial_stop = (activation_price_quant - trail_distance).quantize(tick_size)
+    else:
+        expected_initial_stop = (activation_price_quant + trail_distance).quantize(tick_size)
+
+    log(f"Trailing stop setup: activationPrice={activation_price_quant}, trailDistance={trail_distance} (2R), expectedInitialStop={expected_initial_stop}, callbackRate={callback_rate_dec}%")
+
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "TRAILING_STOP_MARKET",
+        "activationPrice": str(activation_price_quant),
+        "callbackRate": str(callback_rate_dec),
+        "quantity": str(qty_quant),
+        "reduceOnly": "true",
+        "closePosition": "true"
+    }
+
+    is_hedge_mode = client.get_position_mode()
+    if is_hedge_mode:
+        params["positionSide"] = "LONG" if side == "BUY" else "SHORT"
+
+    try:
+        response = client.send_signed_request("POST", "/fapi/v1/order", params)
+        # Log immediate response (stopPrice may be zero initially)
+        returned_stop_price = Decimal(str(response.get('stopPrice', '0'))) if response.get('stopPrice') is not None else Decimal('0')
+        returned_price_rate = response.get('priceRate') or response.get('price_rate') or response.get('callbackRate')
+        log(f"Trailing stop placed (immediate response): orderId={response.get('orderId')}, stopPrice={returned_stop_price}, priceRate={returned_price_rate}")
+
+        # If stopPrice==0, Binance will compute effective stop later. Re-query open orders to fetch actual stopPrice.
+        try:
+            time.sleep(0.7)  # short delay for Binance to compute stopPrice
+            open_orders = client.get_open_orders(symbol)
+            # Find the trailing order by orderId (if present) or by type TRAILING_STOP_MARKET and matching qty
+            order_id = response.get('orderId')
+            trail_order = None
+            if order_id:
+                trail_order = next((o for o in open_orders if o.get('orderId') == order_id), None)
+            if not trail_order:
+                # fallback: find a TRAILING_STOP_MARKET reduceOnly closePosition order matching qty
+                trail_order = next((o for o in open_orders if o.get('type') == 'TRAILING_STOP_MARKET' and o.get('reduceOnly') in (True, 'true', 'True') and Decimal(str(o.get('origQty', o.get('quantity', '0')))) == qty_quant), None)
+            if trail_order:
+                confirmed_stop_price = Decimal(str(trail_order.get('stopPrice', '0')))
+                confirmed_activate = Decimal(str(trail_order.get('activationPrice', trail_order.get('activatePrice', '0')) or '0'))
+                log(f"Trailing stop confirmed on openOrders: orderId={trail_order.get('orderId')}, stopPrice={confirmed_stop_price}, activationPrice={confirmed_activate}, callbackRate={trail_order.get('priceRate') or trail_order.get('price_rate') or trail_order.get('callbackRate')}")
+                # Compare confirmed_stop_price to expected_initial_stop with tolerance = few ticks
+                tolerance = tick_size * Decimal('3')  # e.g., allow 3 ticks drift
+                if confirmed_stop_price != 0 and abs(confirmed_stop_price - expected_initial_stop) > tolerance:
+                    log(f"Warning: Confirmed trailing stopPrice {confirmed_stop_price} differs from expectedInitialStop {expected_initial_stop} by more than {tolerance}.")
+                return trail_order
+            else:
+                log("Trailing stop placed but not found in open orders (immediate). Returning API response.")
+                return response
+        except Exception as e:
+            log(f"Failed to re-check open orders after placing trailing stop: {str(e)}. Returning initial response.")
+            return response
+
+    except BinanceAPIError as e:
+        log(f"Trailing stop error: {str(e)}, payload: {e.payload}")
+        # Keep precision fallback behavior
+        if e.payload and isinstance(e.payload, dict) and e.payload.get('code') == -1111:
+            log(f"Precision error detected. Falling back to STOP_MARKET at expectedInitialStop={expected_initial_stop}")
+            params_fb = {
+                "symbol": symbol,
+                "side": side,
+                "type": "STOP_MARKET",
+                "stopPrice": str(expected_initial_stop),
+                "quantity": str(qty_quant),
+                "reduceOnly": "true",
+                "closePosition": "true"
+            }
+            if is_hedge_mode:
+                params_fb["positionSide"] = "LONG" if side == "BUY" else "SHORT"
+            resp_fb = client.send_signed_request("POST", "/fapi/v1/order", params_fb)
+            log(f"Fallback STOP_MARKET placed: stopPrice={expected_initial_stop}, respOrderId={resp_fb.get('orderId')}")
+            return resp_fb
+        raise
 
 def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id):
+    """
+    Monitor active trade; improved trailing stop distance calculations and logging.
+    """
     log("Monitoring active trade...")
     last_position_check = 0
+    tick_size_dec = Decimal(str(tick_size))
     while trade_state.active:
         if STOP_REQUESTED or os.path.exists("stop.txt"):
             log("Stop requested during monitoring. Exiting.")
@@ -612,17 +709,21 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                 pos = fetch_open_positions_details(client, symbol)
                 pos_amt = Decimal(str(pos.get("positionAmt", "0"))) if pos else Decimal('0')
                 if pos_amt == Decimal('0'):
-                    # Position closed
+                    # Position closed - gather close reason and price
                     open_orders = client.get_open_orders(symbol)
-                    trail_order = next((o for o in open_orders if o.get("orderId") == trade_state.trail_order_id), None) if trade_state.trail_activated else None
+                    trail_order = None
+                    if trade_state.trail_order_id:
+                        trail_order = next((o for o in open_orders if o.get("orderId") == trade_state.trail_order_id), None)
                     sl_order = next((o for o in open_orders if o.get("orderId") == trade_state.sl_order_id), None) if trade_state.sl_order_id else None
                     tp_order = next((o for o in open_orders if o.get("orderId") == trade_state.tp_order_id), None) if trade_state.tp_order_id else None
+
                     close_side = "BUY" if trade_state.side == "SHORT" else "SELL"
                     close_qty = Decimal(str(trade_state.qty))
                     close_price = client.get_latest_fill_price(symbol, trade_state.sl_order_id or trade_state.tp_order_id or trade_state.trail_order_id)
                     close_price = Decimal(str(close_price)) if close_price else Decimal(str(trade_state.sl))
-                    close_price_str = str(close_price.quantize(Decimal(str(tick_size))))
-                    R = Decimal(str(trade_state.sl - trade_state.entry_price if trade_state.side == "LONG" else trade_state.entry_price - trade_state.sl))
+                    close_price_str = str(close_price.quantize(tick_size_dec))
+                    R = (Decimal(str(trade_state.sl)) - Decimal(str(trade_state.entry_price))) if trade_state.side == "LONG" else (Decimal(str(trade_state.entry_price)) - Decimal(str(trade_state.sl)))
+                    R = abs(R)
                     exit_reason = "Unknown"
                     if trade_state.trail_activated and not trail_order:
                         exit_reason = "Trailing Stop"
@@ -635,6 +736,7 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                         log(f"Position closed (take-profit executed): {close_side}, qty={close_qty}, price={close_price_str}")
                     else:
                         log(f"Position closed (unknown reason): {close_side}, qty={close_qty}, price={close_price_str}")
+
                     log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, Decimal(str(close_price)), close_qty, R)
                     send_close_telegram(symbol, trade_state.side, trade_state.qty, Decimal(str(close_price)), exit_reason, telegram_bot, telegram_chat_id)
                     trade_state.active = False
@@ -645,44 +747,57 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                     except BinanceAPIError as e:
                         log(f"Failed to cancel orders: {str(e)}, payload: {e.payload}")
                     return
+
                 unrealized_pnl = Decimal(str(pos.get("unrealizedProfit", "0"))) if pos else Decimal('0')
                 if unrealized_pnl == 0:
                     ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
                     current_price = Decimal(str(ticker.get("price")))
                     entry_price = Decimal(str(trade_state.entry_price))
-                    pos_amt = Decimal(str(pos_amt))
-                    unrealized_pnl = (current_price - entry_price) * pos_amt if pos_amt > 0 else (entry_price - current_price) * pos_amt
+                    pos_amt_abs = abs(pos_amt)
+                    unrealized_pnl = (current_price - entry_price) * pos_amt_abs if pos_amt > 0 else (entry_price - current_price) * pos_amt_abs
                 log(f"Unrealized PNL: {unrealized_pnl.quantize(Decimal('0.01'))} USDT")
+
+                # Check activation
                 if not trade_state.trail_activated and trade_state.trail_activation_price:
                     try:
                         ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
                         current_price = Decimal(str(ticker.get("price")))
-                        if (trade_state.side == "LONG" and current_price >= trade_state.trail_activation_price) or \
-                           (trade_state.side == "SHORT" and current_price <= trade_state.trail_activation_price):
+                        if (trade_state.side == "LONG" and current_price >= Decimal(str(trade_state.trail_activation_price))) or \
+                           (trade_state.side == "SHORT" and current_price <= Decimal(str(trade_state.trail_activation_price))):
                             log(f"Trailing stop activated at price={current_price} (activationPrice={trade_state.trail_activation_price})")
                             trade_state.trail_activated = True
                     except BinanceAPIError as e:
                         log(f"Price fetch failed: {str(e)}, payload: {e.payload}")
                     except Exception as e:
                         log(f"Price fetch failed: {str(e)}")
+
+                # If trailing is active and there's a trail_order_id, fetch the open order to read stopPrice
                 if trade_state.trail_activated and trade_state.trail_order_id:
                     try:
                         orders = client.get_open_orders(symbol)
                         trail_order = next((o for o in orders if o.get("orderId") == trade_state.trail_order_id), None)
                         if trail_order:
                             stop_price = Decimal(str(trail_order.get("stopPrice", "0")))
+                            # current price
                             current_price = Decimal(str(client.public_request("/fapi/v1/ticker/price", {"symbol": symbol}).get("price")))
-                            expected_trail_distance = Decimal(str(2 * abs(trade_state.sl - trade_state.entry_price))).quantize(Decimal(str(tick_size)))
-                            trail_distance = (abs(current_price - stop_price) if trade_state.side == "LONG" else abs(stop_price - current_price)).quantize(Decimal(str(tick_size)))
-                            log(f"Trailing stop update: stopPrice={stop_price.quantize(Decimal(str(tick_size)))}, currentPrice={current_price.quantize(Decimal(str(tick_size)))}, trailDistance={trail_distance} (expected 2R={expected_trail_distance})")
-                            if abs(trail_distance - expected_trail_distance) > Decimal(str(tick_size)):
-                                log(f"Warning: Trailing distance {trail_distance} deviates from expected 2R={expected_trail_distance}. Checking Binance execution.")
+                            expected_trail_distance = (Decimal('2') * abs(Decimal(str(trade_state.sl)) - Decimal(str(trade_state.entry_price)))).quantize(tick_size_dec)
+                            # Compute actual trail distance: abs(currentPrice - stopPrice) (direction-agnostic)
+                            trail_distance = abs(current_price - stop_price).quantize(tick_size_dec)
+                            log(f"Trailing stop update: stopPrice={stop_price.quantize(tick_size_dec)}, currentPrice={current_price.quantize(tick_size_dec)}, trailDistance={trail_distance} (expected 2R={expected_trail_distance})")
+                            # Tolerance = a few ticks
+                            tolerance = tick_size_dec * Decimal('3')
+                            if stop_price == 0:
+                                # Binance may return 0 until it computes; re-query next cycle
+                                log("Note: trailing stop stopPrice==0 in openOrders; will re-check on next cycle.")
+                            elif abs(trail_distance - expected_trail_distance) > tolerance:
+                                log(f"Warning: Trailing distance {trail_distance} deviates from expected 2R={expected_trail_distance} by more than {tolerance}.")
                         else:
-                            log("Trailing stop order no longer exists; position may have closed.")
+                            log("Trailing stop order not found in open orders; position may have closed or order changed.")
                     except BinanceAPIError as e:
                         log(f"Failed to fetch trailing stop update: {str(e)}, payload: {e.payload}")
                     except Exception as e:
                         log(f"Failed to fetch trailing stop update: {str(e)}")
+
                 last_position_check = current_time
             time.sleep(1)
         except BinanceAPIError as e:
