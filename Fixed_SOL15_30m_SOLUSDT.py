@@ -650,7 +650,7 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                     ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
                     current_price = Decimal(str(ticker.get("price")))
                     entry_price = Decimal(str(trade_state.entry_price))
-                    pos_amt = Decimal(str(pos_amt))  # Ensure pos_amt is Decimal
+                    pos_amt = Decimal(str(pos_amt))
                     unrealized_pnl = (current_price - entry_price) * pos_amt if pos_amt > 0 else (entry_price - current_price) * pos_amt
                 log(f"Unrealized PNL: {unrealized_pnl.quantize(Decimal('0.01'))} USDT")
                 if not trade_state.trail_activated and trade_state.trail_activation_price:
@@ -672,11 +672,11 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                         if trail_order:
                             stop_price = Decimal(str(trail_order.get("stopPrice", "0")))
                             current_price = Decimal(str(client.public_request("/fapi/v1/ticker/price", {"symbol": symbol}).get("price")))
-                            trail_distance = abs(current_price - stop_price) if trade_state.side == "LONG" else abs(stop_price - current_price)
-                            expected_trail_distance = 2 * abs(Decimal(str(trade_state.sl)) - Decimal(str(trade_state.entry_price)))
-                            log(f"Trailing stop update: stopPrice={stop_price}, currentPrice={current_price}, trailDistance={trail_distance} (expected 2R={expected_trail_distance})")
-                            if abs(trail_distance - expected_trail_distance) > Decimal('0.01') * expected_trail_distance:
-                                log(f"Warning: Trailing distance {trail_distance} deviates from expected 2R={expected_trail_distance}")
+                            expected_trail_distance = Decimal(str(2 * abs(trade_state.sl - trade_state.entry_price))).quantize(Decimal(str(tick_size)))
+                            trail_distance = (abs(current_price - stop_price) if trade_state.side == "LONG" else abs(stop_price - current_price)).quantize(Decimal(str(tick_size)))
+                            log(f"Trailing stop update: stopPrice={stop_price.quantize(Decimal(str(tick_size)))}, currentPrice={current_price.quantize(Decimal(str(tick_size)))}, trailDistance={trail_distance} (expected 2R={expected_trail_distance})")
+                            if abs(trail_distance - expected_trail_distance) > Decimal(str(tick_size)):
+                                log(f"Warning: Trailing distance {trail_distance} deviates from expected 2R={expected_trail_distance}. Checking Binance execution.")
                         else:
                             log("Trailing stop order no longer exists; position may have closed.")
                     except BinanceAPIError as e:
