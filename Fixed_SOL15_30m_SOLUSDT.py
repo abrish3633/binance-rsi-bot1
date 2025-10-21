@@ -596,6 +596,8 @@ logger.addHandler(file_handler)
 log = logger.info
 
 # -------- TRADE MONITORING ----------
+from decimal import Decimal
+
 def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id):
     log("Monitoring active trade...")
     last_position_check = 0
@@ -633,8 +635,8 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                         log(f"Position closed (take-profit executed): {close_side}, qty={close_qty}, price={close_price_str}")
                     else:
                         log(f"Position closed (unknown reason): {close_side}, qty={close_qty}, price={close_price_str}")
-                    log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price), close_qty, R)
-                    send_close_telegram(symbol, trade_state.side, trade_state.qty, float(close_price), exit_reason, telegram_bot, telegram_chat_id)
+                    log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, Decimal(str(close_price)), close_qty, R)
+                    send_close_telegram(symbol, trade_state.side, trade_state.qty, Decimal(str(close_price)), exit_reason, telegram_bot, telegram_chat_id)
                     trade_state.active = False
                     trade_state.exit_close_time = int(current_time * 1000)
                     try:
@@ -648,6 +650,7 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                     ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
                     current_price = Decimal(str(ticker.get("price")))
                     entry_price = Decimal(str(trade_state.entry_price))
+                    pos_amt = Decimal(str(pos_amt))  # Ensure pos_amt is Decimal
                     unrealized_pnl = (current_price - entry_price) * pos_amt if pos_amt > 0 else (entry_price - current_price) * pos_amt
                 log(f"Unrealized PNL: {unrealized_pnl.quantize(Decimal('0.01'))} USDT")
                 if not trade_state.trail_activated and trade_state.trail_activation_price:
