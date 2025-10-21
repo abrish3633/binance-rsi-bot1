@@ -846,6 +846,226 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 tp_price_f = float(tp_price_dec_quant)
                 trail_activation_price_dec = actual_fill_price + (TRAIL_TRIGGER_MULT * R) if buy_signal else actual_fill_price - (TRAIL_TRIGGER_MULT * R)
                 trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, tick_size)
+# ... [Previous imports and functions unchanged] ...
+
+# -------- TRADING LOOP ----------
+def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, use_macd, telegram_bot, telegram_chat_id):
+    log(f"Starting trading loop with timeframe={timeframe}, symbol={symbol}, risk_pct={risk_pct*100}%, use_volume_filter={use_volume_filter}, use_macd={use_macd}")
+    trades_today = 0
+    last_processed_time = 0
+    trade_state = TradeState()
+    pending_entry = False
+    daily_start_balance = fetch_balance(client)
+    filters = get_symbol_filters(client, symbol)
+    step_size = filters['stepSize']
+    min_qty = filters['minQty']
+    tick_size = filters['tickSize']
+    min_notional = filters['minNotional']
+    is_hedge_mode = client.get_position_mode()
+    log(f"Position mode cached: {'Hedge Mode' if is_hedge_mode else 'One-Way Mode'}")
+    signal.signal(signal.SIGINT, lambda s, f: _request_stop(s, f, symbol, trade_state, telegram_bot, telegram_chat_id))
+    signal.signal(signal.SIGTERM, lambda s, f: _request_stop(s, f, symbol, trade_state, telegram_bot, telegram_chat_id))
+
+    # Check and log existing position at startup
+    try:
+        pos = fetch_open_positions_details(client, symbol)
+        pos_amt = Decimal(str(pos.get("positionAmt", "0"))) if pos else Decimal('0')
+        if pos_amt != 0:
+            log(f"Active position found: side={'LONG' if pos_amt > 0 else 'SHORT'}, qty={abs(pos_amt)}, entryPrice={pos.get('entryPrice', 'N/A')}, unrealizedPnL={pos.get('unrealizedProfit', 'N/A')}")
+            trade_state.active = True
+            trade_state.side = "LONG" if pos_amt > 0 else "SHORT"
+            trade_state.qty = float(abs(pos_amt))
+            trade_state.entry_price = float(pos.get("entryPrice", 0))
+            # Note: SL/TP/trailing stop not restored; requires manual order check
+        else:
+            log("No active position found at startup.")
+    except BinanceAPIError as e:
+        log(f"Failed to fetch position at startup: {str(e)}, payload: {e.payload}")
+
+    # Clean up any existing orders before starting with backoff
+    try:
+        open_orders = client.get_open_orders(symbol)
+        if open_orders:
+            log(f"Existing open orders: {[{'orderId': o['orderId'], 'type': o['type'], 'stopPrice': o.get('stopPrice', 'N/A'), 'side': o['side']} for o in open_orders]}")
+            for attempt in range(3):
+                try:
+                    client.cancel_all_open_orders(symbol)
+                    log("Cancelled all existing orders before starting trading loop.")
+                    break
+                except BinanceAPIError as e:
+                    if e.status_code == 503 and e.payload.get('code') == -1008:
+                        log(f"Throttling detected on attempt {attempt+1}/3: {str(e)}. Waiting {2 ** attempt}s...")
+                        time.sleep(2 ** attempt)
+                        if attempt == 2:
+                            log("Failed to cancel orders after retries. Proceeding with existing orders.")
+                    else:
+                        log(f"Failed to cancel existing orders: {str(e)}, payload: {e.payload}")
+                        break
+    except BinanceAPIError as e:
+        log(f"Failed to fetch open orders: {str(e)}, payload: {e.payload}")
+
+    while not STOP_REQUESTED and not os.path.exists("stop.txt"):
+        try:
+            if trades_today >= max_trades_per_day:
+                log("Max trades reached for today. Waiting for next day.")
+                time.sleep(60)
+                continue
+
+            if use_max_loss and (daily_start_balance - fetch_balance(client)) > daily_start_balance * (max_daily_loss_pct / Decimal("100")):
+                log("Max daily loss reached. Waiting for next day.")
+                time.sleep(60)
+                continue
+
+            server_time = client.public_request("/fapi/v1/time")["serverTime"]
+            next_close_ms = last_processed_time + interval_ms(timeframe)
+            sleep_seconds = max(1.0, (next_close_ms - server_time + 500) / 1000.0)
+            if sleep_seconds > 1:
+                log(f"Waiting for candle close in {sleep_seconds:.2f}s ...")
+                _safe_sleep(sleep_seconds)
+                continue
+
+            klines = fetch_klines(client, symbol, timeframe, limit=100)
+            closes, volumes, close_times, opens = closes_and_volumes_from_klines(klines)
+            last_close_time = close_times[-1]
+
+            if last_processed_time == last_close_time:
+                log(f"Duplicate candle detected at {last_close_time}; sleeping 1s")
+                time.sleep(1)
+                continue
+
+            rsi = compute_rsi(closes)
+            macd, signal_val, bullish_crossover, bearish_crossover = compute_macd(closes) if use_macd else (None, None, True, True)
+            vol_sma15 = sma(volumes, VOL_SMA_PERIOD)
+            curr_vol = volumes[-1]
+            close_price = Decimal(str(closes[-1]))
+            open_price = Decimal(str(opens[-1]))
+            close_time = last_close_time
+            is_green_candle = close_price > open_price
+            is_red_candle = close_price < open_price
+
+            log(f"Candle open={open_price}, close={close_price}, RSI={rsi}, MACD={macd if use_macd else 'N/A'}, Signal={signal_val if use_macd else 'N/A'}, Vol={curr_vol:.2f}, SMA15={(vol_sma15 or 0):.2f}, {'Green' if is_green_candle else 'Red' if is_red_candle else 'Neutral'} candle")
+
+            if prevent_same_bar and trade_state.exit_close_time == close_time:
+                log("Same bar as exit. Skipping to prevent re-entry.")
+                last_processed_time = close_time
+                time.sleep(1)
+                continue
+
+            if require_no_pos and has_active_position(client, symbol):
+                log("Active position detected. Waiting for closure.")
+                last_processed_time = close_time
+                time.sleep(1)
+                continue
+
+            if use_volume_filter and vol_sma15 is None:
+                log("Waiting for volume history...")
+                last_processed_time = close_time
+                time.sleep(1)
+                continue
+
+            buy_signal = (rsi is not None and BUY_RSI_MIN <= rsi <= BUY_RSI_MAX and is_green_candle and
+                          (not use_macd or bullish_crossover) and (not use_volume_filter or curr_vol > vol_sma15))
+            sell_signal = (rsi is not None and SELL_RSI_MIN <= rsi <= SELL_RSI_MAX and is_red_candle and
+                           (not use_macd or bearish_crossover) and (not use_volume_filter or curr_vol > vol_sma15))
+
+            if (buy_signal or sell_signal) and not trade_state.active and not pending_entry:
+                last_processed_time = close_time
+                side_text = "BUY" if buy_signal else "SELL"
+                log(f"Signal on candle close -> {side_text}. Preparing entry.")
+                pending_entry = True
+
+                entry_price = close_price
+                entry_price_f = float(entry_price)
+                sl_price_dec = entry_price * (Decimal("1") - SL_PCT if buy_signal else Decimal("1") + SL_PCT)
+                R = entry_price * SL_PCT
+                tp_price_dec = entry_price + (tp_mult * R) if buy_signal else entry_price - (tp_mult * R)
+                close_side_for_sl = "SELL" if buy_signal else "BUY"
+                sl_rounding = ROUND_DOWN
+                tp_rounding = ROUND_UP
+
+                if R <= Decimal('0'):
+                    log(f"Invalid R ({R}) <= 0. Skipping trade.")
+                    pending_entry = False
+                    time.sleep(1)
+                    continue
+
+                bal = fetch_balance(client)
+                risk_amount = bal * risk_pct
+                qty = risk_amount / R
+                qty_api = quantize_qty(qty, step_size)
+                if qty_api < min_qty:
+                    qty_api = min_qty
+                notional = qty_api * entry_price
+                if notional < min_notional:
+                    qty_api = quantize_qty(min_notional / entry_price, step_size)
+
+                sl_price_dec_quant = quantize_price(sl_price_dec, tick_size, sl_rounding)
+                sl_price_f = float(sl_price_dec_quant)
+                tp_price_dec_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
+                tp_price_f = float(tp_price_dec_quant)
+
+                log(f"Sending MARKET {side_text} order: qty={qty_api}, entry_price={entry_price_f}")
+                order_res = None
+                for attempt in range(3):
+                    try:
+                        order_res = place_market_order(client, symbol, side_text, qty_api, is_hedge_mode)
+                        log(f"Market order placed: {order_res}")
+                        break
+                    except BinanceAPIError as e:
+                        if e.status_code == 408 and e.payload.get('code') == -1007:
+                            log(f"Timeout on attempt {attempt+1}/3: {str(e)}. Waiting {2 ** attempt}s...")
+                            time.sleep(2 ** attempt)
+                            if attempt == 2:
+                                log("Failed to place market order after retries. Aborting trade.")
+                                pending_entry = False
+                                send_telegram_message(telegram_bot, telegram_chat_id, f"Trade Failed: {symbol}, {side_text}, qty={qty_api}, error=HTTP 408 Timeout")
+                                break
+                        else:
+                            log(f"Failed to place market order: {str(e)}, payload: {e.payload}")
+                            pending_entry = False
+                            send_telegram_message(telegram_bot, telegram_chat_id, f"Trade Failed: {symbol}, {side_text}, qty={qty_api}, error={str(e)}")
+                            break
+                if not order_res:
+                    continue
+
+                log("Waiting for entry order to fill...")
+                start_time = time.time()
+                actual_qty = None
+                actual_fill_price = None
+                while time.time() - start_time <= ORDER_FILL_TIMEOUT:
+                    if STOP_REQUESTED or os.path.exists("stop.txt"):
+                        log("Stop requested during fill wait; aborting entry flow.")
+                        break
+                    pos = fetch_open_positions_details(client, symbol)
+                    pos_amt = Decimal(str(pos.get("positionAmt", "0"))) if pos else Decimal('0')
+                    if pos_amt != Decimal('0'):
+                        actual_qty = abs(pos_amt)
+                        actual_fill_price = client.get_latest_fill_price(symbol, order_res.get("orderId")) or entry_price
+                        break
+                    time.sleep(0.5)
+
+                if actual_qty is None:
+                    log("Timeout waiting for fill. Cancelling order...")
+                    try:
+                        client.send_signed_request("DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": order_res.get("orderId"), "positionSide": "LONG" if side_text == "BUY" and is_hedge_mode else "SHORT" if is_hedge_mode else None})
+                        log("Market order cancelled due to fill timeout.")
+                        send_telegram_message(telegram_bot, telegram_chat_id, f"Trade Cancelled: {symbol}, {side_text}, qty={qty_api}, reason=Fill Timeout")
+                    except BinanceAPIError as e:
+                        log(f"Failed to cancel order: {str(e)}, payload: {e.payload}")
+                    pending_entry = False
+                    continue
+
+                actual_fill_price_f = float(actual_fill_price)
+
+                sl_price_dec = actual_fill_price * (Decimal("1") - SL_PCT if buy_signal else Decimal("1") + SL_PCT)
+                R = actual_fill_price * SL_PCT
+                tp_price_dec = actual_fill_price + (tp_mult * R) if buy_signal else actual_fill_price - (tp_mult * R)
+                sl_price_dec_quant = quantize_price(sl_price_dec, tick_size, sl_rounding)
+                sl_price_f = float(sl_price_dec_quant)
+                tp_price_dec_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
+                tp_price_f = float(tp_price_dec_quant)
+                trail_activation_price_dec = actual_fill_price + (TRAIL_TRIGGER_MULT * R) if buy_signal else actual_fill_price - (TRAIL_TRIGGER_MULT * R)
+                trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, tick_size)
                 trail_activation_price_f = float(trail_activation_price_dec_quant)
                 trail_distance = (Decimal('2') * R).quantize(tick_size)
 
@@ -861,6 +1081,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                         "quantity": str(actual_qty),
                         "positionSide": "LONG" if side_text == "BUY" and is_hedge_mode else "SHORT" if is_hedge_mode else None
                     })
+                    send_telegram_message(telegram_bot, telegram_chat_id, f"Trade Cancelled: {symbol}, {side_text}, qty={actual_qty}, reason=Trailing Stop Too Close")
                     pending_entry = False
                     continue
 
@@ -943,27 +1164,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
 
     log("Trading loop exited.")
 
-def interval_ms(interval):
-    if interval.endswith("m"):
-        return int(interval[:-1]) * 60 * 1000
-    if interval.endswith("h"):
-        return int(interval[:-1]) * 60 * 60 * 1000
-    return 5 * 60 * 1000
-
-def _safe_sleep(total_seconds):
-    remaining = float(total_seconds)
-    while remaining > 0:
-        if STOP_REQUESTED or os.path.exists("stop.txt"):
-            break
-        time.sleep(min(1, remaining))
-        remaining -= 1
-
-def closes_and_volumes_from_klines(klines):
-    closes = [float(k[4]) for k in klines]
-    volumes = [float(k[5]) for k in klines]
-    close_times = [int(k[6]) for k in klines]
-    opens = [float(k[1]) for k in klines]
-    return closes, volumes, close_times, opens
+# ... [Rest of the script unchanged] ...
 
 # -------- SCHEDULER FOR REPORTS ----------
 def run_scheduler(bot, chat_id):
