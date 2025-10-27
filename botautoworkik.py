@@ -225,13 +225,19 @@ class BinanceClient:
 def compute_rsi(closes, period=RSI_PERIOD):
     if len(closes) < period + 1:
         return None
-    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-    gains = [max(0, d) for d in deltas]
-    losses = [abs(min(0, d)) for d in deltas]
-    avg_gain = statistics.mean(gains[-period:])
-    avg_loss = statistics.mean(losses[-period:])
+    
+    gains = losses = 0.0
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains += max(diff, 0)
+        losses += max(-diff, 0)
+    
+    avg_gain = gains / period
+    avg_loss = losses / period
+    
     if avg_loss == 0:
         return 100.0
+    
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
     return round(rsi, 2)
