@@ -225,28 +225,36 @@ class BinanceClient:
 def compute_rsi(closes, period=RSI_PERIOD):
     if len(closes) < period + 1:
         return None
-    
-    gains = losses = 0.0
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i - 1]
-        gains += max(diff, 0)
-        losses += max(-diff, 0)
-    
-    avg_gain = gains / period
-    avg_loss = losses / period
-    
-    if avg_loss == 0:
-        return 100.0
-    
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return round(rsi, 2)
-
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains = [max(d, 0) for d in deltas]
+    losses = [max(-d, 0) for d in deltas]
+    if len(gains) < period:
+        return None
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    if len(deltas) == period:
+        if avg_loss == 0:
+            return 100.0
+        return round(100 - 100 / (1 + avg_gain / avg_loss), 2)
+    rsi_values = []
+    current_gain = avg_gain
+    current_loss = avg_loss
+    if current_loss == 0:
+        rsi_values.append(100.0)
+    else:
+        rsi_values.append(100 - 100 / (1 + current_gain / current_loss))
+    for i in range(period, len(deltas)):
+        current_gain = (current_gain * (period - 1) + gains[i]) / period
+        current_loss = (current_loss * (period - 1) + losses[i]) / period
+        if current_loss == 0:
+            rsi_values.append(100.0)
+        else:
+            rsi_values.append(100 - 100 / (1 + current_gain / current_loss))
+    return round(rsi_values[-1], 2)
 def sma(data, period):
     if len(data) < period:
         return None
     return sum(data[-period:]) / period
-
 def quantize_qty(qty, step_size):
     step = Decimal(str(step_size))
     q = (Decimal(str(qty)) // step) * step
