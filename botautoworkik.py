@@ -835,15 +835,14 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot=None, tel
                     log(f"Price fetch failed: {str(e)}", telegram_bot, telegram_chat_id)
                     time.sleep(2)
                     continue
-                # Update highest/lowest price
+                # Update highest/lowest price (SAFE)
                 if trade_state.side == "LONG":
-                    if trade_state.highest_price is None:
+                    if trade_state.highest_price is None or current_price > trade_state.highest_price:
                         trade_state.highest_price = current_price
-                    trade_state.highest_price = max(trade_state.highest_price, current_price)
                 else:
-                    if trade_state.lowest_price is None:
+                    if trade_state.lowest_price is None or current_price < trade_state.lowest_price:
                         trade_state.lowest_price = current_price
-                    trade_state.lowest_price = min(trade_state.lowest_price, current_price)
+
                 # Check for trailing stop activation
                 if not trade_state.trail_activated and trade_state.trail_activation_price:
                     activation_hit = (trade_state.side == "LONG" and current_price >= trade_state.trail_activation_price) or \
@@ -860,7 +859,6 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot=None, tel
                             rounding = ROUND_UP
                         initial_stop_price_quant = quantize_price(initial_stop_price, tick_size, rounding)
                         trade_state.current_trail_stop = initial_stop_price_quant
-                        # Place initial STOP_MARKET for trail
                         try:
                             trail_order = client.place_stop_market(symbol, close_side, qty_dec, initial_stop_price_quant, reduce_only=True, position_side=pos_side)
                             trade_state.trail_order_id = trail_order.get("orderId")
@@ -869,28 +867,40 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot=None, tel
                                 send_trailing_activation_telegram(symbol, trade_state.side, float(current_price), float(initial_stop_price_quant), telegram_bot, telegram_chat_id)
                         except Exception as e:
                             log(f"Failed to place initial trail stop: {str(e)}", telegram_bot, telegram_chat_id)
+
                 # Update trailing stop if activated
                 if trade_state.trail_activated:
                     new_stop_price = None
                     if trade_state.side == "LONG":
+                        if trade_state.highest_price is None:
+                            continue  # Skip if no data
                         new_stop_price = trade_state.highest_price - (TRAIL_DISTANCE_MULT * Decimal(str(trade_state.risk)))
                         rounding = ROUND_DOWN
                     else:
+                        if trade_state.lowest_price is None:
+                            continue  # Skip if no data
                         new_stop_price = trade_state.lowest_price + (TRAIL_DISTANCE_MULT * Decimal(str(trade_state.risk)))
                         rounding = ROUND_UP
+
                     new_stop_price_quant = quantize_price(new_stop_price, tick_size, rounding)
-                    # For long: only update if new > current; for short: if new < current
-                    should_update = (trade_state.side == "LONG" and new_stop_price_quant > trade_state.current_trail_stop) or \
-                                    (trade_state.side == "SHORT" and new_stop_price_quant < trade_state.current_trail_stop)
-                    if should_update and current_time - last_trail_update > 1:  # Throttle updates
-                        # Cancel old trail order
+
+                    # SAFE update condition
+                    should_update = False
+                    if trade_state.side == "LONG":
+                        if trade_state.current_trail_stop is not None:
+                            should_update = new_stop_price_quant > trade_state.current_trail_stop
+                    else:
+                        if trade_state.current_trail_stop is not None:
+                            should_update = new_stop_price_quant < trade_state.current_trail_stop
+
+                    if should_update and current_time - last_trail_update > 1:
+                        # Cancel + place new
                         if trade_state.trail_order_id:
                             try:
                                 client.cancel_order(symbol, trade_state.trail_order_id)
                                 log(f"Cancelled old trail order ID {trade_state.trail_order_id}", telegram_bot, telegram_chat_id)
                             except Exception as e:
                                 log(f"Failed to cancel old trail order: {str(e)}", telegram_bot, telegram_chat_id)
-                        # Place new STOP_MARKET
                         try:
                             trail_order = client.place_stop_market(symbol, close_side, qty_dec, new_stop_price_quant, reduce_only=True, position_side=pos_side)
                             trade_state.trail_order_id = trail_order.get("orderId")
@@ -901,7 +911,6 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot=None, tel
                             last_trail_update = current_time
                         except Exception as e:
                             log(f"Failed to update trail stop: {str(e)}", telegram_bot, telegram_chat_id)
-                # Check position status
                 pos = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
                 if isinstance(pos, dict) and 'data' in pos:
                     pos = pos['data']
