@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# Binance Futures RSI Bot (Manual Trade Management, 30m Optimized, SOLUSDT)
-# Modifications: Removed all MACD code entirely. Kept Binance TRAILING_STOP_MARKET for trailing stop.
-# Added debug_and_recover_expired_orders for SL/TP/trailing expiration recovery, called in monitor_trade() and on startup.
-# Increased default recvWindow to 30000. Structured with sections for readability.
-# Telegram notifications for recovery. Other behavior retained.
+# Binance Futures RSI Bot (Binance-Handled Trailing Stop, 30m Optimized, SOLUSDT)
+# Modifications: Removed all MACD code. Uses Binance TRAILING_STOP_MARKET.
+# Added recovery for SL, TP, and trailing orders (checks if missing/expired and re-places on startup and periodically).
+# RECOVERY_CHECK_INTERVAL = 10sec for throttling. Safe guards against None in math.
+# Telegram notifications for recovery. Structured and clean.
 
 import argparse
 import logging
@@ -24,11 +24,11 @@ import schedule
 from urllib.parse import urlencode
 
 # -------- STRATEGY CONFIG (defaults) ----------
-RISK_PCT = Decimal("0.005") # 0.5% per trade
-SL_PCT = Decimal("0.0075") # 0.75%
+RISK_PCT = Decimal("0.005")  # 0.5% per trade
+SL_PCT = Decimal("0.0075")  # 0.75%
 TP_MULT = Decimal("3.5")
 TRAIL_TRIGGER_MULT = Decimal("1.25")
-TRAIL_DISTANCE_MULT = Decimal("2.0") # 2R trailing distance
+TRAIL_DISTANCE_MULT = Decimal("2.0")  # 2R trailing distance
 VOL_SMA_PERIOD = 15
 RSI_PERIOD = 14
 MAX_TRADES_PER_DAY = 3
@@ -45,6 +45,7 @@ REQUEST_TIMEOUT = 30
 MAX_RETRIES = 5
 RATE_LIMIT_CHECK_INTERVAL = 60
 RATE_LIMIT_THRESHOLD = 80
+RECOVERY_CHECK_INTERVAL = 10  # Seconds between recovery checks
 
 # Global stop flag and client
 STOP_REQUESTED = False
@@ -107,7 +108,7 @@ def log(message, telegram_bot=None, telegram_chat_id=None):
         telegram_post(telegram_bot, telegram_chat_id, message)
 
 def telegram_post(token, chat_id, text, parse_mode=None):
-    """Send Telegram message via direct HTTP POST (creates its own connection each call)."""
+    """Send Telegram message via direct HTTP POST."""
     if not token or not chat_id:
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -221,81 +222,49 @@ def _request_stop(signum, frame, symbol=None, telegram_bot=None, telegram_chat_i
         return
     try:
         pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-        if isinstance(pos_resp, dict) and 'data' in pos_resp:
-            positions = pos_resp['data']
-        else:
-            positions = pos_resp if isinstance(pos_resp, list) else []
-        pos_item = None
-        for p in positions:
-            try:
-                if p.get("symbol") == symbol:
-                    pos_item = p
-                    break
-            except Exception:
-                continue
-        pos_amt = Decimal('0')
-        if pos_item:
-            pos_amt = Decimal(str(pos_item.get("positionAmt", "0")))
+        positions = pos_resp['data'] if isinstance(pos_resp, dict) and 'data' in pos_resp else pos_resp if isinstance(pos_resp, list) else []
+        pos_item = next((p for p in positions if p.get("symbol") == symbol), None)
+        pos_amt = Decimal(str(pos_item.get("positionAmt", "0"))) if pos_item else Decimal('0')
         if pos_amt != 0:
             side = "SELL" if pos_amt > 0 else "BUY"
             qty = abs(pos_amt)
-            entry_price = None
-            try:
-                entry_price = float(Decimal(str(pos_item.get("entryPrice", "0")))) if pos_item else None
-            except Exception:
-                entry_price = None
-            try:
-                response = client.send_signed_request("POST", "/fapi/v1/order", {
-                    "symbol": symbol,
-                    "side": side,
-                    "type": "MARKET",
-                    "quantity": str(qty)
-                })
-                log(f"Closed position: qty={qty} {side}")
-                exit_price = client.get_latest_fill_price(symbol, response.get("orderId"))
-                if exit_price is None:
-                    log("Failed to fetch exit price; using current market price.")
-                    ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
-                    exit_price = Decimal(str(ticker.get("price")))
-                exit_price_f = float(exit_price)
-                if entry_price is None and pos_item:
-                    try:
-                        entry_price = float(Decimal(str(pos_item.get("entryPrice", "0"))))
-                    except Exception:
-                        entry_price = 0.0
-                R = Decimal(str(entry_price)) * SL_PCT if entry_price else Decimal('0')
-                pnl_row = log_pnl(len(pnl_data) + 1, "LONG" if pos_amt > 0 else "SHORT", entry_price or 0.0, exit_price_f, float(qty), float(R) if R else 0.0)
-                if telegram_bot and telegram_chat_id:
-                    send_closure_telegram(symbol, "LONG" if pos_amt > 0 else "SHORT", entry_price or 0.0, exit_price_f, float(qty), pnl_row['pnl_usd'], pnl_row['pnl_r'], "Stop Requested", telegram_bot, telegram_chat_id)
-            except Exception as e:
-                log(f"Failed to close position: {str(e)}, stack: {traceback.format_exc()}")
-        else:
-            log("No open position found for closure.")
-        try:
-            client.cancel_all_open_orders(symbol)
-            log(f"All open orders cancelled for {symbol}.")
-        except Exception as e:
-            log(f"Failed to cancel orders: {str(e)}, stack: {traceback.format_exc()}")
+            entry_price = float(Decimal(str(pos_item.get("entryPrice", "0")))) if pos_item else 0.0
+            response = client.send_signed_request("POST", "/fapi/v1/order", {
+                "symbol": symbol,
+                "side": side,
+                "type": "MARKET",
+                "quantity": str(qty)
+            })
+            log(f"Closed position: qty={qty} {side}")
+            exit_price = client.get_latest_fill_price(symbol, response.get("orderId"))
+            if exit_price is None:
+                ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+                exit_price = Decimal(str(ticker.get("price")))
+            exit_price_f = float(exit_price)
+            R = Decimal(str(entry_price)) * SL_PCT if entry_price else Decimal('0')
+            pnl_row = log_pnl(len(pnl_data) + 1, "LONG" if pos_amt > 0 else "SHORT", entry_price, exit_price_f, float(qty), float(R))
+            if telegram_bot and telegram_chat_id:
+                send_closure_telegram(symbol, "LONG" if pos_amt > 0 else "SHORT", entry_price, exit_price_f, float(qty), pnl_row['pnl_usd'], pnl_row['pnl_r'], "Stop Requested", telegram_bot, telegram_chat_id)
+        client.cancel_all_open_orders(symbol)
+        log(f"All open orders cancelled for {symbol}.")
     except Exception as e:
-        log(f"Failed to handle stop: {str(e)}, stack: {traceback.format_exc()}")
+        log(f"Stop handler error: {str(e)}")
 
+# -------- TIME SYNC CHECK ----------
 def check_time_offset(base_url):
     try:
         start_time = time.time()
         response = requests.get(f"{base_url}/fapi/v1/time", timeout=5)
         server_time_ms = response.json()['serverTime']
-        server_time = datetime.fromtimestamp(server_time_ms / 1000, tz=timezone.utc)
-        local_time = datetime.now(timezone.utc)
-        offset = (server_time - local_time).total_seconds()
+        offset = (datetime.fromtimestamp(server_time_ms / 1000, tz=timezone.utc) - datetime.now(timezone.utc)).total_seconds()
         request_duration = time.time() - start_time
         log(f"Time offset from Binance: {offset} seconds, request duration: {request_duration:.3f}s")
-        if abs(offset) > 5:
-            log("Warning: Clock offset > 5s. Using recvWindow=30000.")
         return request_duration
     except Exception as e:
-        log(f"Binance time sync failed: {str(e)}")
+        log(f"Binance time sync failed: {e}")
         return None
 
+# -------- BINANCE CLIENT ----------
 class BinanceAPIError(Exception):
     def __init__(self, message, status_code=None, payload=None):
         super().__init__(message)
@@ -308,18 +277,14 @@ class BinanceClient:
         self.api_secret = api_secret
         self.use_live = use_live
         self.base = base_override or ("https://fapi.binance.com" if use_live else "https://testnet.binancefuture.com")
-        self.ping_latency = None
         self.ping_latency = check_time_offset(self.base)
         self.dual_side = self._check_position_mode()
-        print(f"💞 Using base URL: {self.base}, Position Mode: {'Hedge' if self.dual_side else 'One-way'}")
+        log(f"Using base URL: {self.base}, Position Mode: {'Hedge' if self.dual_side else 'One-way'}")
 
     def _check_position_mode(self):
         try:
             response = self.send_signed_request("GET", "/fapi/v1/positionSide/dual")
-            if isinstance(response, dict) and 'dualSidePosition' in response:
-                return response['dualSidePosition']
-            log("Failed to fetch position mode; assuming one-way mode.")
-            return False
+            return response.get('dualSidePosition', False)
         except Exception as e:
             log(f"Position mode check failed: {str(e)}. Assuming one-way mode.")
             return False
@@ -327,140 +292,40 @@ class BinanceClient:
     def _sign(self, query_string: str) -> str:
         return hmac.new(self.api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
-    def check_api_status(self):
-        try:
-            start_time = time.time()
-            response = requests.get(f"{self.base}/fapi/v1/ping", timeout=5)
-            duration = time.time() - start_time
-            if response.status_code == 200:
-                log(f"Binance API is reachable (ping duration: {duration:.3f}s).")
-                self.ping_latency = duration
-                return True
-            else:
-                log(f"API ping failed with status {response.status_code} (duration: {duration:.3f}s).")
-                return False
-        except Exception as e:
-            log(f"API ping failed: {str(e)}")
-            return False
-
-    def check_rate_limits(self):
-        global last_rate_limit_check
-        current_time = time.time()
-        if current_time - last_rate_limit_check < RATE_LIMIT_CHECK_INTERVAL:
-            return True
-        try:
-            response = self.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": "SOLUSDT"})
-            if isinstance(response, dict) and '_response' in response:
-                headers = response['_response'].headers
-            else:
-                headers = {}
-            used_weight = int(headers.get('X-MBX-USED-WEIGHT-1M', 0))
-            limit_value = 1200
-            usage_pct = (used_weight / limit_value) * 100
-            log(f"API rate limit usage: {used_weight}/{limit_value} ({usage_pct:.2f}%)")
-            if usage_pct > RATE_LIMIT_THRESHOLD:
-                log(f"Rate limit usage exceeds {RATE_LIMIT_THRESHOLD}%. Pausing for 30s.")
-                time.sleep(30)
-                return False
-            last_rate_limit_check = current_time
-            return True
-        except Exception as e:
-            log(f"Rate limit check failed: {str(e)}")
-            return True
-
     def send_signed_request(self, method: str, endpoint: str, params: dict = None):
         params = params.copy() if params else {}
-        dynamic_timeout = REQUEST_TIMEOUT + (self.ping_latency * 2 if self.ping_latency else 0)
-        for attempt in range(MAX_RETRIES):
-            try:
-                response = requests.get(f"{self.base}/fapi/v1/time", timeout=5)
-                server_time_ms = response.json()['serverTime']
-                params["timestamp"] = server_time_ms
-            except Exception as e:
-                log(f"Time sync failed (attempt {attempt+1}/{MAX_RETRIES}): {str(e)}. Using local time.")
-                params["timestamp"] = int(time.time() * 1000)
-            params["recvWindow"] = 30000
-            query = urlencode({k: str(params[k]) for k in sorted(params.keys())})
-            signature = self._sign(query)
-            url = f"{self.base}{endpoint}?{query}&signature={signature}"
-            headers = {"X-MBX-APIKEY": self.api_key}
-            start_time = time.time()
-            duration = 0
-            try:
-                r = requests.request(method, url, headers=headers, timeout=dynamic_timeout)
-                duration = time.time() - start_time
-                log(f"Request to {endpoint} took {duration:.3f}s")
-                if r.status_code == 200:
-                    response = r.json()
-                    if isinstance(response, list):
-                        response = {'data': response, '_response': r}
-                    else:
-                        if isinstance(response, dict):
-                            response['_response'] = r
-                        else:
-                            response = {'data': response, '_response': r}
-                    if isinstance(response, dict) and response.get("code") not in (None, 200):
-                        if response.get('code') == -1003:
-                            log(f"Rate limit exceeded. Waiting 30s before retry {attempt+1}/{MAX_RETRIES}.")
-                            time.sleep(30)
-                            continue
-                        raise BinanceAPIError(f"API error: {response.get('msg', 'Unknown error')} (code {response.get('code')})", status_code=r.status_code, payload=response)
-                    return response
-                elif r.status_code == 408:
-                    log(f"HTTP 408 Timeout (attempt {attempt+1}/{MAX_RETRIES}): {r.text}, duration: {duration:.3f}s")
-                    if attempt < MAX_RETRIES - 1:
-                        time.sleep(2 ** (attempt + 1))
-                        continue
-                    raise BinanceAPIError(f"HTTP 408 after retries: {r.text}", status_code=r.status_code, payload=r.text)
-                else:
-                    try:
-                        payload = r.json()
-                    except Exception:
-                        payload = r.text
-                    raise BinanceAPIError(f"HTTP {r.status_code}: {payload}", status_code=r.status_code, payload=payload)
-            except BinanceAPIError as e:
-                log(f"Request failed (attempt {attempt+1}/{MAX_RETRIES}): {str(e)}, duration: {duration:.3f}s")
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** (attempt + 1))
-                    continue
-                raise
-            except Exception as e:
-                log(f"Request failed (attempt {attempt+1}/{MAX_RETRIES}): {str(e)}, duration: {duration:.3f}s")
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** (attempt + 1))
-                    continue
-                raise BinanceAPIError(f"Request failed after retries: {str(e)}", payload=str(e))
+        params["timestamp"] = int(time.time() * 1000)
+        params["recvWindow"] = 30000
+        query = urlencode({k: str(params[k]) for k in sorted(params.keys())})
+        signature = self._sign(query)
+        url = f"{self.base}{endpoint}?{query}&signature={signature}"
+        headers = {"X-MBX-APIKEY": self.api_key}
+        try:
+            r = requests.request(method, url, headers=headers, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 200:
+                return r.json()
+            else:
+                raise BinanceAPIError(f"HTTP {r.status_code}: {r.text}", r.status_code, r.text)
+        except Exception as e:
+            raise BinanceAPIError(f"Request failed: {str(e)}", payload=str(e))
 
     def public_request(self, path: str, params: dict = None):
         url = f"{self.base}{path}"
-        for attempt in range(2):
-            try:
-                start_time = time.time()
-                r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT, headers={})
-                duration = time.time() - start_time
-                log(f"Public request to {path} took {duration:.3f}s")
-                if r.status_code == 200:
-                    return r.json()
-                else:
-                    try:
-                        payload = r.json()
-                    except Exception:
-                        payload = r.text
-                    raise BinanceAPIError(f"Public API error: {payload}", status_code=r.status_code, payload=payload)
-            except Exception as e:
-                log(f"Public request failed (attempt {attempt+1}/2): {str(e)}")
-                if attempt == 1:
-                    raise BinanceAPIError(f"Public API request failed: {str(e)}", payload=str(e))
+        try:
+            r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 200:
+                return r.json()
+            else:
+                raise BinanceAPIError(f"HTTP {r.status_code}: {r.text}", r.status_code, r.text)
+        except Exception as e:
+            raise BinanceAPIError(f"Public request failed: {str(e)}", payload=str(e))
 
     def get_latest_trade_details(self, symbol):
         params = {"symbol": symbol, "limit": 1}
         try:
             response = self.send_signed_request("GET", "/fapi/v1/userTrades", params)
-            if isinstance(response, dict) and 'data' in response:
-                trades = response['data']
-            else:
-                trades = response if isinstance(response, list) else []
-            if trades and len(trades) > 0:
+            trades = response if isinstance(response, list) else []
+            if trades:
                 trade = trades[0]
                 return {
                     "price": Decimal(str(trade.get("price", "0"))),
@@ -469,9 +334,6 @@ class BinanceClient:
                     "side": trade.get("side")
                 }
             return None
-        except BinanceAPIError as e:
-            log(f"Failed to fetch latest trade details: {str(e)}, payload: {e.payload}")
-            return None
         except Exception as e:
             log(f"Failed to fetch latest trade details: {str(e)}")
             return None
@@ -479,8 +341,6 @@ class BinanceClient:
     def get_open_orders(self, symbol: str):
         params = {"symbol": symbol}
         response = self.send_signed_request("GET", "/fapi/v1/openOrders", params)
-        if isinstance(response, dict) and 'data' in response:
-            return response['data']
         return response if isinstance(response, list) else []
 
     def cancel_all_open_orders(self, symbol: str):
@@ -495,14 +355,8 @@ class BinanceClient:
         params = {"symbol": symbol, "orderId": order_id}
         try:
             trades = self.send_signed_request("GET", "/fapi/v1/userTrades", params)
-            if isinstance(trades, dict) and 'data' in trades:
-                trades = trades['data']
-            trades = trades if isinstance(trades, list) else []
             if trades and len(trades) > 0:
                 return Decimal(str(trades[-1].get("price", "0")))
-            return None
-        except BinanceAPIError as e:
-            log(f"Failed to fetch fill price: {str(e)}, payload: {e.payload}")
             return None
         except Exception as e:
             log(f"Failed to fetch fill price: {str(e)}")
@@ -534,50 +388,35 @@ class BinanceClient:
             params["positionSide"] = position_side
         return self.send_signed_request("POST", "/fapi/v1/order", params)
 
+    def place_trailing_stop_market(self, symbol: str, side: str, quantity: Decimal, callback_rate: Decimal, activation_price: Decimal, reduce_only: bool = True, position_side: str = None):
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "TRAILING_STOP_MARKET",
+            "callbackRate": str(callback_rate),
+            "activationPrice": str(activation_price),
+            "quantity": str(quantity),
+            "reduceOnly": "true" if reduce_only else "false"
+        }
+        if self.dual_side and position_side:
+            params["positionSide"] = position_side
+        return self.send_signed_request("POST", "/fapi/v1/order", params)
+
 # -------- UTILITIES & INDICATORS ----------
 def compute_rsi(closes, period=RSI_PERIOD):
     if len(closes) < period + 1:
         return None
-
-    # Step 1: Initial SMA of first 'period' gains/losses
     deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
     gains = [max(d, 0) for d in deltas]
     losses = [max(-d, 0) for d in deltas]
-
     if len(gains) < period:
         return None
-
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
-
-    # Step 2: If only period+1 candles → return initial RSI
-    if len(deltas) == period:
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        return round(100 - 100 / (1 + rs), 2)
-
-    # Step 3: Wilder smoothing for all subsequent values
-    rsi_values = []
-    current_gain = avg_gain
-    current_loss = avg_loss
-
-    if current_loss == 0:
-        rsi_values.append(100.0)
-    else:
-        rs = current_gain / current_loss
-        rsi_values.append(100 - 100 / (1 + rs))
-
-    for i in range(period, len(deltas)):
-        current_gain = (current_gain * (period - 1) + gains[i]) / period
-        current_loss = (current_loss * (period - 1) + losses[i]) / period
-        if current_loss == 0:
-            rsi_values.append(100.0)
-        else:
-            rs = current_gain / current_loss
-            rsi_values.append(100 - 100 / (1 + rs))
-
-    return round(rsi_values[-1], 2)
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - 100 / (1 + rs), 2)
 
 def sma(data, period):
     if len(data) < period:
@@ -622,28 +461,13 @@ def place_market_order(client: BinanceClient, symbol: str, side: str, quantity):
         "type": "MARKET",
         "quantity": str(quantity)
     }
-    if client.dual_side:
-        params["positionSide"] = "LONG" if side == "BUY" else "SHORT"
     return client.send_signed_request("POST", "/fapi/v1/order", params)
 
 # -------- DATA FETCHING ----------
 def fetch_klines(client: BinanceClient, symbol: str, interval: str, limit=100):
-    """
-    Fetch candle data from Binance Futures API and ensure valid JSON format.
-    Fix: Binance API may return extra wrapper dicts, now handled robustly.
-    """
     try:
         data = client.public_request("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-        if isinstance(data, dict) and "data" in data:
-            klines = data["data"]
-        else:
-            klines = data
-        if not isinstance(klines, list) or not all(isinstance(k, (list, tuple)) for k in klines):
-            raise ValueError("Invalid klines format received from API.")
-        return klines
-    except BinanceAPIError as e:
-        log(f"Klines fetch failed: {str(e)}, payload: {e.payload}")
-        raise
+        return data
     except Exception as e:
         log(f"Klines fetch failed: {str(e)}")
         raise
@@ -651,12 +475,7 @@ def fetch_klines(client: BinanceClient, symbol: str, interval: str, limit=100):
 def fetch_balance(client: BinanceClient):
     try:
         data = client.send_signed_request("GET", "/fapi/v2/account")
-        balance = Decimal(str(data.get("totalWalletBalance", 0)))
-        log(f"Fetched balance: {balance} USDT")
-        return balance
-    except BinanceAPIError as e:
-        log(f"Balance fetch failed: {str(e)}, payload: {e.payload}")
-        raise
+        return Decimal(str(data.get("totalWalletBalance", 0)))
     except Exception as e:
         log(f"Balance fetch failed: {str(e)}")
         raise
@@ -664,16 +483,9 @@ def fetch_balance(client: BinanceClient):
 def has_active_position(client: BinanceClient, symbol: str):
     try:
         positions = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-        if isinstance(positions, dict) and 'data' in positions:
-            positions = positions['data']
-        positions = positions if isinstance(positions, list) else []
         for p in positions:
             if p.get("symbol") == symbol and Decimal(str(p.get("positionAmt", "0"))) != 0:
-                log(f"Active position detected: {p}")
                 return True
-        return False
-    except BinanceAPIError as e:
-        log(f"Position check failed: {str(e)}, payload: {e.payload}")
         return False
     except Exception as e:
         log(f"Position check failed: {str(e)}")
@@ -682,13 +494,7 @@ def has_active_position(client: BinanceClient, symbol: str):
 def fetch_open_positions_details(client: BinanceClient, symbol: str):
     try:
         positions = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-        if isinstance(positions, dict) and 'data' in positions:
-            positions = positions['data']
-        positions = positions if isinstance(positions, list) else []
         return next((p for p in positions if p.get("symbol") == symbol), None)
-    except BinanceAPIError as e:
-        log(f"Position details fetch failed: {str(e)}, payload: {e.payload}")
-        raise
     except Exception as e:
         log(f"Position details fetch failed: {str(e)}")
         raise
@@ -701,266 +507,136 @@ class TradeState:
         self.qty = None
         self.side = None
         self.entry_close_time = None
-        self.exit_close_time = None
+        self.initial_sl = None
         self.sl = None
         self.tp = None
-        self.trail_activated = False
         self.trail_activation_price = None
         self.highest_price = None
         self.lowest_price = None
         self.current_trail_stop = None
         self.risk = None
-        self.initial_sl = None
         self.sl_order_id = None
         self.tp_order_id = None
         self.trail_order_id = None
 
-# -------- DEBUG & RECOVERY FOR EXPIRED ORDERS --------
+# -------- RECOVERY FOR SL, TP, TRAILING ----------
 def debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot=None, telegram_chat_id=None):
-    """
-    Checks and recovers SL, TP, and trailing orders if expired or missing.
-    Extended to handle all conditional orders for safety.
-    """
     if not trade_state.active:
         return
 
     try:
         open_orders = client.get_open_orders(symbol)
 
-        # Helper to recover specific order
-        def recover_order(order_type, order_id, calc_func, place_func, field_name):
-            order = next((o for o in open_orders if o.get("orderId") == order_id), None)
-            if order and order.get("status") == "EXPIRED":
-                log(f"{order_type} ORDER EXPIRED! ID={order_id}. Recovering...", telegram_bot, telegram_chat_id)
-            elif not order:
-                log(f"{order_type} ORDER MISSING (ID={order_id}). Recovering...", telegram_bot, telegram_chat_id)
-            else:
-                return  # Still active
-
-            # Recalculate and re-place
-            pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-            pos = pos_resp['data'][0] if isinstance(pos_resp, dict) and 'data' in pos_resp and pos_resp['data'] else {}
-            pos_amt = Decimal(str(pos.get("positionAmt", "0")))
-            entry_price = Decimal(str(pos.get("entryPrice", "0")))
-
-            if pos_amt == 0 or entry_price == 0:
-                log(f"Cannot recover {order_type}: No valid position.", telegram_bot, telegram_chat_id)
-                return
-
-            side = "LONG" if pos_amt > 0 else "SHORT"
-            close_side = "SELL" if side == "LONG" else "BUY"
-            qty = abs(pos_amt)
-
-            price_raw, rounding = calc_func(entry_price, side)
-            price = quantize_price(price_raw, tick_size, rounding)
-            price_f = float(price)
-
-            log(f"Recovering {order_type}: {close_side} {qty} @ {price_f}", telegram_bot, telegram_chat_id)
-
-            try:
-                new_order = place_func(symbol, close_side, qty, price, reduce_only=True, position_side=side)
-                setattr(trade_state, field_name, new_order.get("orderId"))
-                log(f"{order_type} RECOVERED! New ID: {new_order.get('orderId')} @ {price_f}", telegram_bot, telegram_chat_id)
+        # Check SL
+        if trade_state.sl_order_id and not any(o.get("orderId") == trade_state.sl_order_id for o in open_orders):
+            log(f"SL order missing/expired (ID={trade_state.sl_order_id}). Recovering...", telegram_bot, telegram_chat_id)
+            # Re-calculate and re-place SL
+            entry_price = Decimal(str(trade_state.entry_price or 0))
+            if entry_price > 0:
+                sl_price_dec = entry_price * (Decimal("1") - SL_PCT) if trade_state.side == "LONG" else entry_price * (Decimal("1") + SL_PCT)
+                sl_rounding = ROUND_DOWN if trade_state.side == "LONG" else ROUND_UP
+                sl_price_dec_quant = quantize_price(sl_price_dec, tick_size, sl_rounding)
+                close_side = "SELL" if trade_state.side == "LONG" else "BUY"
+                pos_side = trade_state.side
+                qty_dec = Decimal(str(trade_state.qty))
+                sl_order = client.place_stop_market(symbol, close_side, qty_dec, sl_price_dec_quant, reduce_only=True, position_side=pos_side)
+                trade_state.sl_order_id = sl_order.get("orderId")
+                trade_state.sl = float(sl_price_dec_quant)
+                log(f"SL recovered: new ID={trade_state.sl_order_id}", telegram_bot, telegram_chat_id)
                 if telegram_bot and telegram_chat_id:
-                    telegram_post(telegram_bot, telegram_chat_id, f"{order_type} RECOVERED\nNew Price: {price_f}\nID: {new_order.get('orderId')}")
-            except Exception as e:
-                log(f"Failed to recover {order_type}: {str(e)}", telegram_bot, telegram_chat_id)
+                    telegram_post(telegram_bot, telegram_chat_id, f"SL Recovered for {symbol}\nNew Stop: {trade_state.sl:.4f}\nOrder ID: {trade_state.sl_order_id}")
 
-        # SL Recovery
-        def calc_sl(entry, side):
-            if side == "LONG":
-                return entry * (Decimal("1") - SL_PCT), ROUND_DOWN
-            else:
-                return entry * (Decimal("1") + SL_PCT), ROUND_UP
-        recover_order("SL", trade_state.sl_order_id, calc_sl, client.place_stop_market, "sl_order_id")
+        # Check TP
+        if trade_state.tp_order_id and not any(o.get("orderId") == trade_state.tp_order_id for o in open_orders):
+            log(f"TP order missing/expired (ID={trade_state.tp_order_id}). Recovering...", telegram_bot, telegram_chat_id)
+            # Re-calculate and re-place TP
+            entry_price = Decimal(str(trade_state.entry_price or 0))
+            if entry_price > 0:
+                R = entry_price * SL_PCT
+                tp_price_dec = entry_price + (TP_MULT * R) if trade_state.side == "LONG" else entry_price - (TP_MULT * R)
+                tp_rounding = ROUND_UP if trade_state.side == "LONG" else ROUND_DOWN
+                tp_price_dec_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
+                close_side = "SELL" if trade_state.side == "LONG" else "BUY"
+                pos_side = trade_state.side
+                qty_dec = Decimal(str(trade_state.qty))
+                tp_order = client.place_take_profit_market(symbol, close_side, qty_dec, tp_price_dec_quant, reduce_only=True, position_side=pos_side)
+                trade_state.tp_order_id = tp_order.get("orderId")
+                trade_state.tp = float(tp_price_dec_quant)
+                log(f"TP recovered: new ID={trade_state.tp_order_id}", telegram_bot, telegram_chat_id)
+                if telegram_bot and telegram_chat_id:
+                    telegram_post(telegram_bot, telegram_chat_id, f"TP Recovered for {symbol}\nNew TP: {trade_state.tp:.4f}\nOrder ID: {trade_state.tp_order_id}")
 
-        # TP Recovery
-        def calc_tp(entry, side):
-            R = entry * SL_PCT
-            if side == "LONG":
-                return entry + (TP_MULT * R), ROUND_UP
-            else:
-                return entry - (TP_MULT * R), ROUND_DOWN
-        recover_order("TP", trade_state.tp_order_id, calc_tp, client.place_take_profit_market, "tp_order_id")
-
-        # Trailing Recovery (if activated, re-place at current trail stop)
-        if trade_state.trail_order_id:
-            def calc_trail(entry, side):
-                # Use current_trail_stop if available
-                if trade_state.current_trail_stop:
-                    return trade_state.current_trail_stop, ROUND_DOWN if side == "LONG" else ROUND_UP
-                # Fallback: recalculate initial trail stop
-                initial_sl = entry * (1 - SL_PCT) if side == "LONG" else entry * (1 + SL_PCT)
-                R = entry * SL_PCT
-                if side == "LONG":
-                    return initial_sl + (TRAIL_INITIAL_OFFSET_MULT * R), ROUND_DOWN
-                else:
-                    return initial_sl - (TRAIL_INITIAL_OFFSET_MULT * R), ROUND_UP
-            recover_order("TRAILING", trade_state.trail_order_id, calc_trail, client.place_stop_market, "trail_order_id")
+        # Check Trailing Stop
+        if trade_state.trail_order_id and not any(o.get("orderId") == trade_state.trail_order_id for o in open_orders):
+            log(f"Trailing order missing/expired (ID={trade_state.trail_order_id}). Recovering...", telegram_bot, telegram_chat_id)
+            # Re-calculate and re-place Trailing
+            entry_price = Decimal(str(trade_state.entry_price or 0))
+            if entry_price > 0:
+                R = entry_price * SL_PCT
+                trail_activation_price_dec = entry_price + (TRAIL_TRIGGER_MULT * R) if trade_state.side == "LONG" else entry_price - (TRAIL_TRIGGER_MULT * R)
+                trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, tick_size)
+                callback_rate = TRAIL_DISTANCE_MULT * SL_PCT * Decimal('100')
+                close_side = "SELL" if trade_state.side == "LONG" else "BUY"
+                pos_side = trade_state.side
+                qty_dec = Decimal(str(trade_state.qty))
+                trail_order = client.place_trailing_stop_market(symbol, close_side, qty_dec, callback_rate, trail_activation_price_dec_quant, reduce_only=True, position_side=pos_side)
+                trade_state.trail_order_id = trail_order.get("orderId")
+                trade_state.trail_activation_price = trail_activation_price_dec_quant
+                log(f"Trailing recovered: new ID={trade_state.trail_order_id}", telegram_bot, telegram_chat_id)
+                if telegram_bot and telegram_chat_id:
+                    telegram_post(telegram_bot, telegram_chat_id, f"Trailing Recovered for {symbol}\nActivation: {float(trail_activation_price_dec_quant):.4f}\nOrder ID: {trade_state.trail_order_id}")
 
     except Exception as e:
-        log(f"Error in debug_and_recover_expired_orders: {str(e)}", telegram_bot, telegram_chat_id)
+        log(f"Recovery error: {str(e)}", telegram_bot, telegram_chat_id)
 
 # -------- TRADE MONITORING ----------
 def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot=None, telegram_chat_id=None):
     log("Monitoring active trade...", telegram_bot, telegram_chat_id)
-    last_position_check = 0
-    last_trail_update = 0
     last_recovery_check = 0
-    RECOVERY_CHECK_INTERVAL = 10  # Throttle to every 10s to reduce logs/openOrders calls
-
-    close_side = "SELL" if trade_state.side == "LONG" else "BUY"
-    pos_side = trade_state.side
-    qty_dec = Decimal(str(trade_state.qty))
     while trade_state.active:
         if STOP_REQUESTED or os.path.exists("stop.txt"):
             log("Stop requested during monitoring. Exiting.", telegram_bot, telegram_chat_id)
             break
+        current_time = time.time()
+        if current_time - last_recovery_check >= RECOVERY_CHECK_INTERVAL:
+            debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
+            last_recovery_check = current_time
         try:
-            current_time = time.time()
-            # Throttled recovery check (reduces repetitive logs)
-            if current_time - last_recovery_check >= RECOVERY_CHECK_INTERVAL:
-                debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
-                last_recovery_check = current_time
-
-            if current_time - last_position_check >= POSITION_CHECK_INTERVAL:
-                try:
+            pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+            positions = pos_resp['data'] if isinstance(pos_resp, dict) and 'data' in pos_resp else pos_resp if isinstance(pos_resp, list) else []
+            pos_item = next((p for p in positions if p.get("symbol") == symbol), None)
+            pos_amt = Decimal(str(pos_item.get("positionAmt", "0"))) if pos_item else Decimal('0')
+            if pos_amt == 0:
+                log("Position closed.", telegram_bot, telegram_chat_id)
+                trade_state.active = False
+                latest_trade = client.get_latest_trade_details(symbol)
+                exit_price = latest_trade["price"] if latest_trade else None
+                if exit_price is None:
                     ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
-                    current_price = Decimal(str(ticker.get("price")))
-                except BinanceAPIError as e:
-                    log(f"Price fetch failed: {str(e)}, payload: {e.payload}", telegram_bot, telegram_chat_id)
-                    time.sleep(2)
-                    continue
-                except Exception as e:
-                    log(f"Price fetch failed: {str(e)}", telegram_bot, telegram_chat_id)
-                    time.sleep(2)
-                    continue
-                # Update highest/lowest price (SAFE)
-                if trade_state.side == "LONG":
-                    if trade_state.highest_price is None or current_price > trade_state.highest_price:
-                        trade_state.highest_price = current_price
-                else:
-                    if trade_state.lowest_price is None or current_price < trade_state.lowest_price:
-                        trade_state.lowest_price = current_price
-
-                # Check for trailing stop activation
-                if not trade_state.trail_activated and trade_state.trail_activation_price:
-                    activation_hit = (trade_state.side == "LONG" and current_price >= trade_state.trail_activation_price) or \
-                                     (trade_state.side == "SHORT" and current_price <= trade_state.trail_activation_price)
-                    if activation_hit:
-                        log(f"Trailing stop activated at price={current_price}", telegram_bot, telegram_chat_id)
-                        trade_state.trail_activated = True
-                        R = Decimal(str(trade_state.risk))
-                        if trade_state.side == "LONG":
-                            initial_stop_price = trade_state.initial_sl + (TRAIL_INITIAL_OFFSET_MULT * R)
-                            rounding = ROUND_DOWN
-                        else:
-                            initial_stop_price = trade_state.initial_sl - (TRAIL_INITIAL_OFFSET_MULT * R)
-                            rounding = ROUND_UP
-                        initial_stop_price_quant = quantize_price(initial_stop_price, tick_size, rounding)
-                        trade_state.current_trail_stop = initial_stop_price_quant
-                        try:
-                            trail_order = client.place_stop_market(symbol, close_side, qty_dec, initial_stop_price_quant, reduce_only=True, position_side=pos_side)
-                            trade_state.trail_order_id = trail_order.get("orderId")
-                            log(f"Placed initial trail STOP_MARKET: {trail_order}", telegram_bot, telegram_chat_id)
-                            if telegram_bot and telegram_chat_id:
-                                send_trailing_activation_telegram(symbol, trade_state.side, float(current_price), float(initial_stop_price_quant), telegram_bot, telegram_chat_id)
-                        except Exception as e:
-                            log(f"Failed to place initial trail stop: {str(e)}", telegram_bot, telegram_chat_id)
-
-                # Update trailing stop if activated
-                if trade_state.trail_activated:
-                    new_stop_price = None
-                    if trade_state.side == "LONG":
-                        if trade_state.highest_price is None:
-                            continue  # Skip if no data
-                        new_stop_price = trade_state.highest_price - (TRAIL_DISTANCE_MULT * Decimal(str(trade_state.risk)))
-                        rounding = ROUND_DOWN
-                    else:
-                        if trade_state.lowest_price is None:
-                            continue  # Skip if no data
-                        new_stop_price = trade_state.lowest_price + (TRAIL_DISTANCE_MULT * Decimal(str(trade_state.risk)))
-                        rounding = ROUND_UP
-
-                    new_stop_price_quant = quantize_price(new_stop_price, tick_size, rounding)
-
-                    # SAFE update condition
-                    should_update = False
-                    if trade_state.side == "LONG":
-                        if trade_state.current_trail_stop is not None:
-                            should_update = new_stop_price_quant > trade_state.current_trail_stop
-                    else:
-                        if trade_state.current_trail_stop is not None:
-                            should_update = new_stop_price_quant < trade_state.current_trail_stop
-
-                    if should_update and current_time - last_trail_update > 1:
-                        # Cancel + place new
-                        if trade_state.trail_order_id:
-                            try:
-                                client.cancel_order(symbol, trade_state.trail_order_id)
-                                log(f"Cancelled old trail order ID {trade_state.trail_order_id}", telegram_bot, telegram_chat_id)
-                            except Exception as e:
-                                log(f"Failed to cancel old trail order: {str(e)}", telegram_bot, telegram_chat_id)
-                        try:
-                            trail_order = client.place_stop_market(symbol, close_side, qty_dec, new_stop_price_quant, reduce_only=True, position_side=pos_side)
-                            trade_state.trail_order_id = trail_order.get("orderId")
-                            trade_state.current_trail_stop = new_stop_price_quant
-                            log(f"Updated trail STOP_MARKET: new_stop_price={new_stop_price_quant}", telegram_bot, telegram_chat_id)
-                            if telegram_bot and telegram_chat_id:
-                                send_trailing_update_telegram(symbol, trade_state.side, float(new_stop_price_quant), telegram_bot, telegram_chat_id)
-                            last_trail_update = current_time
-                        except Exception as e:
-                            log(f"Failed to update trail stop: {str(e)}", telegram_bot, telegram_chat_id)
-                pos = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-                if isinstance(pos, dict) and 'data' in pos:
-                    pos = pos['data']
-                pos = pos if isinstance(pos, list) else []
-                pos_amt = Decimal(str(pos[0].get("positionAmt", "0"))) if pos and len(pos) > 0 else Decimal('0')
-                last_position_check = current_time
-                if pos_amt == Decimal('0'):
-                    log("Position closed.", telegram_bot, telegram_chat_id)
-                    trade_state.active = False
-                    trade_state.exit_close_time = int(current_time * 1000)
-                    try:
-                        latest_trade = client.get_latest_trade_details(symbol)
-                        if latest_trade:
-                            actual_exit_price = latest_trade["price"]
-                            closing_order_id = latest_trade["orderId"]
-                            if closing_order_id == trade_state.sl_order_id:
-                                reason = "Stop Loss"
-                            elif closing_order_id == trade_state.tp_order_id:
-                                reason = "Take Profit"
-                            elif closing_order_id == trade_state.trail_order_id:
-                                reason = "Trailing Stop"
-                            else:
-                                reason = "Unknown"
-                            log(f"Position closed by {reason} at real fill price {actual_exit_price}", telegram_bot, telegram_chat_id)
-                        else:
-                            log("Failed to fetch latest trade details; using current price.", telegram_bot, telegram_chat_id)
-                            actual_exit_price = current_price
-                            reason = "Unknown"
-                        actual_exit_price_f = float(actual_exit_price)
-                        R = Decimal(str(trade_state.entry_price)) * SL_PCT
-                        pnl_row = log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, actual_exit_price_f, trade_state.qty, float(R))
-                        if telegram_bot and telegram_chat_id:
-                            send_closure_telegram(symbol, trade_state.side, trade_state.entry_price, actual_exit_price_f, trade_state.qty, pnl_row['pnl_usd'], pnl_row['pnl_r'], reason, telegram_bot, telegram_chat_id)
-                        client.cancel_all_open_orders(symbol)
-                        log("Cancelled all remaining open orders.", telegram_bot, telegram_chat_id)
-                    except BinanceAPIError as e:
-                        log(f"Failed to fetch exit details: {str(e)}, payload: {e.payload}", telegram_bot, telegram_chat_id)
-                    except Exception as e:
-                        log(f"Failed to fetch exit details: {str(e)}", telegram_bot, telegram_chat_id)
-                    return
-                time.sleep(1)
-        except BinanceAPIError as e:
-            log(f"Monitor error: {str(e)}, payload: {e.payload}", telegram_bot, telegram_chat_id)
-            time.sleep(2)
+                    exit_price = Decimal(str(ticker.get("price")))
+                exit_price_f = float(exit_price)
+                reason = "Unknown"
+                if latest_trade:
+                    closing_order_id = latest_trade["orderId"]
+                    if closing_order_id == trade_state.sl_order_id:
+                        reason = "Stop Loss"
+                    elif closing_order_id == trade_state.tp_order_id:
+                        reason = "Take Profit"
+                    elif closing_order_id == trade_state.trail_order_id:
+                        reason = "Trailing Stop"
+                R = Decimal(str(trade_state.entry_price or 0)) * SL_PCT
+                pnl_row = log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price or 0.0, exit_price_f, trade_state.qty, float(R))
+                send_closure_telegram(symbol, trade_state.side, trade_state.entry_price or 0.0, exit_price_f, trade_state.qty, pnl_row['pnl_usd'], pnl_row['pnl_r'], reason, telegram_bot, telegram_chat_id)
+                client.cancel_all_open_orders(symbol)
+                log("Cancelled all remaining open orders.", telegram_bot, telegram_chat_id)
+                return
+            time.sleep(1)
         except Exception as e:
             log(f"Monitor error: {str(e)}", telegram_bot, telegram_chat_id)
             time.sleep(2)
 
 # -------- TRADING LOOP ----------
-def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, telegram_bot=None, telegram_chat_id=None):
+def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, telegram_bot, telegram_chat_id):
     trades_today = 0
     last_processed_time = 0
     trade_state = TradeState()
@@ -973,9 +649,9 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
     min_notional = filters['minNotional']
     signal.signal(signal.SIGINT, lambda s, f: _request_stop(s, f, symbol, telegram_bot, telegram_chat_id))
     signal.signal(signal.SIGTERM, lambda s, f: _request_stop(s, f, symbol, telegram_bot, telegram_chat_id))
-    log(f"Connected ({'LIVE' if client.use_live else 'TESTNET'}). Starting bot with symbol={symbol}, timeframe={timeframe}", telegram_bot, telegram_chat_id)
+    log(f"Starting bot with symbol={symbol}, timeframe={timeframe}, risk_pct={risk_pct*100}%")
 
-    # Startup recovery
+    # Startup recovery for existing position
     if has_active_position(client, symbol):
         pos = fetch_open_positions_details(client, symbol)
         pos_amt = Decimal(str(pos.get("positionAmt", "0")))
@@ -984,13 +660,11 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             trade_state.side = "LONG" if pos_amt > 0 else "SHORT"
             trade_state.qty = float(abs(pos_amt))
             trade_state.entry_price = float(Decimal(str(pos.get("entryPrice", "0"))))
-            trade_state.initial_sl = float(Decimal(str(pos.get("entryPrice", "0"))) * (1 - SL_PCT)) if trade_state.side == "LONG" else float(Decimal(str(pos.get("entryPrice", "0"))) * (1 + SL_PCT))
-            trade_state.risk = float(Decimal(str(trade_state.entry_price)) * SL_PCT)
-            trade_state.trail_activation_price = float(Decimal(str(trade_state.entry_price)) * (1 + TRAIL_TRIGGER_MULT * SL_PCT)) if trade_state.side == "LONG" else float(Decimal(str(trade_state.entry_price)) * (1 - TRAIL_TRIGGER_MULT * SL_PCT))
-            trade_state.sl_order_id = None  # Force unknown on startup
+            trade_state.risk = Decimal(str(trade_state.entry_price)) * SL_PCT
+            trade_state.sl_order_id = None  # Reset to force check
             trade_state.tp_order_id = None
             trade_state.trail_order_id = None
-            log("Existing position detected on startup. Forcing order recovery...", telegram_bot, telegram_chat_id)
+            log("Existing position detected on startup. Recovering orders...", telegram_bot, telegram_chat_id)
             debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
             monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
 
@@ -1046,8 +720,8 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             is_green_candle = close_price > open_price
             is_red_candle = close_price < open_price
             log(f"Candle close price={close_price} RSI={rsi} Vol={curr_vol:.2f} SMA15={(vol_sma15 or 0):.2f} {'Green' if is_green_candle else 'Red' if is_red_candle else 'Neutral'} candle", telegram_bot, telegram_chat_id)
-            if prevent_same_bar and trade_state.exit_close_time == close_time:
-                log("Same bar as exit. Skipping to prevent re-entry.", telegram_bot, telegram_chat_id)
+            if prevent_same_bar and trade_state.entry_close_time == close_time:
+                log("Same bar as entry. Skipping to prevent re-entry.", telegram_bot, telegram_chat_id)
                 last_processed_time = close_time
                 time.sleep(1)
                 continue
@@ -1156,6 +830,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     actual_fill_price = entry_price
                 actual_fill_price_f = float(actual_fill_price)
                 # Recalculate with actual fill price
+                actual_fill_price = Decimal(str(actual_fill_price_f))
                 if buy_signal:
                     sl_price_dec = actual_fill_price * (Decimal("1") - SL_PCT)
                     R = actual_fill_price * SL_PCT
@@ -1170,7 +845,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 sl_price_f = float(sl_price_dec_quant)
                 tp_price_dec_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
                 tp_price_f = float(tp_price_dec_quant)
-                trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, tick_size)
+                trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, tick_size, trail_rounding)
                 try:
                     ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
                     current_price = Decimal(str(ticker.get("price")))
@@ -1236,7 +911,15 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     log(f"Placed TAKE_PROFIT_MARKET TP: {tp_order}", telegram_bot, telegram_chat_id)
                 except Exception as e:
                     log(f"Failed to place TP: {str(e)}", telegram_bot, telegram_chat_id)
-                # No initial trail order here; manual handling starts in monitor_trade
+                # Place TRAILING_STOP_MARKET immediately
+                callback_rate = TRAIL_DISTANCE_MULT * SL_PCT * Decimal('100')
+                activation_price = trail_activation_price_dec_quant
+                try:
+                    trail_order = client.place_trailing_stop_market(symbol, close_side, qty_dec, callback_rate, activation_price, reduce_only=True, position_side=pos_side)
+                    trade_state.trail_order_id = trail_order.get("orderId")
+                    log(f"Placed TRAILING_STOP_MARKET: {trail_order}", telegram_bot, telegram_chat_id)
+                except Exception as e:
+                    log(f"Failed to place trailing stop: {str(e)}", telegram_bot, telegram_chat_id)
                 trades_today += 1
                 pending_entry = False
                 monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
@@ -1298,7 +981,7 @@ def run_scheduler(bot, chat_id):
 
 # -------- ENTRY POINT ----------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Binance Futures RSI Bot (Manual Trade Management, 30m Optimized, SOLUSDT)")
+    parser = argparse.ArgumentParser(description="Binance Futures RSI Bot (Binance Trailing, 30m Optimized, SOLUSDT)")
     parser.add_argument("--api-key", required=True, help="Binance API Key")
     parser.add_argument("--api-secret", required=True, help="Binance API Secret")
     parser.add_argument("--telegram-token", required=True, help="Telegram Bot Token")
