@@ -46,6 +46,7 @@ MAX_RETRIES = 5
 RATE_LIMIT_CHECK_INTERVAL = 60
 RATE_LIMIT_THRESHOLD = 80
 RECOVERY_CHECK_INTERVAL = 10  # Seconds between recovery checks
+TRAIL_UPDATE_THROTTLE = 10.0  # ENHANCED✅ Alert trailing updates every 10 seconds max
 
 # Global stop flag and client
 STOP_REQUESTED = False
@@ -403,16 +404,28 @@ class BinanceClient:
         return self.send_signed_request("POST", "/fapi/v1/order", params)
 
 # -------- UTILITIES & INDICATORS ----------
-def compute_rsi(closes, period=RSI_PERIOD):
+def compute_rsi(closes, period=14):  # ENHANCED✅ True Wilder RSI
     if len(closes) < period + 1:
         return None
-    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains = [max(d, 0) for d in deltas]
-    losses = [max(-d, 0) for d in deltas]
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        delta = closes[i] - closes[i-1]
+        gains.append(max(delta, 0))
+        losses.append(max(-delta, 0))
+    
     if len(gains) < period:
         return None
+    
+    # First average
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
+    
+    # Smooth subsequent values
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
@@ -511,9 +524,11 @@ class TradeState:
         self.sl = None
         self.tp = None
         self.trail_activation_price = None
-        self.highest_price = None
-        self.lowest_price = None
-        self.current_trail_stop = None
+        self.highest_price = None  # ENHANCED✅ For simulating trailing
+        self.lowest_price = None  # ENHANCED✅ For simulating trailing
+        self.current_trail_stop = None  # ENHANCED✅ Simulated current stop
+        self.trail_activated = False  # ENHANCED✅ Track activation
+        self.last_trail_alert = 0.0  # ENHANCED✅ Throttle alerts
         self.risk = None
         self.sl_order_id = None
         self.tp_order_id = None
@@ -631,6 +646,48 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot=None, tel
                 log("Cancelled all remaining open orders.", telegram_bot, telegram_chat_id)
                 return
             time.sleep(1)
+
+            # === SIMULATE TRAILING STOP FOR ALERTS ONLY ===  # ENHANCED✅
+            try:
+                price_data = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+                price = Decimal(str(price_data["price"]))
+            except:
+                continue
+
+            # Update high/low
+            if trade_state.side == "LONG":
+                if trade_state.highest_price is None or price > trade_state.highest_price:
+                    trade_state.highest_price = price
+            else:
+                if trade_state.lowest_price is None or price < trade_state.lowest_price:
+                    trade_state.lowest_price = price
+
+            # Activation
+            if not trade_state.trail_activated and trade_state.trail_activation_price:
+                if (trade_state.side == "LONG" and price >= trade_state.trail_activation_price) or \
+                   (trade_state.side == "SHORT" and price <= trade_state.trail_activation_price):
+                    trade_state.trail_activated = True
+                    R = Decimal(str(trade_state.risk))
+                    init_stop = trade_state.entry_price - (TRAIL_DISTANCE_MULT * float(R)) if trade_state.side == "LONG" else \
+                                trade_state.entry_price + (TRAIL_DISTANCE_MULT * float(R))
+                    init_stop = quantize_price(Decimal(str(init_stop)), tick_size, ROUND_DOWN if trade_state.side == "LONG" else ROUND_UP)
+                    send_trailing_activation_telegram(symbol, trade_state.side, float(price), float(init_stop), telegram_bot, telegram_chat_id)
+                    trade_state.current_trail_stop = init_stop
+
+            # Update (throttled)
+            if trade_state.trail_activated and time.time() - trade_state.last_trail_alert >= TRAIL_UPDATE_THROTTLE:
+                R = Decimal(str(trade_state.risk))
+                new_stop_raw = trade_state.highest_price - (TRAIL_DISTANCE_MULT * R) if trade_state.side == "LONG" else \
+                               trade_state.lowest_price + (TRAIL_DISTANCE_MULT * R)
+                new_stop = quantize_price(new_stop_raw, tick_size, ROUND_DOWN if trade_state.side == "LONG" else ROUND_UP)
+                if (trade_state.current_trail_stop is None or
+                    (trade_state.side == "LONG" and new_stop > trade_state.current_trail_stop) or
+                    (trade_state.side == "SHORT" and new_stop < trade_state.current_trail_stop)):
+                    trade_state.current_trail_stop = new_stop
+                    send_trailing_update_telegram(symbol, trade_state.side, float(new_stop), telegram_bot, telegram_chat_id)
+                    trade_state.last_trail_alert = time.time()
+            # ==============================================  # ENHANCED✅
+
         except Exception as e:
             log(f"Monitor error: {str(e)}", telegram_bot, telegram_chat_id)
             time.sleep(2)
@@ -872,6 +929,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     continue
                 trade_state.active = True
                 trade_state.entry_price = actual_fill_price_f
+                trade_state.risk = R  # ENHANCED✅ Store Decimal R for trailing simulation
                 trade_state.qty = float(actual_qty)
                 trade_state.side = "LONG" if buy_signal else "SHORT"
                 trade_state.entry_close_time = close_time
