@@ -77,14 +77,17 @@ def init_pnl_log():
             writer.writeheader()
 
 def log_pnl(trade_id, side, entry, exit_price, qty, R):
+    entry = Decimal(str(entry))
+    exit_price = Decimal(str(exit_price))
+    qty = Decimal(str(qty))
+    R = Decimal(str(R))  # ← ADD THIS
+
     if side == 'LONG':
         pnl_usd = (exit_price - entry) * qty
     else:
-        exit_price = Decimal(str(exit_price))
-        entry = Decimal(str(entry))
-        qty = Decimal(str(qty))
         pnl_usd = (entry - exit_price) * qty
-    pnl_r = pnl_usd / R if R > 0 else 0
+    pnl_r = pnl_usd / R if R > 0 else Decimal('0')
+    
     row = {
         'date': datetime.now(timezone.utc).isoformat(),
         'trade_id': trade_id,
@@ -94,6 +97,7 @@ def log_pnl(trade_id, side, entry, exit_price, qty, R):
         'pnl_usd': float(pnl_usd),
         'pnl_r': float(pnl_r)
     }
+    # ... rest unchanged
     pnl_data.append(row)
     with open(PNL_LOG_FILE, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=row.keys())
@@ -745,13 +749,11 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot=None, tel
                                     reason = "Take Profit"
                         except Exception as e:
                             log(f"Failed to detect exit reason: {e}", telegram_bot, telegram_chat_id)
-                    entry_price_safe = float(trade_state.entry_price or 0.0)
-                    R = Decimal(str(entry_price_safe)) * SL_PCT
-                    R_float = float(R)
+                    R_float = float(trade_state.risk or 0.0)
                     pnl_row = log_pnl(
                         len(pnl_data) + 1,
                         trade_state.side,
-                        entry_price_safe,
+                        float(trade_state.entry_price or 0.0),
                         exit_price_f,
                         float(trade_state.qty or 0),
                         R_float
@@ -1127,7 +1129,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
 
                 trade_state.active = True
                 trade_state.entry_price = actual_fill_price_f
-                trade_state.risk = float(R)
+                trade_state.risk = R
                 trade_state.qty = float(actual_qty)
                 trade_state.side = "LONG" if buy_signal else "SHORT"
                 trade_state.entry_close_time = close_time
