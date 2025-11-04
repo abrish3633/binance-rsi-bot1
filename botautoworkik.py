@@ -37,10 +37,10 @@ RSI_PERIOD = 14
 MAX_TRADES_PER_DAY = 3
 INTERVAL_DEFAULT = "30m"
 ORDER_FILL_TIMEOUT = 15
-BUY_RSI_MIN = 50
-BUY_RSI_MAX = 80
-SELL_RSI_MIN = 20
-SELL_RSI_MAX = 50
+BUY_RSI_MIN = 54
+BUY_RSI_MAX = 66
+SELL_RSI_MIN = 34
+SELL_RSI_MAX = 46
 POSITION_CHECK_INTERVAL = 60
 TRAIL_PRICE_BUFFER = Decimal("0.003")
 KLINES_CACHE_DURATION = 5.0
@@ -1035,7 +1035,13 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             close_time = last_close_time
             is_green_candle = close_price > open_price
             is_red_candle = close_price < open_price
-            log(f"Candle close price={float(close_price):.4f} RSI={rsi} Vol={curr_vol:.2f} SMA15={(vol_sma15 or 0):.2f} {'Green' if is_green_candle else 'Red' if is_red_candle else 'Neutral'} candle", telegram_bot, telegram_chat_id)
+            def fmt(x): return f"{float(x or 0):.2f}"
+            
+            log(
+                f"Candle close price={float(close_price):.4f} RSI={rsi:.2f} Vol={float(curr_vol):.2f} SMA15={float(vol_sma15 or 0):.2f} "
+                f"{'Green' if is_green_candle else 'Red' if is_red_candle else 'Neutral'} candle",
+                telegram_bot, telegram_chat_id
+            )
 
             if prevent_same_bar and getattr(trade_state, 'entry_close_time', None) == close_time:
                 last_processed_time = close_time
@@ -1239,11 +1245,25 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
     log("Trading loop exited.", telegram_bot, telegram_chat_id)
 
 def interval_ms(interval):
+    interval = interval.strip().lower()
     if interval.endswith("m"):
-        return int(interval[:-1]) * 60 * 1000
-    if interval.endswith("h"):
-        return int(interval[:-1]) * 60 * 60 * 1000
-    return 30 * 60 * 1000
+        try:
+            minutes = int(interval[:-1])
+            if minutes <= 0:
+                raise ValueError
+            return minutes * 60 * 1000
+        except:
+            raise ValueError(f"Invalid minutes in timeframe: {interval}")
+    elif interval.endswith("h"):
+        try:
+            hours = int(interval[:-1])
+            if hours <= 0:
+                raise ValueError
+            return hours * 60 * 60 * 1000
+        except:
+            raise ValueError(f"Invalid hours in timeframe: {interval}")
+    else:
+        raise ValueError(f"Unsupported timeframe: {interval}. Use e.g., 5m, 45m, 1h")
 
 def _safe_sleep(total_seconds):
     remaining = float(total_seconds)
