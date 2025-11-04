@@ -900,6 +900,32 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot=None, tel
                     ws.close()
             except:
                 pass
+def place_sl_order_closepos(client: BinanceClient, symbol: str, stop_price: str, side: str):
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "STOP_MARKET",
+        "closePosition": "true",
+        "stopPrice": stop_price,
+        "recvWindow": 30000
+    }
+    if client.dual_side:
+        params["positionSide"] = "LONG" if side == "SELL" else "SHORT"
+    return client.send_signed_request("POST", "/fapi/v1/order", params)
+
+def place_tp_order_closepos(client: BinanceClient, symbol: str, stop_price: str, side: str):
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "TAKE_PROFIT_MARKET",
+        "closePosition": "true",
+        "stopPrice": stop_price,
+        "recvWindow": 30000
+    }
+    if client.dual_side:
+        params["positionSide"] = "LONG" if side == "SELL" else "SHORT"
+    return client.send_signed_request("POST", "/fapi/v1/order", params)
+            
 # ------------------- TRADING LOOP -------------------
 def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, telegram_bot, telegram_chat_id):
     global last_trade_date
@@ -1017,6 +1043,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             if (buy_signal or sell_signal) and not trade_state.active and not pending_entry:
                 last_processed_time = close_time
                 side_text = "BUY" if buy_signal else "SELL"
+                close_side_for_orders = "SELL" if buy_signal else "BUY"
                 log(f"Signal on candle close -> {side_text}. Preparing entry.", telegram_bot, telegram_chat_id)
                 pending_entry = True
                 entry_price = close_price
@@ -1177,7 +1204,6 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 send_trade_telegram(trade_details, telegram_bot, telegram_chat_id)
 
                 # === PLACE SL/TP ORDERS + SAVE orderId ===
-                close_side_for_orders = "SELL" if buy_signal else "BUY"
                 
                 try:
                     log("Placing SL and TP orders...", telegram_bot, telegram_chat_id)
