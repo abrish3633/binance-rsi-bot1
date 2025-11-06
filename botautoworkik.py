@@ -174,8 +174,8 @@ def send_trailing_activation_telegram(symbol, side, activation_price, initial_st
         f"Trailing Stop Activated:\n"
         f"- Symbol: {symbol}\n"
         f"- Side: {side}\n"
-        f"- Activation Price: {activation_price:.4f}\n"
-        f"- Initial Stop Price: {initial_stop_price:.4f}\n"
+        f"- Activation Price: {float(activation_price):.4f}\n"
+        f"- Initial Stop Price: {float(initial_stop_price):.4f}\n"
     )
     telegram_post(bot, chat_id, message)
 
@@ -184,7 +184,7 @@ def send_trailing_update_telegram(symbol, side, new_stop_price, bot, chat_id):
         f"Trailing Stop Updated:\n"
         f"- Symbol: {symbol}\n"
         f"- Side: {side}\n"
-        f"- New Stop Price: {new_stop_price:.4f}\n"
+        f"- New Stop Price: {float(new_stop_price):.4f}\n"
     )
     telegram_post(bot, chat_id, message)
 
@@ -646,6 +646,7 @@ def debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, tel
             if new_trail:
                 trade_state.trail_order_id = new_trail["orderId"]
                 trade_state.trail_activation_price = float(act_price)
+                trade_state.current_trail_stop = float(new_trail.get("stopPrice") or act_price)
                 _tg_notify("Trailing Recovered", f"Activation: {trade_state.trail_activation_price:.4f}\nOrder ID: {trade_state.trail_order_id}", symbol, telegram_bot, telegram_chat_id)
 
     except Exception as e:
