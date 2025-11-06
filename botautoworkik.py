@@ -1228,8 +1228,11 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 trades_today += 1
                 last_trade_date = current_date
                 pending_entry = False
-                monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
-
+                monitor_trade(
+                    client, symbol, trade_state, tick_size,
+                    telegram_bot, telegram_chat_id,
+                    close_time  # ← ADD THIS
+                )
             else:
                 if not (trade_state.active or pending_entry):
                     log("No trade signal on candle close.", telegram_bot, telegram_chat_id)
