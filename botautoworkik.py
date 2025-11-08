@@ -467,6 +467,40 @@ def quantize_qty(qty: Decimal, step_size: Decimal) -> Decimal:
 def quantize_price(p: Decimal, tick_size: Decimal, rounding=ROUND_HALF_EVEN) -> Decimal:
     return p.quantize(tick_size, rounding=rounding)
 
+def aggregate_klines_to_45m(klines_15m):
+    if len(klines_15m) < 3:
+        return []
+
+    aggregated = []
+    # tolerance in ms for alignment (small allowance for minor timing differences)
+    TOLERANCE_MS = 2000
+    for i in range(0, len(klines_15m) - 2, 3):  # Every 3 candles
+        a, b, c = klines_15m[i], klines_15m[i+1], klines_15m[i+2]
+        open_time = int(a[0])
+        close_time = int(c[6])
+
+        expected_duration = 3 * 15 * 60 * 1000  # 45 minutes in ms
+
+        # Only accept if the group is complete and aligned (allow tiny tolerance)
+        if abs((close_time - open_time) - expected_duration) > TOLERANCE_MS:
+            continue  # Skip incomplete or misaligned
+
+        high = max(float(a[2]), float(b[2]), float(c[2]))
+        low = min(float(a[3]), float(b[3]), float(c[3]))
+        volume = float(a[5]) + float(b[5]) + float(c[5])
+
+        aggregated.append([
+            open_time,
+            float(a[1]),    # open
+            high,
+            low,
+            float(c[4]),    # close
+            volume,
+            close_time
+        ])
+
+    return aggregated
+
 # ------------------- SYMBOL FILTERS -------------------
 def get_symbol_filters(client: BinanceClient, symbol: str):
     global symbol_filters_cache
@@ -531,12 +565,24 @@ def place_orders(client, symbol, trade_state, tick_size, telegram_bot=None, tele
     log(f"Manual trailing setup: activation @ {trade_state.trail_activation_price:.4f}", telegram_bot, telegram_chat_id)
 
 # ------------------- DATA FETCHING -------------------
-def fetch_klines(client: BinanceClient, symbol: str, interval: str, limit=max(100, VOL_SMA_PERIOD + 50)):
+def fetch_klines(client, symbol, interval, limit=max(100, VOL_SMA_PERIOD + 50)):
+    # preserve original requested timeframe
+    requested = interval
+    if requested == "45m":
+        interval = "15m"
+        limit = max(limit, 300)  # Need 3x more
     try:
-        data = client.public_request("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-        return data
+        raw = client.public_request("/fapi/v1/klines", {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit
+        })
+        # if the caller requested 45m, aggregate the fetched 15m klines
+        if interval == "15m" and requested == "45m":
+            return aggregate_klines_to_45m(raw)
+        return raw
     except Exception as e:
-        log(f"Klines fetch failed: {str(e)}")
+        log(f"Klines fetch failed: {e}")
         raise
 
 def fetch_balance(client: BinanceClient):
