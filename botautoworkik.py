@@ -1056,33 +1056,30 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 _safe_sleep(sleep_seconds)
                 continue
 
-            # ------------------------------------------------------------
-            # 5. FETCH FRESH KLINES (WITH 45m AGGREGATION)
-            # ------------------------------------------------------------
-            try:
-                klines = fetch_klines(client, symbol, timeframe)
-            except Exception as e:
-                log(f"Klines fetch failed: {e}", telegram_bot, telegram_chat_id)
-                time.sleep(2)
+            # === FETCH KLINES (45m SUPPORT VIA 15m AGGREGATION) ===
+            klines = fetch_klines(client, symbol, timeframe)
+
+            # === AUTO-ALIGN TO 45m BOUNDARY (CRITICAL FOR 45m) ===
+            if klines:
+                last_candle = klines[-1]
+                last_processed_time = int(last_candle[6])  # close_time of last 45m candle
+                
+
+                dt = datetime.fromtimestamp(last_processed_time / 1000, tz=timezone.utc)
+                log(f"Aligned to 45m candle close: {dt.strftime('%H:%M')} UTC")
+            else:
+                last_processed_time = int(time.time() * 1000)
+                log("No klines yet — waiting for first candle")
+                time.sleep(1)
                 continue
+            
 
-            if not klines:
-                log("No klines received — retrying in 5s")
-                time.sleep(5)
-                continue
+            # === EXTRACT DATA FROM KLINES ===
+            closes, volumes, close_times, opens = closes_and_volumes_from_klines(klines)
+            log(f"Fetched {len(klines)} klines for {timeframe} timeframe.")
 
-            # ------------------------------------------------------------
-            # 6. ALIGN TO LAST CANDLE CLOSE + ADD 100ms BUFFER
-            # ------------------------------------------------------------
-            last_candle = klines[-1]
-            last_close_time = int(last_candle[6])  # ms
-
-            dt = datetime.fromtimestamp(last_close_time / 1000, tz=timezone.utc)
-            log(f"Aligned to {timeframe} candle close: {dt.strftime('%H:%M')} UTC")
-
-            # ------------------------------------------------------------
-            # 7. PREVENT REPROCESSING SAME CANDLE
-            # ------------------------------------------------------------
+            # === SKIP IF SAME CANDLE ALREADY PROCESSED ===
+            last_close_time = close_times[-1] if close_times else 0
             if last_close_time <= last_processed_time:
                 log("Candle already processed or not fully closed.")
                 time.sleep(1)
