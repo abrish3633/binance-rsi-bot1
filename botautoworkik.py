@@ -1418,6 +1418,25 @@ def run_scheduler(bot, chat_id):
     while True:
         schedule.run_pending()
         time.sleep(60)
+# === KEEP-ALIVE WEB SERVER (EMBEDDED) ===
+from flask import Flask
+from threading import Thread
+import time
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is alive."
+
+def run_flask():
+    app.run(host='0.0.0.0', port=8080)
+
+def start_keep_alive():
+    t = Thread(target=run_flask)
+    t.daemon = True
+    t.start()
+    log("Keep-alive server started on port 8080")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Binance Futures RSI Bot (Binance Trailing, 30m Optimized, SOLUSDT)")
@@ -1446,6 +1465,7 @@ if __name__ == "__main__":
     log(f"Connected ({'LIVE' if args.live else 'TESTNET'}). Starting bot with symbol={args.symbol}, timeframe={args.timeframe}, risk_pct={args.risk_pct}%, use_volume_filter={args.use_volume_filter}", args.telegram_token, args.chat_id)
     balance = fetch_balance(client)
     log(f"Fetched balance: {float(balance):.2f} USDT", args.telegram_token, args.chat_id)
+    start_keep_alive()  # ← Starts Flask in background
 
     atexit.register(_request_stop, symbol=args.symbol, telegram_bot=args.telegram_token, telegram_chat_id=args.chat_id)
 
