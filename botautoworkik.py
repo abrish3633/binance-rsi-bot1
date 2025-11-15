@@ -24,6 +24,8 @@ import atexit
 import websocket
 import json
 import queue
+import feedparser  # ← NEW
+import socket
 
 # ------------------- CONFIGURATION -------------------
 RISK_PCT = Decimal("0.005")  # 0.5% per trade
@@ -50,6 +52,34 @@ RATE_LIMIT_THRESHOLD = 80
 RECOVERY_CHECK_INTERVAL = 10  # Seconds between recovery checks
 TRAIL_UPDATE_THROTTLE = 10.0  # Alert trailing updates every 10 seconds max
 POLLING_INTERVAL = 3  # ENHANCED: Polling interval after WS failure
+# ---------------------------------------------------------------------------------------
+# === CONFIG: BLACKOUT WINDOWS (UTC) ===
+# (weekday: 0=Mon..6=Sun, None=every day), (start_h, m), (end_h, m)
+NEWS_BLACKOUT_WINDOWS = [
+    (4, (12, 25), (13, 5)),     # Friday 12:30–13:00 UTC (NFP)
+    (2, (18, 55), (19, 35)),     # Wednesday 19:00–19:30 UTC (FOMC)
+]
+
+# === CONFIG: LIVE API ===
+LIVE_APIS = [
+    "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+    "https://ec.forexprostools.com/?columns=exc_currency,exc_type&timezone=utc"
+]
+LOCAL_CALENDAR = "high_impact_calendar.json"          # you update weekly
+LOCAL_OVERRIDE = "news_calendar_override.json"       # one-off manual block
+CACHE_DURATION = 300  # 5 min
+HIGH_IMPACT_KEYWORDS = {
+    "NFP", "NONFARM", "CPI", "FOMC", "GDP", "UNEMPLOYMENT", "RATE DECISION",
+    "PCE", "CORE", "ISM", "JOLTS", "OPEC", "SNB", "BOJ", "GEOPOLITICAL",
+    "RETAIL SALES", "ADP", "FLASH", "PRELIMINARY"
+}
+BUFFER_MINUTES = 5
+# === DRAWDOWN-SCALED RISK (NO ATR) ===
+BASE_RISK_PCT = Decimal("0.005")        # 0.5% when drawdown = 0%
+MAX_DRAWDOWN_PCT = Decimal("0.20")      # Risk → 0 at 20% daily drawdown
+MIN_RISK_PCT = Decimal("0.001")         # Never go below 0.1%
+# CONFIG SLIPAGE
+MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")
 
 # ------------------- GLOBAL STATE -------------------
 STOP_REQUESTED = False
@@ -62,7 +92,7 @@ PNL_LOG_FILE = 'pnl_log.csv'
 pnl_data = []
 last_trade_date = None
 last_exit_candle_time = None
-
+socket.setdefaulttimeout(10)
 # ENHANCED: Thread-safe stop & order cancellation
 _stop_lock = threading.Lock()
 _orders_cancelled = False
@@ -71,7 +101,197 @@ _orders_cancelled = False
 _ws_failed = False
 _polling_active = False
 _price_queue = queue.Queue()  # Shared price source (WS or polling)
+# ---------------------------------------------------------------------------------------
+# === INTERNAL STATE ===
+_news_lock = threading.Lock()
+_news_cache: list = []
+_cache_ts = 0.0
+NEWS_LOCK = False          # <--- blocks entry + forces emergency close
+VOLATILITY_ABORT = False   # set by ATR spike check (see trading loop)
+# === DAILY DRAWDOWN PROTECTION ===
+daily_start_equity = None
+account_size = None
+drawdown_protection_enabled = True
+last_news_guard_msg: str | None = None
+news_guard_was_active: bool = False
+_last_news_block_reason = None
+# ---------------------------------------------------------------------------------------
+# 4. FETCHERS
+# ----------------------------------------------------------------------
+def _fetch_json(url: str) -> list | None:
+    try:
+        r = requests.get(url, timeout=8)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        return None
+    return None
 
+def _load_local_calendar() -> list:
+    if os.path.exists(LOCAL_CALENDAR):
+        try:
+            with open(LOCAL_CALENDAR) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+def _load_override() -> list:
+    if os.path.exists(LOCAL_OVERRIDE):
+        try:
+            with open(LOCAL_OVERRIDE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+def _parse_event(event) -> datetime | None:
+    """Return UTC event datetime or None."""
+    dt_str = event.get("date") or event.get("timestamp")
+    if not dt_str:
+        return None
+    try:
+        # faireconomy: ISO with Z, investing.com: unix ms
+        if isinstance(dt_str, (int, float)):
+            return datetime.fromtimestamp(dt_str, tz=timezone.utc)
+        return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    
+# ----------------------------------------------------------------------
+# 4. HELPERS
+# ----------------------------------------------------------------------
+def _time_in_window(now_utc, start_hm, end_hm):
+    start = datetime(now_utc.year, now_utc.month, now_utc.day, *start_hm, tzinfo=timezone.utc)
+    end = datetime(now_utc.year, now_utc.month, now_utc.day, *end_hm, tzinfo=timezone.utc)
+    if end <= start:
+        end += timedelta(days=1)
+    return start <= now_utc <= end
+
+def _in_blackout_window(now_utc=None):
+    now = now_utc or datetime.now(timezone.utc)
+    for wd, start, end in NEWS_BLACKOUT_WINDOWS:
+        if wd is None or wd == now.weekday():
+            if _time_in_window(now, start, end):
+                return True, f"Blackout: {start}–{end} UTC"
+    return False, None
+
+# ----------------------------------------------------------------------
+# 5. CORE REFRESHER (runs every 60 s)
+# ----------------------------------------------------------------------
+def _refresh_news():
+    global _news_cache, _cache_ts
+    now = datetime.now(timezone.utc)
+    events = []
+
+    # === 1. Existing economic calendars ===
+    for api in LIVE_APIS:
+        data = _fetch_json(api)
+        if data:
+            events.extend(data)
+            break
+    events.extend(_load_local_calendar())
+    events.extend(_load_override())
+
+    high = []
+    for e in events:
+        title = (e.get("title") or e.get("event") or "").upper()
+        impact = (e.get("impact") or "").lower()
+        if impact != "high" and not any(k in title for k in HIGH_IMPACT_KEYWORDS):
+            continue
+        dt = _parse_event(e)
+        if dt:
+            high.append({"dt": dt, "title": title})
+
+def news_heartbeat():
+    global NEWS_LOCK
+    while not STOP_REQUESTED:
+        _refresh_news()
+        now = datetime.now(timezone.utc)
+        news_lock = False
+
+        # Economic events
+        for ev in _news_cache:
+            if (ev["dt"] - timedelta(minutes=BUFFER_MINUTES) <= now <= 
+                ev["dt"] + timedelta(minutes=BUFFER_MINUTES)):
+                news_lock = True
+                break
+        static_block, _ = _in_blackout_window(now)
+        NEWS_LOCK = news_lock or static_block
+        time.sleep(60)
+
+# ----------------------------------------------------------------------
+# 6. PUBLIC GUARD (called from trading loop)
+# ----------------------------------------------------------------------
+_last_news_block_reason = None  # ← MOVE TO TOP
+
+def is_news_blocked(now_utc: datetime | None = None) -> tuple[bool, str | None]:
+    global _last_news_block_reason
+    now = now_utc or datetime.now(timezone.utc)
+
+    with _news_lock:
+        for ev in _news_cache:
+            if (ev["dt"] - timedelta(minutes=BUFFER_MINUTES) <= now <= 
+                ev["dt"] + timedelta(minutes=BUFFER_MINUTES)):
+                reason = f"Live: {ev['title']} @ {ev['dt'].strftime('%H:%M')} UTC"
+                if reason != _last_news_block_reason:
+                    _last_news_block_reason = reason
+                return True, reason
+
+    blocked, reason = _in_blackout_window(now)
+    if blocked:
+        if reason != _last_news_block_reason:
+            _last_news_block_reason = reason
+        return True, reason
+
+    if os.path.exists("FORCE_NO_TRADE_TODAY.txt"):
+        reason = "Manual override"
+        if reason != _last_news_block_reason:
+            _last_news_block_reason = reason
+        return True, reason
+
+    # === BLACKOUT ENDED ===
+    if _last_news_block_reason is not None:
+        log("NEWS GUARD -> All clear. Trading resumed.", telegram_bot, telegram_chat_id)
+        _last_news_block_reason = None
+
+    return False, None
+
+# ----------------------------------------------------------------------
+# 7. EMERGENCY CLOSE (call from monitor_trade_mt5 when NEWS_LOCK flips)
+# ----------------------------------------------------------------------
+def emergency_close_on_news(client, symbol, trade_state, bot, chat_id):
+    if not trade_state.active:
+        return
+    log("NEWS EMERGENCY CLOSE TRIGGERED", bot, chat_id)
+    _request_stop(symbol=symbol, telegram_bot=bot, telegram_chat_id=chat_id)
+    trade_state.active = False
+    telegram_post(bot, chat_id,
+                  f"EMERGENCY CLOSE – HIGH IMPACT NEWS\n"
+                  f"Symbol: {symbol} | Side: {trade_state.side}")
+
+# ----------------------------------------------------------------------
+# 8. VOLATILITY PROXY (optional – set VOLATILITY_ABORT)
+# ----------------------------------------------------------------------
+def check_volatility_abort(klines: list, period: int = 14) -> bool:
+    """Return True if ATR > 3× 20-period mean."""
+    if len(klines) < period + 1:
+        return False
+    import numpy as np
+    highs  = np.array([float(k[2]) for k in klines[-period-20:]])
+    lows   = np.array([float(k[3]) for k in klines[-period-20:]])
+    closes = np.array([float(k[4]) for k in klines[-period-20:]])
+    tr = np.maximum(highs[1:] - lows[1:], np.abs(highs[1:] - closes[:-1]),
+                    np.abs(lows[1:] - closes[:-1]))
+    atr = np.mean(tr[-period:])
+    mean20 = np.mean(tr[-20:])
+    return atr > mean20 * 3.0
+
+# === DAILY DRAWDOWN PROTECTION ===
+def emergency_close_on_drawdown(client, symbol, bot, chat_id):
+    log("DAILY DRAWDOWN EMERGENCY CLOSE TRIGGERED", bot, chat_id)
+    _request_stop(symbol=symbol, telegram_bot=bot, telegram_chat_id=chat_id)
+    telegram_post(bot, chat_id, "EMERGENCY SHUTDOWN – DRAWDOWN >4%")
 # ------------------- PNL LOGGING -------------------
 def init_pnl_log():
     if not os.path.exists(PNL_LOG_FILE):
@@ -794,7 +1014,7 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
         global _ws_failed
         if not _ws_failed and trade_state.active:
             log("WebSocket connection failed. Switching to polling mode.", telegram_bot, telegram_chat_id)
-            telegram_post(telegram_bot, telegram_chat_id, "WebSocket failed → Switched to REST polling (3s)")
+            telegram_post(telegram_bot, telegram_chat_id, "WebSocket failed  Switched to REST polling (3s)")
             _ws_failed = True
             start_polling_mode(symbol, telegram_bot, telegram_chat_id)
 
@@ -839,6 +1059,38 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
 
     try:
         while trade_state.active and not STOP_REQUESTED:
+            # === FETCH KLINES FOR VOLATILITY ===
+            try:
+                klines = fetch_klines(client, symbol, "30m", limit=100)
+            except:
+                klines = []
+
+            # NEWS EMERGENCY
+            if NEWS_LOCK and trade_state.active:
+                emergency_close_on_news(client, symbol, trade_state, telegram_bot, telegram_chat_id)
+                return
+
+            # DAILY DRAWDOWN CHECK
+            if drawdown_protection_enabled and daily_start_equity is not None:
+                try:
+                    balance = fetch_balance(client)
+                    pos = fetch_open_positions_details(client, symbol)
+                    unrealized_pnl = Decimal(str(pos.get("unRealizedProfit", "0")))
+                    current_equity = balance + unrealized_pnl
+                    drawdown = (daily_start_equity - current_equity) / daily_start_equity
+                    if drawdown > Decimal("0.04"):
+                        log(f"DAILY DRAWDOWN BREACH: {drawdown:.1%} > 4% | AUTO-CLOSING ALL", telegram_bot, telegram_chat_id)
+                        emergency_close_on_drawdown(client, symbol, telegram_bot, telegram_chat_id)
+                        return
+                except Exception as e:
+                    log(f"Drawdown check failed: {e}", telegram_bot, telegram_chat_id)
+
+            # VOLATILITY ABORT
+            if len(klines) >= 100 and check_volatility_abort(klines):
+                log("VOLATILITY EMERGENCY CLOSE – ATR SPIKE >3x", telegram_bot, telegram_chat_id)
+                _request_stop(symbol=symbol, telegram_bot=telegram_bot, telegram_chat_id=telegram_chat_id)
+                telegram_post(telegram_bot, telegram_chat_id, "EMERGENCY CLOSE – ATR SPIKE >3x")
+                return
             # --- Recovery Check ---
             if time.time() - last_recovery_check >= RECOVERY_CHECK_INTERVAL:
                 debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
@@ -857,38 +1109,40 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                 pos_item = next((p for p in positions if p.get("symbol") == symbol), None)
                 pos_amt = Decimal(str(pos_item.get("positionAmt", "0"))) if pos_item else Decimal('0')
 
-                # ---- POSITION CLOSED → 4-STEP ORDER DISAPPEARANCE LOGIC ----
                 if pos_amt == 0:
                     log("Position closed.", telegram_bot, telegram_chat_id)
                     trade_state.active = False
 
-                    open_orders = client.get_open_orders(symbol)
-                    open_order_ids = {o["orderId"] for o in open_orders}
-
-                    if (trade_state.trail_activated and
-                        trade_state.trail_order_id and
-                        trade_state.trail_order_id not in open_order_ids):
-                        reason = "Trailing Stop"
-                        exit_price = client.get_latest_fill_price(symbol, trade_state.trail_order_id)
-                    elif (trade_state.sl_order_id and trade_state.sl_order_id not in open_order_ids):
-                        reason = "Stop Loss"
-                        exit_price = client.get_latest_fill_price(symbol, trade_state.sl_order_id)
-                    elif (trade_state.tp_order_id and trade_state.tp_order_id not in open_order_ids):
-                        reason = "Take Profit"
-                        exit_price = client.get_latest_fill_price(symbol, trade_state.tp_order_id)
-                    else:
-                        reason = "Manual Close" if not STOP_REQUESTED else "Stop Requested"
-                        exit_price = None
-
+                    # --- Get Exit Price ---
+                    latest_trade = client.get_latest_trade_details(symbol)
+                    exit_price = latest_trade["price"] if latest_trade else None
                     if exit_price is None:
-                        latest = client.get_latest_trade_details(symbol)
-                        if latest:
-                            exit_price = latest["price"]
-                        else:
-                            ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
-                            exit_price = Decimal(str(ticker.get("price", "0")))
-
+                        ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+                        exit_price = Decimal(str(ticker.get("price", "0")))
                     exit_price_f = float(exit_price)
+
+                    # --- Determine Exit Reason (Trailing > TP > SL > Manual) ---
+                    reason = "Manual Close"
+                    if STOP_REQUESTED or os.path.exists("stop.txt"):
+                        reason = "Stop Requested"
+                    else:
+                        try:
+                            recent = client.send_signed_request("GET", "/fapi/v1/userTrades", {"symbol": symbol, "limit": 5})
+                            close_trades = [t for t in recent if abs(Decimal(t.get('qty', '0'))) >= Decimal(str(trade_state.qty)) * Decimal('0.9')]
+                            if close_trades:
+                                exit_p = Decimal(close_trades[0]['price'])
+                                # Check trailing stop first
+                                if (trade_state.current_trail_stop and 
+                                    abs(exit_p - Decimal(str(trade_state.current_trail_stop))) < tick_size * 20):
+                                    reason = "Trailing Stop"
+                                elif abs(exit_p - Decimal(str(trade_state.sl))) < tick_size * 20:
+                                    reason = "Stop Loss"
+                                elif abs(exit_p - Decimal(str(trade_state.tp))) < tick_size * 20:
+                                    reason = "Take Profit"
+                        except Exception as e:
+                            log(f"Failed to detect exit reason: {e}", telegram_bot, telegram_chat_id)
+
+                    # --- Log PNL ---
                     entry_price_safe = float(trade_state.entry_price or 0.0)
                     R = Decimal(str(entry_price_safe)) * SL_PCT
                     R_float = float(R)
@@ -901,6 +1155,7 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                         R_float
                     )
 
+                    # --- Send Telegram ---
                     send_closure_telegram(
                         symbol, trade_state.side,
                         entry_price_safe, exit_price_f,
@@ -908,8 +1163,8 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                         float(pnl_row['pnl_usd']), float(pnl_row['pnl_r']),
                         reason, telegram_bot, telegram_chat_id
                     )
-                    global last_exit_candle_time
-                    last_exit_candle_time = current_candle_close_time
+
+                    # --- Cancel Orders (Thread-Safe) ---
                     with _stop_lock:
                         if not _orders_cancelled:
                             try:
@@ -918,7 +1173,8 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                             except Exception as e:
                                 log(f"Failed to cancel orders: {e}", telegram_bot, telegram_chat_id)
                             _orders_cancelled = True
-                    return
+
+                    return  # Exit monitor cleanly
 
                 # --- Fallback Price ---
                 if current_price is None:
@@ -1003,10 +1259,12 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                 pass
 # ------------------- TRADING LOOP -------------------
 def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, telegram_bot, telegram_chat_id):
+    global last_news_guard_msg, news_guard_was_active
     global last_trade_date
     trades_today = 0
     last_processed_time = 0
     trade_state = TradeState()
+    qty_api = None  # ← ADD THIS
     pending_entry = False
     filters = get_symbol_filters(client, symbol)
     step_size = filters['stepSize']
@@ -1138,9 +1396,49 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             rsi = compute_rsi(closes)
             vol_sma15 = sma(volumes, VOL_SMA_PERIOD) if len(volumes) >= VOL_SMA_PERIOD else 0
 
-            log(f"Candle: {float(close_price):.4f} | RSI: {rsi or 'N/A'} | Vol: {curr_vol:.2f} | SMA15: {vol_sma15:.2f} | {'Green' if is_green_candle else 'Red' if is_red_candle else 'Doji'}", telegram_bot, telegram_chat_id)
+            # === SMART CANDLE LOG (ONLY ON CHANGE) ===
+            current_state = f"{close_price:.4f}|{rsi:.2f}|{curr_vol:.0f}|{vol_sma15:.2f}|{'G' if is_green_candle else 'R'}"
+            if not hasattr(trading_loop, "last_candle_state") or current_state != trading_loop.last_candle_state:
+                log(f"Candle: {close_price:.4f} RSI={rsi:.2f} Vol={curr_vol:.0f} SMA15={vol_sma15:.2f} {'Green' if is_green_candle else 'Red'}", telegram_bot, telegram_chat_id)
+                trading_loop.last_candle_state = current_state
 
             # === ENTRY GUARDS ===
+            
+            # === NEWS GUARD – MUST BE INSIDE THE LOOP ===
+
+            blocked, reason = is_news_blocked()
+            now_active = blocked
+
+            # Guard just became ACTIVE
+            if now_active and not news_guard_was_active:
+                msg = f"NEWS GUARD -> {reason}"
+                log(msg, telegram_bot, telegram_chat_id)
+                last_news_guard_msg = msg
+
+                if trade_state.active:
+                    emergency_close_on_news(client, symbol, trade_state,
+                                            telegram_bot, telegram_chat_id)
+
+                news_guard_was_active = True
+                continue   # ← NOW VALID: inside while loop
+
+            # Guard still ACTIVE
+            elif now_active and news_guard_was_active:
+                news_guard_was_active = True
+                continue   # ← valid
+
+            # Guard just became INACTIVE
+            elif not now_active and news_guard_was_active:
+                msg = "NEWS GUARD -> Cleared"
+                log(msg, telegram_bot, telegram_chat_id)
+                last_news_guard_msg = None
+                news_guard_was_active = False
+                # no continue → proceed to signal check
+
+            # Guard never active
+            else:
+                news_guard_was_active = False
+                
             if prevent_same_bar and getattr(trade_state, 'entry_close_time', None) == close_time:
                 last_processed_time = close_time
                 time.sleep(1)
@@ -1173,6 +1471,19 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 pending_entry = True
                 entry_price = close_price
                 entry_price_f = float(entry_price)
+                
+                # === SLIPPAGE GUARD (PREVENT BAD ENTRY) ===
+                MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")  # 0.2% max slippage
+                try:
+                    mark_data = client.public_request("/fapi/v1/premiumIndex", {"symbol": symbol})
+                    mark_price = Decimal(str(mark_data["markPrice"]))
+                    slippage_pct = abs(mark_price - entry_price) / entry_price
+                    if slippage_pct > MAX_ENTRY_SLIPPAGE_PCT:
+                        log(f"ENTRY SKIPPED: Slippage {float(slippage_pct*100):.3f}% > {float(MAX_ENTRY_SLIPPAGE_PCT*100):.1f}%", telegram_bot, telegram_chat_id)
+                        pending_entry = False
+                        continue
+                except Exception as e:
+                    log(f"Slippage check failed: {e}. Proceeding with market order.", telegram_bot, telegram_chat_id)
 
                 # === CALCULATE RISK & LEVELS ===
                 if buy_signal:
@@ -1193,21 +1504,24 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     trail_rounding = ROUND_UP
 
                 if R <= Decimal('0'):
+                    log("Invalid R (R <= 0). Skipping trade.", telegram_bot, telegram_chat_id)
                     pending_entry = False
                     time.sleep(1)
                     continue
 
-                # === POSITION SIZING ===
+                # === DRAWDOWN-SCALED RISK (SOFT THROTTLE) ===  ← INDENTED CORRECTLY
                 bal = fetch_balance(client)
-                risk_amount = bal * risk_pct
+                drawdown = max(Decimal('0'), (daily_start_equity - bal) / daily_start_equity)
+                dynamic_risk_pct = BASE_RISK_PCT * (Decimal('1') - drawdown / MAX_DRAWDOWN_PCT)
+                dynamic_risk_pct = max(dynamic_risk_pct, MIN_RISK_PCT)
+
+                risk_amount = bal * dynamic_risk_pct
                 qty = risk_amount / R
                 qty_api = quantize_qty(qty, step_size)
-                if qty_api < min_qty:
-                    qty_api = min_qty
-                notional = qty_api * entry_price
-                if notional < min_notional:
-                    qty_api = quantize_qty(min_notional / entry_price, step_size)
 
+                log(f"Risk: DD={float(drawdown*100):.2f}% -> {float(dynamic_risk_pct*100):.3f}% | Qty={float(qty_api):.3f}", telegram_bot, telegram_chat_id)
+
+                # === PRICE LEVELS ===
                 sl_price_dec_quant = quantize_price(sl_price_dec, tick_size, sl_rounding)
                 sl_price_f = float(sl_price_dec_quant)
                 tp_price_dec_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
@@ -1405,6 +1719,7 @@ def closes_and_volumes_from_klines(klines):
     return closes, volumes, close_times, opens
 
 def run_scheduler(bot, chat_id):
+    global daily_start_equity, account_size
     last_month = None
     def check_monthly_report():
         nonlocal last_month
@@ -1412,31 +1727,28 @@ def run_scheduler(bot, chat_id):
         if current_date.day == 1 and (last_month is None or current_date.month != last_month):
             send_monthly_report(bot, chat_id)
             last_month = current_date.month
+
     schedule.every().day.at("23:59").do(lambda: send_daily_report(bot, chat_id))
     schedule.every().sunday.at("23:59").do(lambda: send_weekly_report(bot, chat_id))
     schedule.every().day.at("00:00").do(check_monthly_report)
+
+    global daily_start_equity, account_size
     while True:
+        # RESET @ 00:00 UTC
+        now_utc = datetime.now(timezone.utc)
+        if now_utc.hour == 0 and now_utc.minute < 5:
+            try:
+                current_balance = fetch_balance(client)
+                account_size = current_balance
+                daily_start_equity = current_balance
+                log(f"DAILY RESET @ 00:00 UTC | New start equity: {float(daily_start_equity):.2f} USD", bot, chat_id)
+                telegram_post(bot, chat_id, f"DAILY RESET\nEquity: ${float(daily_start_equity):.2f}")
+            except Exception as e:
+                log(f"Daily reset failed: {e}", bot, chat_id)
+            time.sleep(300)
+            continue
         schedule.run_pending()
         time.sleep(60)
-# === KEEP-ALIVE WEB SERVER (EMBEDDED) ===
-from flask import Flask
-from threading import Thread
-import time
-
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Bot is alive."
-
-def run_flask():
-    app.run(host='0.0.0.0', port=8080)
-
-def start_keep_alive():
-    t = Thread(target=run_flask)
-    t.daemon = True
-    t.start()
-    log("Keep-alive server started on port 8080")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Binance Futures RSI Bot (Binance Trailing, 30m Optimized, SOLUSDT)")
@@ -1462,10 +1774,15 @@ if __name__ == "__main__":
 
     init_pnl_log()
     client = BinanceClient(args.api_key, args.api_secret, use_live=args.live, base_override=args.base_url)
+    balance = fetch_balance(client)
+    account_size = balance
+    daily_start_equity = balance
+    log(f"Daily drawdown protection ENABLED. Start equity: {float(daily_start_equity):.2f} USD", args.telegram_token, args.chat_id)
+    log(f"Fetched balance: {float(balance):.2f} USDT", args.telegram_token, args.chat_id)
+    threading.Thread(target=news_heartbeat, daemon=True).start()
     log(f"Connected ({'LIVE' if args.live else 'TESTNET'}). Starting bot with symbol={args.symbol}, timeframe={args.timeframe}, risk_pct={args.risk_pct}%, use_volume_filter={args.use_volume_filter}", args.telegram_token, args.chat_id)
     balance = fetch_balance(client)
     log(f"Fetched balance: {float(balance):.2f} USDT", args.telegram_token, args.chat_id)
-    start_keep_alive()  # ← Starts Flask in background
 
     atexit.register(_request_stop, symbol=args.symbol, telegram_bot=args.telegram_token, telegram_chat_id=args.chat_id)
 
