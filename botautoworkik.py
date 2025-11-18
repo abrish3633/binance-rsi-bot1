@@ -26,6 +26,7 @@ import json
 import queue
 import feedparser  # ← NEW
 import socket
+import platform
 
 # ------------------- CONFIGURATION -------------------
 RISK_PCT = Decimal("0.005")  # 0.5% per trade
@@ -80,6 +81,7 @@ MAX_DRAWDOWN_PCT = Decimal("0.20")      # Risk → 0 at 20% daily drawdown
 MIN_RISK_PCT = Decimal("0.001")         # Never go below 0.1%
 # CONFIG SLIPAGE
 MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")
+LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'sol_rsi_bot.lock')
 
 # ------------------- GLOBAL STATE -------------------
 STOP_REQUESTED = False
@@ -115,6 +117,39 @@ drawdown_protection_enabled = True
 last_news_guard_msg: str | None = None
 news_guard_was_active: bool = False
 _last_news_block_reason = None
+# ==================== SINGLE INSTANCE LOCK (Windows + Linux) ====================
+LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'sol_rsi_bot.lock')
+
+try:
+    # 'x' mode = create exclusively → fails if file exists
+    LOCK_HANDLE = open(LOCK_FILE, 'x')
+except FileExistsError:
+    print("Another instance is already running! Exiting.")
+    sys.exit(1)
+except FileNotFoundError:
+    # Windows TEMP may not exist
+    os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+    LOCK_HANDLE = open(LOCK_FILE, 'x')
+
+# Optional real lock on Linux only
+if platform.system() != "Windows":
+    try:
+        import fcntl
+        fcntl.lockf(LOCK_HANDLE.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except Exception:
+        pass
+
+# ==================== MEMORY LIMIT (Linux / OCI only) ====================
+if platform.system() != "Windows":
+    try:
+        import resource
+        SOFT = HARD = 680 * 1024 * 1024   # ~680 MB
+        resource.setrlimit(resource.RLIMIT_AS, (SOFT, HARD))
+        print(f"[Startup] Memory limit set to ~680 MB")
+    except Exception as e:
+        print(f"[Startup] Could not set memory limit: {e}")
+else:
+    print("[Startup] Windows detected – skipping Unix-only features (normal for local testing)")
 # ---------------------------------------------------------------------------------------
 # 4. FETCHERS
 # ----------------------------------------------------------------------
@@ -711,40 +746,41 @@ def quantize_price(p: Decimal, tick_size: Decimal, rounding=ROUND_HALF_EVEN) -> 
     return p.quantize(tick_size, rounding=rounding)
 
 # === 45m AGGREGATION + ALIGNMENT (BEST VERSION) ===
-
 def aggregate_klines_to_45m(klines_15m):
     if len(klines_15m) < 3:
         return []
 
     aggregated = []
-    # tolerance in ms for alignment (small allowance for minor timing differences)
-    TOLERANCE_MS = 2000
-    for i in range(0, len(klines_15m) - 2, 3):  # Every 3 candles
-        a, b, c = klines_15m[i], klines_15m[i+1], klines_15m[i+2]
-        open_time = int(a[0])
+    # Start from the newest complete group of 3 → guarantees a candle every 45 min
+    for i in range(len(klines_15m) - 3, -1, -3):   # reverse loop, step -3
+        chunk = klines_15m[i:i+3][::-1]             # take 3 and reverse to chronological
+        if len(chunk) != 3:
+            continue
+        a, b, c = chunk[0], chunk[1], chunk[2]     # a = oldest, c = newest
+
+        open_time  = int(a[0])
         close_time = int(c[6])
 
-        expected_duration = 3 * 15 * 60 * 1000  # 45 minutes in ms
-
-        # Only accept if the group is complete and aligned (allow tiny tolerance)
-        if abs((close_time - open_time) - expected_duration) > TOLERANCE_MS:
-            continue  # Skip incomplete or misaligned
+        # Strict perfect alignment (Binance 15m is always perfect)
+        if close_time - open_time != 45 * 60 * 1000:
+            continue
 
         high = max(float(a[2]), float(b[2]), float(c[2]))
-        low = min(float(a[3]), float(b[3]), float(c[3]))
-        volume = float(a[5]) + float(b[5]) + float(c[5])
+        low  = min(float(a[3]), float(b[3]), float(c[3]))
 
         aggregated.append([
             open_time,
-            float(a[1]),    # open
+            float(a[1]),   # open
             high,
             low,
-            float(c[4]),    # close
-            volume,
+            float(c[4]),   # close
+            float(a[5]) + float(b[5]) + float(c[5]),  # volume
             close_time
         ])
 
+    aggregated.reverse()   # back to chronological order
     return aggregated
+
 
 # ------------------- SYMBOL FILTERS -------------------
 def get_symbol_filters(client: BinanceClient, symbol: str):
@@ -825,21 +861,24 @@ def fetch_klines(client, symbol, interval, limit=max(100, VOL_SMA_PERIOD + 50)):
     requested = interval
     if requested == "45m":
         interval = "15m"
-        limit = max(limit, 300)  # Need 3x more
+        limit = max(limit, 300)  # Need 3x more for safe aggregation
+
     try:
         raw = client.public_request("/fapi/v1/klines", {
             "symbol": symbol,
             "interval": interval,
             "limit": limit
         })
+
         # if the caller requested 45m, aggregate the fetched 15m klines
         if interval == "15m" and requested == "45m":
-            return aggregate_klines_to_45m(raw)
+            return aggregate_klines_to_45m(raw)   # ← new drift-proof version
+
         return raw
+
     except Exception as e:
         log(f"Klines fetch failed: {e}")
         raise
-
 def fetch_balance(client: BinanceClient):
     try:
         data = client.send_signed_request("GET", "/fapi/v2/account")
@@ -1369,7 +1408,8 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             last_close_time = int(last_candle[6])  # ms
             close_time = last_close_time
 
-            dt = datetime.fromtimestamp(last_close_time / 1000, tz=timezone.utc)
+            real_close_time = klines[-1][6]  # actual close time of the 45m candle
+            dt = datetime.fromtimestamp(real_close_time / 1000, tz=timezone.utc)
             log(f"Aligned to {timeframe} candle close: {dt.strftime('%H:%M')} UTC")
 
             # ------------------------------------------------------------
@@ -1762,47 +1802,67 @@ if __name__ == "__main__":
     parser.add_argument("--risk-pct", type=float, default=0.5, help="Risk percentage per trade (default: 0.5%)")
     parser.add_argument("--max-loss-pct", type=float, default=5.0, help="Max daily loss percentage (default: 5%)")
     parser.add_argument("--tp-mult", type=float, default=3.5, help="Take-profit multiplier (default: 3.5)")
-    parser.add_argument("--no-trailing", dest='use_trailing', action='store_false', help="Disable trailing stop (default: enabled)")
-    parser.add_argument("--no-prevent-same-bar", dest='prevent_same_bar', action='store_false', help="Allow entries on same bar (default: prevent same bar)")
-    parser.add_argument("--no-require-no-pos", dest='require_no_pos', action='store_false', help="Allow entry even if there's an active position (default: require no pos)")
-    parser.add_argument("--no-use-max-loss", dest='use_max_loss', action='store_false', help="Disable max daily loss protection (default: enabled)")
-    parser.add_argument("--use-volume-filter", action='store_true', default=False, help="Use volume filter (vol > SMA15)")
-    parser.add_argument("--no-volume-filter", action='store_false', dest='use_volume_filter', help="Disable volume filter")
-    parser.add_argument("--live", action="store_true", help="Use live Binance (default: Testnet)")
-    parser.add_argument("--base-url", default=None, help="Override base URL for Binance API (advanced)")
+    parser.add_argument("--no-trailing", dest='use_trailing', action='store_false', help="Disable trailing stop")
+    parser.add_argument("--no-prevent-same-bar", dest='prevent_same_bar', action='store_false')
+    parser.add_argument("--no-require-no-pos", dest='require_no_pos', action='store_false')
+    parser.add_argument("--no-use-max-loss", dest='use_max_loss', action='store_false')
+    parser.add_argument("--use-volume-filter", action='store_true', default=False)
+    parser.add_argument("--no-volume-filter", action='store_false', dest='use_volume_filter')
+    parser.add_argument("--live", action="store_true")
+    parser.add_argument("--base-url", default=None)
     args = parser.parse_args()
 
     init_pnl_log()
-    client = BinanceClient(args.api_key, args.api_secret, use_live=args.live, base_override=args.base_url)
-    balance = fetch_balance(client)
-    account_size = balance
-    daily_start_equity = balance
-    log(f"Daily drawdown protection ENABLED. Start equity: {float(daily_start_equity):.2f} USD", args.telegram_token, args.chat_id)
-    log(f"Fetched balance: {float(balance):.2f} USDT", args.telegram_token, args.chat_id)
-    threading.Thread(target=news_heartbeat, daemon=True).start()
-    log(f"Connected ({'LIVE' if args.live else 'TESTNET'}). Starting bot with symbol={args.symbol}, timeframe={args.timeframe}, risk_pct={args.risk_pct}%, use_volume_filter={args.use_volume_filter}", args.telegram_token, args.chat_id)
-    balance = fetch_balance(client)
-    log(f"Fetched balance: {float(balance):.2f} USDT", args.telegram_token, args.chat_id)
 
+    # These run only once – on normal program exit
     atexit.register(_request_stop, symbol=args.symbol, telegram_bot=args.telegram_token, telegram_chat_id=args.chat_id)
+    atexit.register(lambda: (LOCK_HANDLE.close(), os.unlink(LOCK_FILE) if os.path.exists(LOCK_FILE) else None))
 
-    try:
-        threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
-        trading_loop(
-            client=client,
-            symbol=args.symbol,
-            timeframe=args.timeframe,
-            max_trades_per_day=args.max_trades,
-            risk_pct=Decimal(str(args.risk_pct)) / Decimal("100"),
-            max_daily_loss_pct=Decimal(str(args.max_loss_pct)),
-            tp_mult=Decimal(str(args.tp_mult)),
-            use_trailing=args.use_trailing,
-            prevent_same_bar=args.prevent_same_bar,
-            require_no_pos=args.require_no_pos,
-            use_max_loss=args.use_max_loss,
-            use_volume_filter=args.use_volume_filter,
-            telegram_bot=args.telegram_token,
-            telegram_chat_id=args.chat_id
-        )
-    finally:
-        pass
+    # ======================== IMMORTAL BOT LOOP ========================
+    while True:
+        try:
+            # Everything that needs a fresh start goes HERE
+            client = BinanceClient(args.api_key, args.api_secret, use_live=args.live, base_override=args.base_url)
+            balance = fetch_balance(client)
+            account_size = balance
+            daily_start_equity = balance
+
+            log(f"Daily drawdown protection ENABLED. Start equity: {float(daily_start_equity):.2f} USD",
+                args.telegram_token, args.chat_id)
+            log(f"Fetched balance: {float(balance):.2f} USDT", args.telegram_token, args.chat_id)
+
+            threading.Thread(target=news_heartbeat, daemon=True).start()
+            log(f"Connected ({'LIVE' if args.live else 'TESTNET'}). Starting bot with symbol={args.symbol}, "
+                f"timeframe={args.timeframe}, risk_pct={args.risk_pct}%, use_volume_filter={args.use_volume_filter}",
+                args.telegram_token, args.chat_id)
+
+            threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
+
+            trading_loop(
+                client=client,
+                symbol=args.symbol,
+                timeframe=args.timeframe,
+                max_trades_per_day=args.max_trades,
+                risk_pct=Decimal(str(args.risk_pct)) / Decimal("100"),
+                max_daily_loss_pct=Decimal(str(args.max_loss_pct)),
+                tp_mult=Decimal(str(args.tp_mult)),
+                use_trailing=args.use_trailing,
+                prevent_same_bar=args.prevent_same_bar,
+                require_no_pos=args.require_no_pos,
+                use_max_loss=args.use_max_loss,
+                use_volume_filter=args.use_volume_filter,
+                telegram_bot=args.telegram_token,
+                telegram_chat_id=args.chat_id
+            )
+
+            # Clean exit path
+            log("Bot stopped cleanly – exiting.", args.telegram_token, args.chat_id)
+            break
+
+        except Exception as e:
+            import traceback
+            error_msg = f"BOT CRASHED → AUTO-RESTARTING IN 15s\n{traceback.format_exc()}"
+            log(error_msg, args.telegram_token, args.chat_id)
+            telegram_post(args.telegram_token, args.chat_id, "BOT CRASHED – RESTARTING IN 15s")
+            time.sleep(15)
+    # ==================================================================
