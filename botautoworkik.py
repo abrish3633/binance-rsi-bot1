@@ -18,6 +18,7 @@ import threading
 import traceback
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_EVEN
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 import schedule
 from urllib.parse import urlencode
 import atexit
@@ -112,9 +113,9 @@ VOLATILITY_ABORT = False   # set by ATR spike check (see trading loop)
 daily_start_equity = None
 account_size = None
 drawdown_protection_enabled = True
-last_news_guard_msg: str | None = None
+last_news_guard_msg: Optional[str] = None
 news_guard_was_active: bool = False
-_last_news_block_reason = None
+_last_news_block_reason: Optional[str] = None
 # ---------------------------------------------------------------------------------------
 # 4. FETCHERS
 # ----------------------------------------------------------------------
@@ -717,33 +718,34 @@ def aggregate_klines_to_45m(klines_15m):
         return []
 
     aggregated = []
-    # tolerance in ms for alignment (small allowance for minor timing differences)
-    TOLERANCE_MS = 2000
-    for i in range(0, len(klines_15m) - 2, 3):  # Every 3 candles
-        a, b, c = klines_15m[i], klines_15m[i+1], klines_15m[i+2]
-        open_time = int(a[0])
+    # Start from the newest complete group of 3 → guarantees a candle every 45 min
+    for i in range(len(klines_15m) - 3, -1, -3):   # reverse loop, step -3
+        chunk = klines_15m[i:i+3][::-1]             # take 3 and reverse to chronological
+        if len(chunk) != 3:
+            continue
+        a, b, c = chunk[0], chunk[1], chunk[2]     # a = oldest, c = newest
+
+        open_time  = int(a[0])
         close_time = int(c[6])
 
-        expected_duration = 3 * 15 * 60 * 1000  # 45 minutes in ms
-
-        # Only accept if the group is complete and aligned (allow tiny tolerance)
-        if abs((close_time - open_time) - expected_duration) > TOLERANCE_MS:
-            continue  # Skip incomplete or misaligned
+        # Strict perfect alignment (Binance 15m is always perfect)
+        if close_time - open_time != 45 * 60 * 1000:
+            continue
 
         high = max(float(a[2]), float(b[2]), float(c[2]))
-        low = min(float(a[3]), float(b[3]), float(c[3]))
-        volume = float(a[5]) + float(b[5]) + float(c[5])
+        low  = min(float(a[3]), float(b[3]), float(c[3]))
 
         aggregated.append([
             open_time,
-            float(a[1]),    # open
+            float(a[1]),   # open
             high,
             low,
-            float(c[4]),    # close
-            volume,
+            float(c[4]),   # close
+            float(a[5]) + float(b[5]) + float(c[5]),  # volume
             close_time
         ])
 
+    aggregated.reverse()   # back to chronological order
     return aggregated
 
 # ------------------- SYMBOL FILTERS -------------------
@@ -825,20 +827,25 @@ def fetch_klines(client, symbol, interval, limit=max(100, VOL_SMA_PERIOD + 50)):
     requested = interval
     if requested == "45m":
         interval = "15m"
-        limit = max(limit, 300)  # Need 3x more
+        limit = max(limit, 300)  # Need 3x more for safe aggregation
+
     try:
         raw = client.public_request("/fapi/v1/klines", {
             "symbol": symbol,
             "interval": interval,
             "limit": limit
         })
+
         # if the caller requested 45m, aggregate the fetched 15m klines
         if interval == "15m" and requested == "45m":
-            return aggregate_klines_to_45m(raw)
+            return aggregate_klines_to_45m(raw)   # ← new drift-proof version
+
         return raw
+
     except Exception as e:
         log(f"Klines fetch failed: {e}")
         raise
+
 
 def fetch_balance(client: BinanceClient):
     try:
