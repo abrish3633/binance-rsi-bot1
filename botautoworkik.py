@@ -18,7 +18,7 @@ import threading
 import traceback
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_EVEN
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Tuple
 import schedule
 from urllib.parse import urlencode
 import atexit
