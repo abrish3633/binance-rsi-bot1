@@ -1131,9 +1131,9 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                 klines = []
 
             # NEWS EMERGENCY
-            if NEWS_LOCK and trade_state.active:
-                emergency_close_on_news(client, symbol, trade_state, telegram_bot, telegram_chat_id)
-                return
+            # if NEWS_LOCK and trade_state.active:
+            #    emergency_close_on_news(client, symbol, trade_state, telegram_bot, telegram_chat_id)
+            #   return
 
             # DAILY DRAWDOWN CHECK
             if drawdown_protection_enabled and daily_start_equity is not None:
@@ -1178,34 +1178,44 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                     log("Position closed.", telegram_bot, telegram_chat_id)
                     trade_state.active = False
 
-                    # --- Get Exit Price ---
-                    latest_trade = client.get_latest_trade_details(symbol)
-                    exit_price = latest_trade["price"] if latest_trade else None
-                    if exit_price is None:
-                        ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
-                        exit_price = Decimal(str(ticker.get("price", "0")))
-                    exit_price_f = float(exit_price)
+                    # ---- 1. Fetch open orders once ----
+                    open_orders = client.get_open_orders(symbol)
+                    open_order_ids = {o["orderId"] for o in open_orders}
 
-                    # --- Determine Exit Reason (Trailing > TP > SL > Manual) ---
-                    reason = "Manual Close"
-                    if STOP_REQUESTED or os.path.exists("stop.txt"):
-                        reason = "Stop Requested"
+                    # ---- 2. TRAILING STOP HIT? ----
+                    if (trade_state.trail_activated and
+                        trade_state.trail_order_id and
+                        trade_state.trail_order_id not in open_order_ids):
+                        reason = "Trailing Stop"
+                        exit_price = client.get_latest_fill_price(symbol, trade_state.trail_order_id)
+
+                    # ---- 3. STOP-LOSS HIT? ----
+                    elif (trade_state.sl_order_id and
+                          trade_state.sl_order_id not in open_order_ids):
+                        reason = "Stop Loss"
+                        exit_price = client.get_latest_fill_price(symbol, trade_state.sl_order_id)
+
+                    # ---- 4. TAKE-PROFIT HIT? ----
+                    elif (trade_state.tp_order_id and
+                          trade_state.tp_order_id not in open_order_ids):
+                        reason = "Take Profit"
+                        exit_price = client.get_latest_fill_price(symbol, trade_state.tp_order_id)
+
+                    # ---- 5. MANUAL / UNKNOWN ----
                     else:
-                        try:
-                            recent = client.send_signed_request("GET", "/fapi/v1/userTrades", {"symbol": symbol, "limit": 5})
-                            close_trades = [t for t in recent if abs(Decimal(t.get('qty', '0'))) >= Decimal(str(trade_state.qty)) * Decimal('0.9')]
-                            if close_trades:
-                                exit_p = Decimal(close_trades[0]['price'])
-                                # Check trailing stop first
-                                if (trade_state.current_trail_stop and 
-                                    abs(exit_p - Decimal(str(trade_state.current_trail_stop))) < tick_size * 20):
-                                    reason = "Trailing Stop"
-                                elif abs(exit_p - Decimal(str(trade_state.sl))) < tick_size * 20:
-                                    reason = "Stop Loss"
-                                elif abs(exit_p - Decimal(str(trade_state.tp))) < tick_size * 20:
-                                    reason = "Take Profit"
-                        except Exception as e:
-                            log(f"Failed to detect exit reason: {e}", telegram_bot, telegram_chat_id)
+                        reason = "Manual Close" if not STOP_REQUESTED else "Stop Requested"
+                        exit_price = None  # Will fallback below
+
+                    # ---- 6. FALLBACK PRICE (only if still no fill) ----
+                    if exit_price is None:
+                        latest = client.get_latest_trade_details(symbol)
+                        if latest:
+                            exit_price = latest["price"]
+                        else:
+                            ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+                            exit_price = Decimal(str(ticker.get("price", "0")))
+
+                    exit_price_f = float(exit_price)
 
                     # --- Log PNL ---
                     entry_price_safe = float(trade_state.entry_price or 0.0)
@@ -1854,27 +1864,51 @@ if __name__ == "__main__":
             pass
         sys.exit(0)
 
-    import signal
-    signal.signal(signal.SIGINT, _force_cleanup)   # Ctrl+C
-    signal.signal(signal.SIGTERM, _force_cleanup)  # kill / systemd
+    # ======================== FINAL GOODBYE MESSAGE (ALWAYS SENT) ========================
+    def _send_goodbye():
+        try:
+            reason = "Clean exit"
+            if os.path.exists("/tmp/STOP_BOT_NOW"):
+                reason = "KILL FLAG / Manual stop"
+            elif "KeyboardInterrupt" in traceback.format_exc():
+                reason = "Ctrl+C / SIGINT"
+            elif sys.exc_info()[0] is not None:
+                reason = "Crash / Unhandled exception"
 
-    # Ensure lock file is removed on any exit (atexit + signal = bulletproof)
+            goodbye_msg = f" RSI BOT STOPPED\n" \
+                          f"Symbol: {args.symbol}\n" \
+                          f"Timeframe: {args.timeframe}\n" \
+                          f"Reason: {reason}\n" \
+                          f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
+
+            log(goodbye_msg, args.telegram_token, args.chat_id)
+            telegram_post(args.telegram_token, args.chat_id, goodbye_msg)
+
+            if os.path.exists("/tmp/STOP_BOT_NOW"):
+                os.unlink("/tmp/STOP_BOT_NOW")
+        except:
+            pass
+
+    # Register cleanup & goodbye
+    atexit.register(_send_goodbye)
     atexit.register(_force_cleanup)
     atexit.register(_request_stop, symbol=args.symbol, telegram_bot=args.telegram_token, telegram_chat_id=args.chat_id)
 
+    # Catch Ctrl+C and SIGTERM → send goodbye + clean exit
+    import signal
+    def _handle_exit(sig, frame):
+        _send_goodbye()
+        _force_cleanup()
+    signal.signal(signal.SIGINT, _handle_exit)   # Ctrl+C
+    signal.signal(signal.SIGTERM, _handle_exit)  # kill / systemd
+
     # ======================== IMMORTAL BOT LOOP ========================
     while True:
-        # === INSTANT GLOBAL KILL SWITCH (touch /tmp/STOP_BOT_NOW to kill forever) ===
         if os.path.exists("/tmp/STOP_BOT_NOW"):
             log("STOP_BOT_NOW flag detected – shutting down permanently", args.telegram_token, args.chat_id)
-            try:
-                os.unlink("/tmp/STOP_BOT_NOW")
-            except:
-                pass
             break
 
         try:
-            # Everything that needs a fresh start goes HERE
             client = BinanceClient(args.api_key, args.api_secret, use_live=args.live, base_override=args.base_url)
             balance = fetch_balance(client)
             account_size = balance
@@ -1908,7 +1942,6 @@ if __name__ == "__main__":
                 telegram_chat_id=args.chat_id
             )
 
-            # Clean exit path
             log("Bot stopped cleanly – exiting.", args.telegram_token, args.chat_id)
             break
 
@@ -1918,5 +1951,4 @@ if __name__ == "__main__":
             log(error_msg, args.telegram_token, args.chat_id)
             telegram_post(args.telegram_token, args.chat_id, "BOT CRASHED – RESTARTING IN 15s")
             time.sleep(15)
-    # ==================================================================
 
