@@ -1865,37 +1865,54 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # ======================== FINAL GOODBYE MESSAGE (ALWAYS SENT) ========================
-    def _send_goodbye():
+    _goodbye_sent = False
+
+    def _send_goodbye_and_cleanup(sig=None, frame=None):
+        global _goodbye_sent
+        if _goodbye_sent:
+            _force_cleanup()
+            return
+
+        _goodbye_sent = True
+
         try:
             reason = "Clean exit"
             if os.path.exists("/tmp/STOP_BOT_NOW"):
                 reason = "KILL FLAG / Manual stop"
-            elif "KeyboardInterrupt" in traceback.format_exc():
-                reason = "Ctrl+C / SIGINT"
-            elif sys.exc_info()[0] is not None:
-                reason = "Crash / Unhandled exception"
+            elif sig == signal.SIGINT:
+                reason = "Ctrl+C"
+            elif sig == signal.SIGTERM:
+                reason = "SIGTERM / pkill"
+            else:
+                reason = "Crash / Exception"
 
-            goodbye_msg = f" RSI BOT STOPPED\n" \
-                          f"Symbol: {args.symbol}\n" \
-                          f"Timeframe: {args.timeframe}\n" \
-                          f"Reason: {reason}\n" \
-                          f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
+            goodbye_msg = (
+                f" RSI BOT STOPPED\n"
+                f"Symbol: {args.symbol}\n"
+                f"Timeframe: {args.timeframe}\n"
+                f"Reason: {reason}\n"
+                f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
+            )
 
             log(goodbye_msg, args.telegram_token, args.chat_id)
             telegram_post(args.telegram_token, args.chat_id, goodbye_msg)
 
             if os.path.exists("/tmp/STOP_BOT_NOW"):
                 os.unlink("/tmp/STOP_BOT_NOW")
-        except:
-            pass
 
-    # Register cleanup & goodbye
-    atexit.register(_send_goodbye)
+        except Exception:
+            pass
+        finally:
+            _force_cleanup()
+
+    # === ONLY ONE WAY TO SEND GOODBYE + CLEANUP ===
+    import signal
+    signal.signal(signal.SIGINT,  _send_goodbye_and_cleanup)   # Ctrl+C
+    signal.signal(signal.SIGTERM, _send_goodbye_and_cleanup)   # pkill / systemd
+
+    # === ONLY CLEANUP (no message) ===
     atexit.register(_force_cleanup)
     atexit.register(_request_stop, symbol=args.symbol, telegram_bot=args.telegram_token, telegram_chat_id=args.chat_id)
-
-    # Catch Ctrl+C and SIGTERM → send goodbye + clean exit
-    import signal
     def _handle_exit(sig, frame):
         _send_goodbye()
         _force_cleanup()
