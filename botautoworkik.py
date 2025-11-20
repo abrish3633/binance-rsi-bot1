@@ -299,13 +299,15 @@ def is_news_blocked(now_utc: datetime | None = None) -> tuple[bool, str | None]:
             _last_news_block_reason = reason
         return True, reason
 
-    # === BLACKOUT ENDED ===
+    # ←←←←← DELETE OR COMMENT OUT THIS LINE ←←←←←
+    # log("NEWS GUARD -> All clear. Trading resumed.", telegram_bot, telegram_chat_id)
+
     if _last_news_block_reason is not None:
-        log("NEWS GUARD -> All clear. Trading resumed.", telegram_bot, telegram_chat_id)
         _last_news_block_reason = None
+        # Optional: you can keep a console log, it goes to bot.log anyway
+        logger.info("NEWS GUARD -> All clear. Trading resumed.")
 
     return False, None
-
 # ----------------------------------------------------------------------
 # 7. EMERGENCY CLOSE (call from monitor_trade_mt5 when NEWS_LOCK flips)
 # ----------------------------------------------------------------------
