@@ -55,7 +55,12 @@ RECOVERY_CHECK_INTERVAL = 10  # Seconds between recovery checks
 TRAIL_UPDATE_THROTTLE = 10.0  # Alert trailing updates every 10 seconds max
 POLLING_INTERVAL = 3  # ENHANCED: Polling interval after WS failure
 # ---------------------------------------------------------------------------------------
-
+# === CONFIG: BLACKOUT WINDOWS (UTC) ===
+# (weekday: 0=Mon..6=Sun, None=every day), (start_h, m), (end_h, m)
+NEWS_BLACKOUT_WINDOWS = [
+    (4, (12, 25), (13, 5)),     # Friday 12:30–13:00 UTC (NFP)
+    (2, (18, 55), (19, 35)),     # Wednesday 19:00–19:30 UTC (FOMC)
+]
 
 # === CONFIG: LIVE API ===
 LIVE_APIS = [
@@ -72,13 +77,7 @@ HIGH_IMPACT_KEYWORDS = {
 }
 BUFFER_MINUTES = 5
 # === DRAWDOWN-SCALED RISK (NO ATR) ===
-BASE_RISK_PCT = Decimal("0.005")        # 0.5% when drawdown = 0%NEWS_BLACKOUT_WINDOWS = [
-    (None, (datetime.now(timezone.utc).hour, datetime.now(timezone.utc).minute),
-           ((datetime.now(timezone.utc) + timedelta(minutes=2)).hour,
-            (datetime.now(timezone.utc) + timedelta(minutes=2)).minute)),
-    (4, (12, 25), (13, 5)),     # Friday NFP
-    (2, (18, 55), (19, 35)),    # Wednesday FOMC
-]
+BASE_RISK_PCT = Decimal("0.005")        # 0.5% when drawdown = 0%
 MAX_DRAWDOWN_PCT = Decimal("0.20")      # Risk → 0 at 20% daily drawdown
 MIN_RISK_PCT = Decimal("0.001")         # Never go below 0.1%
 # CONFIG SLIPAGE
