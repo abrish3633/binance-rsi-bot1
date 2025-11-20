@@ -1338,7 +1338,7 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
             except:
                 pass
 # ------------------- TRADING LOOP -------------------
-def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, telegram_bot, telegram_chat_id):
+def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, telegram_bot=None, telegram_chat_id=None):
     global last_news_guard_msg, news_guard_was_active
     global last_trade_date
     global last_no_klines_log
