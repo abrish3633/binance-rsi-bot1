@@ -57,10 +57,11 @@ POLLING_INTERVAL = 3  # ENHANCED: Polling interval after WS failure
 # ---------------------------------------------------------------------------------------
 # === CONFIG: BLACKOUT WINDOWS (UTC) ===
 NEWS_BLACKOUT_WINDOWS = [
-    (None, (datetime.now(timezone.utc).hour, datetime.now(timezone.utc).minute), 
-           ((datetime.now(timezone.utc) + timedelta(hours=1)).hour, (datetime.now(timezone.utc) + timedelta(hours=1)).minute)),
-    (4, (12, 25), (13, 5)),     # Friday 12:30–13:00 UTC (NFP)
-    (2, (18, 55), (19, 35)),    # Wednesday 19:00–19:30 UTC (FOMC)
+    (None, (datetime.now(timezone.utc).hour, datetime.now(timezone.utc).minute),
+           ((datetime.now(timezone.utc) + timedelta(minutes=10)).hour,
+            (datetime.now(timezone.utc) + timedelta(minutes=10)).minute)),
+    (4, (12, 25), (13, 5)),     # Friday NFP
+    (2, (18, 55), (19, 35)),    # Wednesday FOMC
 ]
 
 # === CONFIG: LIVE API ===
