@@ -55,6 +55,7 @@ RECOVERY_CHECK_INTERVAL = 10  # Seconds between recovery checks
 TRAIL_UPDATE_THROTTLE = 10.0  # Alert trailing updates every 10 seconds max
 POLLING_INTERVAL = 3  # ENHANCED: Polling interval after WS failure
 # ---------------------------------------------------------------------------------------
+# === CONFIG: BLACKOUT WINDOWS (UTC) ===
 NEWS_BLACKOUT_WINDOWS = [
     (None, (datetime.now(timezone.utc).hour, datetime.now(timezone.utc).minute),
            ((datetime.now(timezone.utc) + timedelta(minutes=2)).hour,
@@ -62,7 +63,6 @@ NEWS_BLACKOUT_WINDOWS = [
     (4, (12, 25), (13, 5)),     # Friday NFP
     (2, (18, 55), (19, 35)),    # Wednesday FOMC
 ]
-
 # === CONFIG: LIVE API ===
 LIVE_APIS = [
     "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
@@ -1761,7 +1761,24 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             _safe_sleep(sleep_seconds)
 
         except Exception as e:
-            log(f"Loop error: {str(e)}", telegram_bot, telegram_chat_id)
+            import traceback
+            error_msg = f"Loop error: {str(e)}"
+            full_trace = traceback.format_exc()
+            
+            # Always safe – writes to console + bot.log even if Telegram is dead
+            logger.error(error_msg)
+            logger.error(full_trace)
+            
+            # Try to send to Telegram – will never raise NameError or crash the bot
+            try:
+                telegram_post(telegram_bot, telegram_chat_id, f"⚠️ BOT ERROR ⚠️\n{error_msg}")
+            except NameError:
+                # telegram_bot / telegram_chat_id not in scope yet (very rare edge case)
+                pass
+            except Exception:
+                # Any other Telegram/network issue – ignore, bot must stay alive
+                pass
+            
             time.sleep(2)
 
     log("Trading loop exited.", telegram_bot, telegram_chat_id)
