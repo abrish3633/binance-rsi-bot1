@@ -229,7 +229,7 @@ def _refresh_news():
     now = datetime.now(timezone.utc)
     events = []
 
-    # === 1. Fetch live calendars ===
+    # === 1. Existing economic calendars ===
     for api in LIVE_APIS:
         data = _fetch_json(api)
         if data:
@@ -247,10 +247,6 @@ def _refresh_news():
         dt = _parse_event(e)
         if dt:
             high.append({"dt": dt, "title": title})
-
-    # ←←← THIS LINE WAS MISSING ←←←
-    _news_cache = high
-    _cache_ts = time.time()
 
 def news_heartbeat():
     global NEWS_LOCK
@@ -1381,7 +1377,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             trade_state.trail_order_id = None
             log("Existing position detected on startup. Recovering orders...", telegram_bot, telegram_chat_id)
             debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
-            monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, int(time.time() * 1000))
+            monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, close_time)
 
     # === MAIN LOOP ===
     while not STOP_REQUESTED and not os.path.exists("stop.txt"):
@@ -1857,75 +1853,65 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     init_pnl_log()
-    # === ALIASES FOR CLEAN CODE (THIS IS THE RIGHT WAY) ===
-    telegram_bot = args.telegram_token
-    telegram_chat_id = args.chat_id
-    # ======================== NUCLEAR KILL SWITCH + LOCK CLEANUP ========================
-    def _force_cleanup(signum=None, frame=None):
+
+    # ======================== SINGLE, BULLETPROOF SHUTDOWN ========================
+    _shutdown_done = False
+
+    def graceful_shutdown(sig=None, frame=None):
+        global _shutdown_done
+        if _shutdown_done:
+            return
+        _shutdown_done = True
+
+        reason = {
+            signal.SIGINT: "Ctrl+C",
+            signal.SIGTERM: "SIGTERM / systemd",
+        }.get(sig, "Clean exit")
+
+        if os.path.exists("/tmp/STOP_BOT_NOW"):
+            reason = "KILL FLAG / Manual stop"
+
+        goodbye = (
+            f"RSI BOT STOPPED\n"
+            f"Symbol: {args.symbol}\n"
+            f"Timeframe: {args.timeframe}\n"
+            f"Reason: {reason}\n"
+            f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        )
+
+        try:
+            log(goodbye, args.telegram_token, args.chat_id)
+            telegram_post(args.telegram_token, args.chat_id, goodbye)
+        except:
+            pass  # Never crash on goodbye
+
+        # Clean lock file
         try:
             LOCK_HANDLE.close()
             if os.path.exists(LOCK_FILE):
                 os.unlink(LOCK_FILE)
         except:
             pass
-        sys.exit(0)
 
-    # ======================== FINAL GOODBYE MESSAGE (ALWAYS SENT) ========================
-    _goodbye_sent = False
-
-    def _send_goodbye_and_cleanup(sig=None, frame=None):
-        global _goodbye_sent
-        if _goodbye_sent:
-            _force_cleanup()
-            return
-
-        _goodbye_sent = True
-
+        # Remove kill flag
         try:
-            reason = "Clean exit"
-            if os.path.exists("/tmp/STOP_BOT_NOW"):
-                reason = "KILL FLAG / Manual stop"
-            elif sig == signal.SIGINT:
-                reason = "Ctrl+C"
-            elif sig == signal.SIGTERM:
-                reason = "SIGTERM / pkill"
-            else:
-                reason = "Crash / Exception"
-
-            goodbye_msg = (
-                f" RSI BOT STOPPED\n"
-                f"Symbol: {args.symbol}\n"
-                f"Timeframe: {args.timeframe}\n"
-                f"Reason: {reason}\n"
-                f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
-            )
-
-            log(goodbye_msg, telegram_bot, telegram_chat_id)
-            telegram_post(telegram_bot, telegram_chat_id, goodbye_msg)
-
             if os.path.exists("/tmp/STOP_BOT_NOW"):
                 os.unlink("/tmp/STOP_BOT_NOW")
-
-        except Exception:
+        except:
             pass
-        finally:
-            _force_cleanup()
 
-    # === ONLY ONE WAY TO SEND GOODBYE + CLEANUP ===
-    import signal
-    
-    atexit.register(_force_cleanup)
-    atexit.register(_request_stop, symbol=args.symbol, telegram_bot=telegram_bot, telegram_chat_id=telegram_chat_id)
-    def _handle_exit(sig, frame):
-        _send_goodbye()
-        _force_cleanup()
-    signal.signal(signal.SIGINT, _handle_exit)   # Ctrl+C
-    signal.signal(signal.SIGTERM, _handle_exit)  # kill / systemd
+        os._exit(0)
+
+    # Register exactly once
+    signal.signal(signal.SIGINT, graceful_shutdown)
+    signal.signal(signal.SIGTERM, graceful_shutdown)
+    atexit.register(graceful_shutdown)
 
     # ======================== IMMORTAL BOT LOOP ========================
     while True:
         if os.path.exists("/tmp/STOP_BOT_NOW"):
-            log("STOP_BOT_NOW flag detected – shutting down permanently", telegram_bot, telegram_chat_id)
+            log("STOP_BOT_NOW flag detected – shutting down permanently", args.telegram_token, args.chat_id)
+            graceful_shutdown()
             break
 
         try:
@@ -1935,15 +1921,15 @@ if __name__ == "__main__":
             daily_start_equity = balance
 
             log(f"Daily drawdown protection ENABLED. Start equity: {float(daily_start_equity):.2f} USD",
-                telegram_bot, telegram_chat_id)
-            log(f"Fetched balance: {float(balance):.2f} USDT", telegram_bot, telegram_chat_id)
+                args.telegram_token, args.chat_id)
+            log(f"Fetched balance: {float(balance):.2f} USDT", args.telegram_token, args.chat_id)
 
             threading.Thread(target=news_heartbeat, daemon=True).start()
             log(f"Connected ({'LIVE' if args.live else 'TESTNET'}). Starting bot with symbol={args.symbol}, "
                 f"timeframe={args.timeframe}, risk_pct={args.risk_pct}%, use_volume_filter={args.use_volume_filter}",
-                telegram_bot, telegram_chat_id)
+                args.telegram_token, args.chat_id)
 
-            threading.Thread(target=lambda: run_scheduler(telegram_bot, telegram_chat_id), daemon=True).start()
+            threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
 
             trading_loop(
                 client=client,
@@ -1958,17 +1944,20 @@ if __name__ == "__main__":
                 require_no_pos=args.require_no_pos,
                 use_max_loss=args.use_max_loss,
                 use_volume_filter=args.use_volume_filter,
-                telegram_bot=telegram_bot,
-                telegram_chat_id=telegram_chat_id
+                telegram_bot=args.telegram_token,
+                telegram_chat_id=args.chat_id
             )
 
-            log("Bot stopped cleanly – exiting.", telegram_bot, telegram_chat_id)
+            log("Bot stopped cleanly – exiting.", args.telegram_token, args.chat_id)
             break
 
         except Exception as e:
             import traceback
-            error_msg = f"BOT CRASHED → AUTO-RESTARTING IN 15s\n{traceback.format_exc()}"
-            log(error_msg, telegram_bot, telegram_chat_id)
-            telegram_post(telegram_bot, telegram_chat_id, "BOT CRASHED – RESTARTING IN 15s")
+            error_msg = f"BOT CRASHED → RESTARTING IN 15s\n{traceback.format_exc()}"
+            try:
+                log(error_msg, args.telegram_token, args.chat_id)
+                telegram_post(args.telegram_token, args.chat_id, "BOT CRASHED – RESTARTING IN 15s")
+            except:
+                pass  # Never die from logging
             time.sleep(15)
 
