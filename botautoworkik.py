@@ -247,6 +247,9 @@ def _refresh_news():
         dt = _parse_event(e)
         if dt:
             high.append({"dt": dt, "title": title})
+        # ←←← THIS LINE WAS MISSING ←←←
+    _news_cache = high
+    _cache_ts = time.time()
 
 def news_heartbeat():
     global NEWS_LOCK
@@ -1377,7 +1380,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             trade_state.trail_order_id = None
             log("Existing position detected on startup. Recovering orders...", telegram_bot, telegram_chat_id)
             debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
-            monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, close_time)
+            monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, int(time.time() * 1000))
 
     # === MAIN LOOP ===
     while not STOP_REQUESTED and not os.path.exists("stop.txt"):
@@ -1960,4 +1963,3 @@ if __name__ == "__main__":
             except:
                 pass  # Never die from logging
             time.sleep(15)
-
