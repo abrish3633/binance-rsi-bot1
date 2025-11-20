@@ -229,7 +229,7 @@ def _refresh_news():
     now = datetime.now(timezone.utc)
     events = []
 
-    # === 1. Existing economic calendars ===
+    # === 1. Fetch live calendars ===
     for api in LIVE_APIS:
         data = _fetch_json(api)
         if data:
@@ -247,6 +247,10 @@ def _refresh_news():
         dt = _parse_event(e)
         if dt:
             high.append({"dt": dt, "title": title})
+
+    # ←←← THIS LINE WAS MISSING ←←←
+    _news_cache = high
+    _cache_ts = time.time()
 
 def news_heartbeat():
     global NEWS_LOCK
@@ -1377,7 +1381,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             trade_state.trail_order_id = None
             log("Existing position detected on startup. Recovering orders...", telegram_bot, telegram_chat_id)
             debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
-            monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, close_time)
+            monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, int(time.time() * 1000))
 
     # === MAIN LOOP ===
     while not STOP_REQUESTED and not os.path.exists("stop.txt"):
@@ -1853,7 +1857,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     init_pnl_log()
-
+    # === ALIASES FOR CLEAN CODE (THIS IS THE RIGHT WAY) ===
+    telegram_bot = args.telegram_token
+    telegram_chat_id = args.chat_id
     # ======================== NUCLEAR KILL SWITCH + LOCK CLEANUP ========================
     def _force_cleanup(signum=None, frame=None):
         try:
@@ -1894,8 +1900,8 @@ if __name__ == "__main__":
                 f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
             )
 
-            log(goodbye_msg, args.telegram_token, args.chat_id)
-            telegram_post(args.telegram_token, args.chat_id, goodbye_msg)
+            log(goodbye_msg, telegram_bot, telegram_chat_id)
+            telegram_post(telegram_bot, telegram_chat_id, goodbye_msg)
 
             if os.path.exists("/tmp/STOP_BOT_NOW"):
                 os.unlink("/tmp/STOP_BOT_NOW")
@@ -1907,12 +1913,9 @@ if __name__ == "__main__":
 
     # === ONLY ONE WAY TO SEND GOODBYE + CLEANUP ===
     import signal
-    signal.signal(signal.SIGINT,  _send_goodbye_and_cleanup)   # Ctrl+C
-    signal.signal(signal.SIGTERM, _send_goodbye_and_cleanup)   # pkill / systemd
-
-    # === ONLY CLEANUP (no message) ===
+    
     atexit.register(_force_cleanup)
-    atexit.register(_request_stop, symbol=args.symbol, telegram_bot=args.telegram_token, telegram_chat_id=args.chat_id)
+    atexit.register(_request_stop, symbol=args.symbol, telegram_bot=telegram_bot, telegram_chat_id=telegram_chat_id)
     def _handle_exit(sig, frame):
         _send_goodbye()
         _force_cleanup()
@@ -1922,7 +1925,7 @@ if __name__ == "__main__":
     # ======================== IMMORTAL BOT LOOP ========================
     while True:
         if os.path.exists("/tmp/STOP_BOT_NOW"):
-            log("STOP_BOT_NOW flag detected – shutting down permanently", args.telegram_token, args.chat_id)
+            log("STOP_BOT_NOW flag detected – shutting down permanently", telegram_bot, telegram_chat_id)
             break
 
         try:
@@ -1932,15 +1935,15 @@ if __name__ == "__main__":
             daily_start_equity = balance
 
             log(f"Daily drawdown protection ENABLED. Start equity: {float(daily_start_equity):.2f} USD",
-                args.telegram_token, args.chat_id)
-            log(f"Fetched balance: {float(balance):.2f} USDT", args.telegram_token, args.chat_id)
+                telegram_bot, telegram_chat_id)
+            log(f"Fetched balance: {float(balance):.2f} USDT", telegram_bot, telegram_chat_id)
 
             threading.Thread(target=news_heartbeat, daemon=True).start()
             log(f"Connected ({'LIVE' if args.live else 'TESTNET'}). Starting bot with symbol={args.symbol}, "
                 f"timeframe={args.timeframe}, risk_pct={args.risk_pct}%, use_volume_filter={args.use_volume_filter}",
-                args.telegram_token, args.chat_id)
+                telegram_bot, telegram_chat_id)
 
-            threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
+            threading.Thread(target=lambda: run_scheduler(telegram_bot, telegram_chat_id), daemon=True).start()
 
             trading_loop(
                 client=client,
@@ -1955,17 +1958,17 @@ if __name__ == "__main__":
                 require_no_pos=args.require_no_pos,
                 use_max_loss=args.use_max_loss,
                 use_volume_filter=args.use_volume_filter,
-                telegram_bot=args.telegram_token,
-                telegram_chat_id=args.chat_id
+                telegram_bot=telegram_bot,
+                telegram_chat_id=telegram_chat_id
             )
 
-            log("Bot stopped cleanly – exiting.", args.telegram_token, args.chat_id)
+            log("Bot stopped cleanly – exiting.", telegram_bot, telegram_chat_id)
             break
 
         except Exception as e:
             import traceback
             error_msg = f"BOT CRASHED → AUTO-RESTARTING IN 15s\n{traceback.format_exc()}"
-            log(error_msg, args.telegram_token, args.chat_id)
-            telegram_post(args.telegram_token, args.chat_id, "BOT CRASHED – RESTARTING IN 15s")
+            log(error_msg, telegram_bot, telegram_chat_id)
+            telegram_post(telegram_bot, telegram_chat_id, "BOT CRASHED – RESTARTING IN 15s")
             time.sleep(15)
 
