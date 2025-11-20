@@ -58,8 +58,8 @@ POLLING_INTERVAL = 3  # ENHANCED: Polling interval after WS failure
 # === CONFIG: BLACKOUT WINDOWS (UTC) ===
 NEWS_BLACKOUT_WINDOWS = [
     (None, (datetime.now(timezone.utc).hour, datetime.now(timezone.utc).minute),
-           ((datetime.now(timezone.utc) + timedelta(minutes=10)).hour,
-            (datetime.now(timezone.utc) + timedelta(minutes=10)).minute)),
+           ((datetime.now(timezone.utc) + timedelta(minutes=2)).hour,
+            (datetime.now(timezone.utc) + timedelta(minutes=2)).minute)),
     (4, (12, 25), (13, 5)),     # Friday NFP
     (2, (18, 55), (19, 35)),    # Wednesday FOMC
 ]
@@ -298,13 +298,6 @@ def is_news_blocked(now_utc: datetime | None = None) -> tuple[bool, str | None]:
         if reason != _last_news_block_reason:
             _last_news_block_reason = reason
         return True, reason
-
-    # === BLACKOUT ENDED ===
-    if _last_news_block_reason is not None:
-        log("NEWS GUARD -> All clear. Trading resumed.", telegram_bot, telegram_chat_id)
-        _last_news_block_reason = None
-
-    return False, None
 
 # ----------------------------------------------------------------------
 # 7. EMERGENCY CLOSE (call from monitor_trade_mt5 when NEWS_LOCK flips)
