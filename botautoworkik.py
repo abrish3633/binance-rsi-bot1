@@ -55,13 +55,7 @@ RECOVERY_CHECK_INTERVAL = 10  # Seconds between recovery checks
 TRAIL_UPDATE_THROTTLE = 10.0  # Alert trailing updates every 10 seconds max
 POLLING_INTERVAL = 3  # ENHANCED: Polling interval after WS failure
 # ---------------------------------------------------------------------------------------
-NEWS_BLACKOUT_WINDOWS = [
-    (None, (datetime.now(timezone.utc).hour, datetime.now(timezone.utc).minute),
-           ((datetime.now(timezone.utc) + timedelta(minutes=2)).hour,
-            (datetime.now(timezone.utc) + timedelta(minutes=2)).minute)),
-    (4, (12, 25), (13, 5)),     # Friday NFP
-    (2, (18, 55), (19, 35)),    # Wednesday FOMC
-]
+
 
 # === CONFIG: LIVE API ===
 LIVE_APIS = [
@@ -78,7 +72,13 @@ HIGH_IMPACT_KEYWORDS = {
 }
 BUFFER_MINUTES = 5
 # === DRAWDOWN-SCALED RISK (NO ATR) ===
-BASE_RISK_PCT = Decimal("0.005")        # 0.5% when drawdown = 0%
+BASE_RISK_PCT = Decimal("0.005")        # 0.5% when drawdown = 0%NEWS_BLACKOUT_WINDOWS = [
+    (None, (datetime.now(timezone.utc).hour, datetime.now(timezone.utc).minute),
+           ((datetime.now(timezone.utc) + timedelta(minutes=2)).hour,
+            (datetime.now(timezone.utc) + timedelta(minutes=2)).minute)),
+    (4, (12, 25), (13, 5)),     # Friday NFP
+    (2, (18, 55), (19, 35)),    # Wednesday FOMC
+]
 MAX_DRAWDOWN_PCT = Decimal("0.20")      # Risk → 0 at 20% daily drawdown
 MIN_RISK_PCT = Decimal("0.001")         # Never go below 0.1%
 # CONFIG SLIPAGE
@@ -299,6 +299,7 @@ def is_news_blocked(now_utc: datetime | None = None) -> tuple[bool, str | None]:
             _last_news_block_reason = reason
         return True, reason
 
+    # === BLACKOUT ENDED ===
     if _last_news_block_reason is not None:
         log("NEWS GUARD -> All clear. Trading resumed.", telegram_bot, telegram_chat_id)
         _last_news_block_reason = None
@@ -386,11 +387,8 @@ logger.addHandler(file_handler)
 
 def log(message, telegram_bot=None, telegram_chat_id=None):
     logger.info(message)
-    if telegram_bot is not None and telegram_chat_id is not None:
-        try:
-            telegram_post(telegram_bot, telegram_chat_id, message)
-        except:
-            pass
+    if telegram_bot and telegram_chat_id:
+        telegram_post(telegram_bot, telegram_chat_id, message)
 
 # ------------------- TELEGRAM (3x retry + backoff) -------------------
 def telegram_post(token, chat_id, text, parse_mode=None):
