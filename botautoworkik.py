@@ -56,10 +56,11 @@ TRAIL_UPDATE_THROTTLE = 10.0  # Alert trailing updates every 10 seconds max
 POLLING_INTERVAL = 3  # ENHANCED: Polling interval after WS failure
 # ---------------------------------------------------------------------------------------
 # === CONFIG: BLACKOUT WINDOWS (UTC) ===
-# (weekday: 0=Mon..6=Sun, None=every day), (start_h, m), (end_h, m)
 NEWS_BLACKOUT_WINDOWS = [
+    (None, (datetime.now(timezone.utc).hour, datetime.now(timezone.utc).minute), 
+           ((datetime.now(timezone.utc) + timedelta(hours=1)).hour, (datetime.now(timezone.utc) + timedelta(hours=1)).minute)),
     (4, (12, 25), (13, 5)),     # Friday 12:30–13:00 UTC (NFP)
-    (2, (18, 55), (19, 35)),     # Wednesday 19:00–19:30 UTC (FOMC)
+    (2, (18, 55), (19, 35)),    # Wednesday 19:00–19:30 UTC (FOMC)
 ]
 
 # === CONFIG: LIVE API ===
