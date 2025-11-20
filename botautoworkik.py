@@ -18,16 +18,15 @@ import threading
 import traceback
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_EVEN
 from datetime import datetime, timezone, timedelta
+from typing import Optional, Tuple
 import schedule
 from urllib.parse import urlencode
-from typing import Optional, Tuple
 import atexit
 import websocket
 import json
 import queue
 import feedparser  # ← NEW
 import socket
-import platform
 
 # ------------------- CONFIGURATION -------------------
 RISK_PCT = Decimal("0.005")  # 0.5% per trade
@@ -58,8 +57,8 @@ POLLING_INTERVAL = 3  # ENHANCED: Polling interval after WS failure
 # === CONFIG: BLACKOUT WINDOWS (UTC) ===
 NEWS_BLACKOUT_WINDOWS = [
     (None, (datetime.now(timezone.utc).hour, datetime.now(timezone.utc).minute),
-           ((datetime.now(timezone.utc) + timedelta(minutes=10)).hour,
-            (datetime.now(timezone.utc) + timedelta(minutes=10)).minute)),
+           ((datetime.now(timezone.utc) + timedelta(minutes=3)).hour,
+            (datetime.now(timezone.utc) + timedelta(minutes=3)).minute)),
     (4, (12, 25), (13, 5)),     # Friday NFP
     (2, (18, 55), (19, 35)),    # Wednesday FOMC
 ]
@@ -84,7 +83,6 @@ MAX_DRAWDOWN_PCT = Decimal("0.20")      # Risk → 0 at 20% daily drawdown
 MIN_RISK_PCT = Decimal("0.001")         # Never go below 0.1%
 # CONFIG SLIPAGE
 MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")
-LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'sol_rsi_bot.lock')
 
 # ------------------- GLOBAL STATE -------------------
 STOP_REQUESTED = False
@@ -101,7 +99,7 @@ socket.setdefaulttimeout(10)
 # ENHANCED: Thread-safe stop & order cancellation
 _stop_lock = threading.Lock()
 _orders_cancelled = False
-
+last_no_klines_log = 0.0
 # ENHANCED: WebSocket → Polling fallback state
 _ws_failed = False
 _polling_active = False
@@ -120,40 +118,6 @@ drawdown_protection_enabled = True
 last_news_guard_msg: Optional[str] = None
 news_guard_was_active: bool = False
 _last_news_block_reason: Optional[str] = None
-
-# ==================== SINGLE INSTANCE LOCK (Windows + Linux) ====================
-LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'sol_rsi_bot.lock')
-
-try:
-    # 'x' mode = create exclusively → fails if file exists
-    LOCK_HANDLE = open(LOCK_FILE, 'x')
-except FileExistsError:
-    print("Another instance is already running! Exiting.")
-    sys.exit(1)
-except FileNotFoundError:
-    # Windows TEMP may not exist
-    os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
-    LOCK_HANDLE = open(LOCK_FILE, 'x')
-
-# Optional real lock on Linux only
-if platform.system() != "Windows":
-    try:
-        import fcntl
-        fcntl.lockf(LOCK_HANDLE.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except Exception:
-        pass
-
-# ==================== MEMORY LIMIT (Linux / OCI only) ====================
-if platform.system() != "Windows":
-    try:
-        import resource
-        SOFT = HARD = 680 * 1024 * 1024   # ~680 MB
-        resource.setrlimit(resource.RLIMIT_AS, (SOFT, HARD))
-        print(f"[Startup] Memory limit set to ~680 MB")
-    except Exception as e:
-        print(f"[Startup] Could not set memory limit: {e}")
-else:
-    print("[Startup] Windows detected – skipping Unix-only features (normal for local testing)")
 # ---------------------------------------------------------------------------------------
 # 4. FETCHERS
 # ----------------------------------------------------------------------
@@ -249,9 +213,6 @@ def _refresh_news():
         dt = _parse_event(e)
         if dt:
             high.append({"dt": dt, "title": title})
-        # ←←← THIS LINE WAS MISSING ←←←
-    _news_cache = high
-    _cache_ts = time.time()
 
 def news_heartbeat():
     global NEWS_LOCK
@@ -1136,9 +1097,9 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                 klines = []
 
             # NEWS EMERGENCY
-            # if NEWS_LOCK and trade_state.active:
-            #    emergency_close_on_news(client, symbol, trade_state, telegram_bot, telegram_chat_id)
-            #   return
+            if NEWS_LOCK and trade_state.active:
+                emergency_close_on_news(client, symbol, trade_state, telegram_bot, telegram_chat_id)
+                return
 
             # DAILY DRAWDOWN CHECK
             if drawdown_protection_enabled and daily_start_equity is not None:
@@ -1338,7 +1299,7 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
             except:
                 pass
 # ------------------- TRADING LOOP -------------------
-def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, telegram_bot=None, telegram_chat_id=None):
+def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, telegram_bot, telegram_chat_id):
     global last_news_guard_msg, news_guard_was_active
     global last_trade_date
     global last_no_klines_log
@@ -1382,7 +1343,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             trade_state.trail_order_id = None
             log("Existing position detected on startup. Recovering orders...", telegram_bot, telegram_chat_id)
             debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
-            monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, int(time.time() * 1000))
+            monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, close_time)
 
     # === MAIN LOOP ===
     while not STOP_REQUESTED and not os.path.exists("stop.txt"):
@@ -1847,121 +1808,48 @@ if __name__ == "__main__":
     parser.add_argument("--risk-pct", type=float, default=0.5, help="Risk percentage per trade (default: 0.5%)")
     parser.add_argument("--max-loss-pct", type=float, default=5.0, help="Max daily loss percentage (default: 5%)")
     parser.add_argument("--tp-mult", type=float, default=3.5, help="Take-profit multiplier (default: 3.5)")
-    parser.add_argument("--no-trailing", dest='use_trailing', action='store_false', help="Disable trailing stop")
-    parser.add_argument("--no-prevent-same-bar", dest='prevent_same_bar', action='store_false')
-    parser.add_argument("--no-require-no-pos", dest='require_no_pos', action='store_false')
-    parser.add_argument("--no-use-max-loss", dest='use_max_loss', action='store_false')
-    parser.add_argument("--use-volume-filter", action='store_true', default=False)
-    parser.add_argument("--no-volume-filter", action='store_false', dest='use_volume_filter')
-    parser.add_argument("--live", action="store_true")
-    parser.add_argument("--base-url", default=None)
+    parser.add_argument("--no-trailing", dest='use_trailing', action='store_false', help="Disable trailing stop (default: enabled)")
+    parser.add_argument("--no-prevent-same-bar", dest='prevent_same_bar', action='store_false', help="Allow entries on same bar (default: prevent same bar)")
+    parser.add_argument("--no-require-no-pos", dest='require_no_pos', action='store_false', help="Allow entry even if there's an active position (default: require no pos)")
+    parser.add_argument("--no-use-max-loss", dest='use_max_loss', action='store_false', help="Disable max daily loss protection (default: enabled)")
+    parser.add_argument("--use-volume-filter", action='store_true', default=False, help="Use volume filter (vol > SMA15)")
+    parser.add_argument("--no-volume-filter", action='store_false', dest='use_volume_filter', help="Disable volume filter")
+    parser.add_argument("--live", action="store_true", help="Use live Binance (default: Testnet)")
+    parser.add_argument("--base-url", default=None, help="Override base URL for Binance API (advanced)")
     args = parser.parse_args()
 
     init_pnl_log()
+    client = BinanceClient(args.api_key, args.api_secret, use_live=args.live, base_override=args.base_url)
+    get_server_time(client)  # Test sync at startup
+    balance = fetch_balance(client)
+    account_size = balance
+    daily_start_equity = balance
+    log(f"Daily drawdown protection ENABLED. Start equity: {float(daily_start_equity):.2f} USD", args.telegram_token, args.chat_id)
+    log(f"Fetched balance: {float(balance):.2f} USDT", args.telegram_token, args.chat_id)
+    threading.Thread(target=news_heartbeat, daemon=True).start()
+    log(f"Connected ({'LIVE' if args.live else 'TESTNET'}). Starting bot with symbol={args.symbol}, timeframe={args.timeframe}, risk_pct={args.risk_pct}%, use_volume_filter={args.use_volume_filter}", args.telegram_token, args.chat_id)
+    balance = fetch_balance(client)
+    log(f"Fetched balance: {float(balance):.2f} USDT", args.telegram_token, args.chat_id)
 
-    # ======================== SINGLE, BULLETPROOF SHUTDOWN ========================
-    _shutdown_done = False
+    atexit.register(_request_stop, symbol=args.symbol, telegram_bot=args.telegram_token, telegram_chat_id=args.chat_id)
 
-    def graceful_shutdown(sig=None, frame=None):
-        global _shutdown_done
-        if _shutdown_done:
-            return
-        _shutdown_done = True
-
-        reason = {
-            signal.SIGINT: "Ctrl+C",
-            signal.SIGTERM: "SIGTERM / systemd",
-        }.get(sig, "Clean exit")
-
-        if os.path.exists("/tmp/STOP_BOT_NOW"):
-            reason = "KILL FLAG / Manual stop"
-
-        goodbye = (
-            f"RSI BOT STOPPED\n"
-            f"Symbol: {args.symbol}\n"
-            f"Timeframe: {args.timeframe}\n"
-            f"Reason: {reason}\n"
-            f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
+    try:
+        threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
+        trading_loop(
+            client=client,
+            symbol=args.symbol,
+            timeframe=args.timeframe,
+            max_trades_per_day=args.max_trades,
+            risk_pct=Decimal(str(args.risk_pct)) / Decimal("100"),
+            max_daily_loss_pct=Decimal(str(args.max_loss_pct)),
+            tp_mult=Decimal(str(args.tp_mult)),
+            use_trailing=args.use_trailing,
+            prevent_same_bar=args.prevent_same_bar,
+            require_no_pos=args.require_no_pos,
+            use_max_loss=args.use_max_loss,
+            use_volume_filter=args.use_volume_filter,
+            telegram_bot=args.telegram_token,
+            telegram_chat_id=args.chat_id
         )
-
-        try:
-            log(goodbye, args.telegram_token, args.chat_id)
-            telegram_post(args.telegram_token, args.chat_id, goodbye)
-        except:
-            pass  # Never crash on goodbye
-
-        # Clean lock file
-        try:
-            LOCK_HANDLE.close()
-            if os.path.exists(LOCK_FILE):
-                os.unlink(LOCK_FILE)
-        except:
-            pass
-
-        # Remove kill flag
-        try:
-            if os.path.exists("/tmp/STOP_BOT_NOW"):
-                os.unlink("/tmp/STOP_BOT_NOW")
-        except:
-            pass
-
-        os._exit(0)
-
-    # Register exactly once
-    signal.signal(signal.SIGINT, graceful_shutdown)
-    signal.signal(signal.SIGTERM, graceful_shutdown)
-    atexit.register(graceful_shutdown)
-
-    # ======================== IMMORTAL BOT LOOP ========================
-    while True:
-        if os.path.exists("/tmp/STOP_BOT_NOW"):
-            log("STOP_BOT_NOW flag detected – shutting down permanently", args.telegram_token, args.chat_id)
-            graceful_shutdown()
-            break
-
-        try:
-            client = BinanceClient(args.api_key, args.api_secret, use_live=args.live, base_override=args.base_url)
-            balance = fetch_balance(client)
-            account_size = balance
-            daily_start_equity = balance
-
-            log(f"Daily drawdown protection ENABLED. Start equity: {float(daily_start_equity):.2f} USD",
-                args.telegram_token, args.chat_id)
-            log(f"Fetched balance: {float(balance):.2f} USDT", args.telegram_token, args.chat_id)
-
-            threading.Thread(target=news_heartbeat, daemon=True).start()
-            log(f"Connected ({'LIVE' if args.live else 'TESTNET'}). Starting bot with symbol={args.symbol}, "
-                f"timeframe={args.timeframe}, risk_pct={args.risk_pct}%, use_volume_filter={args.use_volume_filter}",
-                args.telegram_token, args.chat_id)
-
-            threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
-
-            trading_loop(
-                client=client,
-                symbol=args.symbol,
-                timeframe=args.timeframe,
-                max_trades_per_day=args.max_trades,
-                risk_pct=Decimal(str(args.risk_pct)) / Decimal("100"),
-                max_daily_loss_pct=Decimal(str(args.max_loss_pct)),
-                tp_mult=Decimal(str(args.tp_mult)),
-                use_trailing=args.use_trailing,
-                prevent_same_bar=args.prevent_same_bar,
-                require_no_pos=args.require_no_pos,
-                use_max_loss=args.use_max_loss,
-                use_volume_filter=args.use_volume_filter,
-                telegram_bot=args.telegram_token,
-                telegram_chat_id=args.chat_id
-            )
-
-            log("Bot stopped cleanly – exiting.", args.telegram_token, args.chat_id)
-            break
-
-        except Exception as e:
-            import traceback
-            error_msg = f"BOT CRASHED → RESTARTING IN 15s\n{traceback.format_exc()}"
-            try:
-                log(error_msg, args.telegram_token, args.chat_id)
-                telegram_post(args.telegram_token, args.chat_id, "BOT CRASHED – RESTARTING IN 15s")
-            except:
-                pass  # Never die from logging
-            time.sleep(15)
+    finally:
+        pass
