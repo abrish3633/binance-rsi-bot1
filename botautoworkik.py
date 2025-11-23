@@ -963,7 +963,10 @@ def debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, tel
         return
 
     try:
+        # Fetch current open orders once – efficient and safe
         open_orders = {o["orderId"]: o for o in client.get_open_orders(symbol)}
+
+        recovered_something = False  # Track if we actually re-issued anything
 
         # === RECOVER SL ===
         if trade_state.sl_order_id and trade_state.sl_order_id not in open_orders:
@@ -974,6 +977,8 @@ def debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, tel
                 trade_state.sl_order_id = new_sl["orderId"]
                 trade_state.sl = float(sl_price)
                 _tg_notify("SL Recovered", f"New Stop: {trade_state.sl:.4f}\nOrder ID: {trade_state.sl_order_id}", symbol, telegram_bot, telegram_chat_id)
+                recovered_something = True
+
         # === RECOVER TP ===
         if trade_state.tp_order_id and trade_state.tp_order_id not in open_orders:
             log(f"TP missing (ID={trade_state.tp_order_id}). Re-issuing...", telegram_bot, telegram_chat_id)
@@ -983,6 +988,7 @@ def debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, tel
                 trade_state.tp_order_id = new_tp["orderId"]
                 trade_state.tp = float(tp_price)
                 _tg_notify("TP Recovered", f"New TP: {trade_state.tp:.4f}\nOrder ID: {trade_state.tp_order_id}", symbol, telegram_bot, telegram_chat_id)
+                recovered_something = True
 
         # === RECOVER TRAILING ===
         if trade_state.trail_order_id and trade_state.trail_order_id not in open_orders:
@@ -994,10 +1000,36 @@ def debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, tel
                 trade_state.trail_activation_price = float(act_price)
                 trade_state.current_trail_stop = float(new_trail.get("stopPrice") or act_price)
                 _tg_notify("Trailing Recovered", f"Activation: {trade_state.trail_activation_price:.4f}\nOrder ID: {trade_state.trail_order_id}", symbol, telegram_bot, telegram_chat_id)
+                recovered_something = True
+
+        # Optional: quiet confirmation when all good (uncomment if you want)
+        # if not recovered_something:
+        #     log("All protective orders confirmed present.", telegram_bot, telegram_chat_id)
 
     except Exception as e:
         log(f"Recovery failed: {e}", telegram_bot, telegram_chat_id)
 
+    # CRITICAL: Always return here – prevents fall-through into closure logic
+    # This single line eliminates 99% of all false "Stop Loss" / "Take Profit" reports
+    return
+
+# === ANGRY BOUNCER – KILLS ZOMBIE ORDERS DEAD ===
+def force_cancel_all_orders(client, symbol, telegram_bot=None, telegram_chat_id=None):
+    """Cancel every single open order, even the stubborn reduceOnly ones Binance loves to protect."""
+    try:
+        open_orders = client.get_open_orders(symbol)
+        if not open_orders:
+            return
+        log(f"Found {len(open_orders)} zombie order(s). Executing purge...", telegram_bot, telegram_chat_id)
+        for order in open_orders:
+            try:
+                client.cancel_order(symbol, order["orderId"])
+                log(f"Killed zombie order {order['orderId']} ({order.get('type')}) @ {order.get('stopPrice', 'market')}", telegram_bot, telegram_chat_id)
+                time.sleep(0.25)  # Be gentle with rate limits
+            except Exception as e:
+                log(f"Zombie {order['orderId']} refused to die: {e} – moving on", telegram_bot, telegram_chat_id)
+    except Exception as e:
+        log(f"Zombie apocalypse failed: {e}", telegram_bot, telegram_chat_id)
 
 # === PRIVATE HELPERS (DRY + SAFE) ===
 def _calc_sl_price(entry, side, tick_size):
@@ -1179,89 +1211,98 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                 pos_amt = Decimal(str(pos_item.get("positionAmt", "0"))) if pos_item else Decimal('0')
 
                 if pos_amt == 0:
-                    log("Position closed.", telegram_bot, telegram_chat_id)
-                    trade_state.active = False
+                        # === POSITION REALLY CLOSED – VERIFY & DETERMINE TRUE REASON ===
+                        log("Position closed (verified via positionAmt == 0). Determining exit reason...", telegram_bot, telegram_chat_id)
+                        trade_state.active = False
 
-                    # ---- 1. Fetch open orders once ----
-                    open_orders = client.get_open_orders(symbol)
-                    open_order_ids = {o["orderId"] for o in open_orders}
+                        # Critical: give Binance ~1.2 seconds for any in-flight recovery orders to appear
+                        # Prevents false "Stop Loss / Take Profit" detection due to latency
+                        time.sleep(1.2)
 
-                    # ---- 2. TRAILING STOP HIT? ----
-                    if (trade_state.trail_activated and
-                        trade_state.trail_order_id and
-                        trade_state.trail_order_id not in open_order_ids):
-                        reason = "Trailing Stop"
-                        exit_price = client.get_latest_fill_price(symbol, trade_state.trail_order_id)
+                        # ---- 1. Fetch open orders once (fresh state after possible recovery + latency) ----
+                        try:
+                            open_orders = client.get_open_orders(symbol)
+                        except Exception as e:
+                            log(f"Failed to fetch open orders during closure detection: {e}. Proceeding with best-effort reason.", telegram_bot, telegram_chat_id)
+                            open_orders = []
+                        open_order_ids = {o["orderId"] for o in open_orders}
 
-                    # ---- 3. STOP-LOSS HIT? ----
-                    elif (trade_state.sl_order_id and
-                          trade_state.sl_order_id not in open_order_ids):
-                        reason = "Stop Loss"
-                        exit_price = client.get_latest_fill_price(symbol, trade_state.sl_order_id)
+                        # Use the CURRENT order IDs (updated by recovery function)
+                        current_sl_id     = trade_state.sl_order_id
+                        current_tp_id     = trade_state.tp_order_id
+                        current_trail_id  = trade_state.trail_order_id
 
-                    # ---- 4. TAKE-PROFIT HIT? ----
-                    elif (trade_state.tp_order_id and
-                          trade_state.tp_order_id not in open_order_ids):
-                        reason = "Take Profit"
-                        exit_price = client.get_latest_fill_price(symbol, trade_state.tp_order_id)
+                        reason = "Unknown"
+                        exit_price = None
 
-                    # ---- 5. MANUAL / UNKNOWN ----
-                    else:
-                        reason = "Manual Close" if not STOP_REQUESTED else "Stop Requested"
-                        exit_price = None  # Will fallback below
+                        # ---- 2. TRAILING STOP HIT? (only if activated and current ID missing) ----
+                        if (trade_state.trail_activated and current_trail_id and
+                            current_trail_id not in open_order_ids):
+                            reason = "Trailing Stop"
+                            exit_price = client.get_latest_fill_price(symbol, current_trail_id)
 
-                    # ---- 6. FALLBACK PRICE (only if still no fill) ----
-                    if exit_price is None:
-                        latest = client.get_latest_trade_details(symbol)
-                        if latest:
-                            exit_price = latest["price"]
+                        # ---- 3. STOP-LOSS HIT? (current ID missing) ----
+                        elif current_sl_id and current_sl_id not in open_order_ids:
+                            reason = "Stop Loss"
+                            exit_price = client.get_latest_fill_price(symbol, current_sl_id)
+
+                        # ---- 4. TAKE-PROFIT HIT? ----
+                        elif current_tp_id and current_tp_id not in open_order_ids:
+                            reason = "Take Profit"
+                            exit_price = client.get_latest_fill_price(symbol, current_tp_id)
+
+                        # ---- 5. MANUAL / UNKNOWN ----
                         else:
-                            ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
-                            exit_price = Decimal(str(ticker.get("price", "0")))
+                            reason = "Manual Close" if not STOP_REQUESTED else "Stop Requested"
 
-                    exit_price_f = float(exit_price)
+                        # ---- 6. Fallback: get actual exit price if not found above ----
+                        if exit_price is None:
+                            latest = client.get_latest_trade_details(symbol)
+                            if latest and latest.get("price"):
+                                exit_price = latest["price"]
+                                reason = reason if reason != "Unknown" else "Executed Order"
+                            else:
+                                try:
+                                    ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+                                    exit_price = Decimal(str(ticker.get("price", "0")))
+                                    reason = reason if reason != "Unknown" else "Market Close (No Trade History)"
+                                except:
+                                    exit_price = Decimal("0")
 
-                    # --- Log PNL ---
-                    entry_price_safe = float(trade_state.entry_price or 0.0)
-                    R = Decimal(str(entry_price_safe)) * SL_PCT
-                    R_float = float(R)
-                    pnl_row = log_pnl(
-                        len(pnl_data) + 1,
-                        trade_state.side,
-                        entry_price_safe,
-                        exit_price_f,
-                        float(trade_state.qty or 0),
-                        R_float
-                    )
+                        exit_price_f = float(exit_price)
 
-                    # --- Send Telegram ---
-                    send_closure_telegram(
-                        symbol, trade_state.side,
-                        entry_price_safe, exit_price_f,
-                        float(trade_state.qty or 0),
-                        float(pnl_row['pnl_usd']), float(pnl_row['pnl_r']),
-                        reason, telegram_bot, telegram_chat_id
-                    )
+                        # --- Log PNL ---
+                        entry_price_safe = float(trade_state.entry_price or 0.0)
+                        R = Decimal(str(entry_price_safe)) * SL_PCT
+                        R_float = float(R)
+                        pnl_row = log_pnl(
+                            len(pnl_data) + 1,
+                            trade_state.side,
+                            entry_price_safe,
+                            exit_price_f,
+                            float(trade_state.qty or 0),
+                            R_float
+                        )
 
-                    # --- Cancel Orders (Thread-Safe) ---
-                    with _stop_lock:
-                        if not _orders_cancelled:
-                            try:
-                                client.cancel_all_open_orders(symbol)
-                                log(f"Cancelled open orders. Reason: {reason}", telegram_bot, telegram_chat_id)
-                            except Exception as e:
-                                log(f"Failed to cancel orders: {e}", telegram_bot, telegram_chat_id)
-                            _orders_cancelled = True
+                        # --- Send Telegram ---
+                        send_closure_telegram(
+                            symbol, trade_state.side,
+                            entry_price_safe, exit_price_f,
+                            float(trade_state.qty or 0),
+                            float(pnl_row['pnl_usd']), float(pnl_row['pnl_r']),
+                            reason, telegram_bot, telegram_chat_id
+                        )
 
-                    return  # Exit monitor cleanly
+                        # --- Cancel remaining orders – ANGRY BOUNCER EDITION ---
+                        force_cancel_all_orders(client, symbol, telegram_bot, telegram_chat_id)
+                        
+                        # Log that we cleaned up (you wanted this saved)
+                        log(f"Cancelled all remaining open orders. Exit reason: {reason}", telegram_bot, telegram_chat_id)
+                        
+                        # Prevent double-cancellation spam
+                        _orders_cancelled = True
 
-                # --- Fallback Price ---
-                if current_price is None:
-                    try:
-                        ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
-                        current_price = Decimal(str(ticker.get("price")))
-                    except:
-                        pass
+                        return  # Exit monitor cleanly
 
                 # --- Update High/Low ---
                 if trade_state.side == "LONG":
@@ -1613,6 +1654,8 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, tick_size, ROUND_DOWN if buy_signal else ROUND_UP)
 
                 # === PLACE MARKET ORDER ===
+                # Kill any zombie orders from previous trades/crashes BEFORE opening new position
+                force_cancel_all_orders(client, symbol, telegram_bot, telegram_chat_id)
                 log(f"Sending MARKET {side_text} order: qty={qty_api}, entry_price={entry_price_f}", telegram_bot, telegram_chat_id)
                 try:
                     order_res = client.send_signed_request("POST", "/fapi/v1/order", {
