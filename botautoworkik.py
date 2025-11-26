@@ -32,18 +32,18 @@ import platform
 # ------------------- CONFIGURATION -------------------
 RISK_PCT = Decimal("0.005")  # 0.5% per trade
 SL_PCT = Decimal("0.0075")  # 0.75%
-TP_MULT = Decimal("3.5")
-TRAIL_TRIGGER_MULT = Decimal("1.25")
-TRAIL_DISTANCE_MULT = Decimal("2.0")  # 2R trailing distance
-VOL_SMA_PERIOD = 15
+TP_MULT = Decimal("3")
+TRAIL_TRIGGER_MULT = Decimal("1.5")
+TRAIL_DISTANCE_MULT = Decimal("2.5")  # 2.5R trailing distance
+VOL_SMA_PERIOD = 16
 RSI_PERIOD = 14
-MAX_TRADES_PER_DAY = 3
+MAX_TRADES_PER_DAY = 1
 INTERVAL_DEFAULT = "30m"
 ORDER_FILL_TIMEOUT = 15
-BUY_RSI_MIN = 54
-BUY_RSI_MAX = 66
-SELL_RSI_MIN = 34
-SELL_RSI_MAX = 46
+BUY_RSI_MIN = 55
+BUY_RSI_MAX = 65
+SELL_RSI_MIN = 35
+SELL_RSI_MAX = 45
 POSITION_CHECK_INTERVAL = 60
 TRAIL_PRICE_BUFFER = Decimal("0.003")
 KLINES_CACHE_DURATION = 5.0
@@ -76,6 +76,10 @@ HIGH_IMPACT_KEYWORDS = {
     "RETAIL SALES", "ADP", "FLASH", "PRELIMINARY"
 }
 BUFFER_MINUTES = 5
+# === CONFIG: NEWS GUARD ===
+NEWS_GUARD_ENABLED = True   # ← Will be overridden by --no-news-guard
+if not NEWS_GUARD_ENABLED:
+    logging.getLogger().setLevel(logging.WARNING)  # Optional: reduce noise
 # === DRAWDOWN-SCALED RISK (NO ATR) ===
 BASE_RISK_PCT = Decimal("0.005")        # 0.5% when drawdown = 0%
 MAX_DRAWDOWN_PCT = Decimal("0.20")      # Risk → 0 at 20% daily drawdown
@@ -1531,38 +1535,20 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             
             # === NEWS GUARD – MUST BE INSIDE THE LOOP ===
 
-            blocked, reason = is_news_blocked()
-            now_active = blocked
-
-            # Guard just became ACTIVE
-            if now_active and not news_guard_was_active:
-                msg = f"NEWS GUARD -> {reason}"
-                log(msg, telegram_bot, telegram_chat_id)
-                last_news_guard_msg = msg
-
-                if trade_state.active:
-                    emergency_close_on_news(client, symbol, trade_state,
-                                            telegram_bot, telegram_chat_id)
-
-                news_guard_was_active = True
-                continue   # ← NOW VALID: inside while loop
-
-            # Guard still ACTIVE
-            elif now_active and news_guard_was_active:
-                news_guard_was_active = True
-                continue   # ← valid
-
-            # Guard just became INACTIVE
-            elif not now_active and news_guard_was_active:
-                msg = "NEWS GUARD -> Cleared"
-                log(msg, telegram_bot, telegram_chat_id)
-                last_news_guard_msg = None
-                news_guard_was_active = False
-                # no continue → proceed to signal check
-
-            # Guard never active
+            if NEWS_GUARD_ENABLED:
+                blocked, reason = is_news_blocked()
+                if blocked:
+                    if not news_guard_was_active:
+                        log(f"NEWS GUARD ACTIVE -> {reason}", telegram_bot, telegram_chat_id)
+                        if trade_state.active:
+                            emergency_close_on_news(client, symbol, trade_state, telegram_bot, telegram_chat_id)
+                        news_guard_was_active = True
+                    continue
+                elif news_guard_was_active:
+                    log("NEWS GUARD -> Cleared", telegram_bot, telegram_chat_id)
+                    news_guard_was_active = False
             else:
-                news_guard_was_active = False
+                news_guard_was_active = False  # always off
                 
             if prevent_same_bar and getattr(trade_state, 'entry_close_time', None) == close_time:
                 last_processed_time = close_time
@@ -1914,7 +1900,14 @@ if __name__ == "__main__":
     parser.add_argument("--no-volume-filter", action='store_false', dest='use_volume_filter')
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--base-url", default=None)
+    parser.add_argument("--no-news-guard", action="store_true", help="Completely disable news/economic calendar guard")
     args = parser.parse_args()
+
+    if args.no_news_guard:
+        NEWS_GUARD_ENABLED = False
+        print("[CONFIG] News Guard FULLY DISABLED via --no-news-guard")
+    else:
+        NEWS_GUARD_ENABLED = True
 
     init_pnl_log()
 
@@ -1945,7 +1938,6 @@ if __name__ == "__main__":
 
         try:
             log(goodbye, args.telegram_token, args.chat_id)
-            telegram_post(args.telegram_token, args.chat_id, goodbye)
         except:
             pass  # Never crash on goodbye
 
@@ -1984,13 +1976,23 @@ if __name__ == "__main__":
             account_size = balance
             daily_start_equity = balance
 
+            # Format risk % safely and precisely
+            risk_pct_display = float(Decimal(str(args.risk_pct)))
+
             log(f"Daily drawdown protection ENABLED. Start equity: {float(daily_start_equity):.2f} USD",
                 args.telegram_token, args.chat_id)
             log(f"Fetched balance: {float(balance):.2f} USDT", args.telegram_token, args.chat_id)
 
-            threading.Thread(target=news_heartbeat, daemon=True).start()
-            log(f"Connected ({'LIVE' if args.live else 'TESTNET'}). Starting bot with symbol={args.symbol}, "
-                f"timeframe={args.timeframe}, risk_pct={args.risk_pct}%, use_volume_filter={args.use_volume_filter}",
+            if NEWS_GUARD_ENABLED:
+                threading.Thread(target=news_heartbeat, daemon=True).start()
+                log("Economic calendar monitoring: ENABLED", args.telegram_token, args.chat_id)
+            else:
+                log("Economic calendar monitoring: DISABLED (--no-news-guard)", args.telegram_token, args.chat_id)
+
+            log(f"STARTING BOT → {args.symbol} | {args.timeframe} | "
+                f"Risk: {risk_pct_display:.3f}% | "
+                f"Volume Filter: {'ON' if args.use_volume_filter else 'OFF'} | "
+                f"Mode: {'LIVE' if args.live else 'TESTNET'}",
                 args.telegram_token, args.chat_id)
 
             threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
