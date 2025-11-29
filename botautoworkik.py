@@ -33,8 +33,8 @@ import platform
 RISK_PCT = Decimal("0.005")  # 0.5% per trade
 SL_PCT = Decimal("0.0075")  # 0.75%
 TP_MULT = Decimal("3")
-TRAIL_TRIGGER_MULT = Decimal("1.5")
-TRAIL_DISTANCE_MULT = Decimal("2.5")  # 2.5R trailing distance
+TRAIL_TRIGGER_MULT = Decimal("1.25")
+TRAIL_DISTANCE_MULT = Decimal("2")  # 2R trailing distance
 VOL_SMA_PERIOD = 16
 RSI_PERIOD = 14
 MAX_TRADES_PER_DAY = 1
