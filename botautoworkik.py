@@ -33,8 +33,8 @@ import platform
 RISK_PCT = Decimal("0.005")  # 0.5% per trade
 SL_PCT = Decimal("0.0075")  # 0.75%
 TP_MULT = Decimal("3")
-TRAIL_TRIGGER_MULT = Decimal("1.25")
-TRAIL_DISTANCE_MULT = Decimal("2")  # 2R trailing distance
+TRAIL_TRIGGER_MULT = Decimal("1.5")
+TRAIL_DISTANCE_MULT = Decimal("2.5")  # 2.5R trailing distance
 VOL_SMA_PERIOD = 16
 RSI_PERIOD = 14
 MAX_TRADES_PER_DAY = 1
@@ -1386,6 +1386,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
     global last_news_guard_msg, news_guard_was_active
     global last_trade_date
     global last_no_klines_log
+    last_trade_date: Optional[date] = None
     interval_seconds = interval_ms(timeframe) / 1000.0  # tf in seconds
     trades_today = 0
     last_processed_time = 0
@@ -1398,14 +1399,6 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
     tick_size = filters['tickSize']
     min_notional = filters['minNotional']
     max_trades_alert_sent = False
-
-    # === DAILY RESET STATE ===
-    current_date = datetime.now(timezone.utc).date()
-    if last_trade_date != current_date:
-        trades_today = 0
-        last_trade_date = current_date
-        max_trades_alert_sent = False
-    daily_start_balance = fetch_balance(client)
 
     signal.signal(signal.SIGINT, lambda s, f: _request_stop(s, f, symbol, telegram_bot, telegram_chat_id))
     signal.signal(signal.SIGTERM, lambda s, f: _request_stop(s, f, symbol, telegram_bot, telegram_chat_id))
@@ -1432,14 +1425,15 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
     while not STOP_REQUESTED and not os.path.exists("stop.txt"):
         try:
             # === DAILY RESET CHECK (UTC MIDNIGHT) ===
-            current_date = datetime.now(timezone.utc).date()
-            if last_trade_date != current_date:
+            now_date = datetime.now(timezone.utc).date()
+            if last_trade_date != now_date:
+                old_date = last_trade_date or "None"
+                last_trade_date = now_date
                 trades_today = 0
-                last_trade_date = current_date
-                daily_start_balance = fetch_balance(client)
                 max_trades_alert_sent = False
-                log(f"New UTC day: {current_date}. Resetting trade counter and balance.", telegram_bot, telegram_chat_id)
-
+                daily_start_balance = fetch_balance(client)
+                daily_start_equity = daily_start_balance
+                log(f"NEW DAY → {old_date} to {now_date} | Trades reset to 0 | Equity: ${float(daily_start_balance):.2f}", telegram_bot, telegram_chat_id)
             # === MAX TRADES PER DAY ===
             if trades_today >= max_trades_per_day:
                 if not max_trades_alert_sent:
@@ -1897,6 +1891,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-require-no-pos", dest='require_no_pos', action='store_false')
     parser.add_argument("--no-use-max-loss", dest='use_max_loss', action='store_false')
     parser.add_argument("--use-volume-filter", action='store_true', default=False)
+    parser.add_argument("--no-volume-filter", action='store_false', dest='use_volume_filter')
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--no-news-guard", action="store_true", help="Completely disable news/economic calendar guard")
