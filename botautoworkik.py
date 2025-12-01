@@ -1386,7 +1386,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
     global last_news_guard_msg, news_guard_was_active
     global last_trade_date
     global last_no_klines_log
-    last_trade_date: Optional[date] = None
+    last_trade_date = None
     interval_seconds = interval_ms(timeframe) / 1000.0  # tf in seconds
     trades_today = 0
     last_processed_time = 0
