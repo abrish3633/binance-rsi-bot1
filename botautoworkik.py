@@ -2074,8 +2074,8 @@ if __name__ == "__main__":
             risk_pct_display = float(Decimal(str(args.risk_pct)))
 
             if ENABLE_WEEKLY_SCALING:
-                log(f"Weekly dynamic drawdown scaling: ENABLED (10% max)", args.telegram_token, args.chat_id)
-                log(f"Risk scaling: {float(BASE_RISK_PCT*100):.2f}% → {float(MIN_RISK_PCT*100):.2f}% as DD: 0% → 10%", 
+                log(f"Weekly dynamic drawdown scaling: ENABLED (20% max)", args.telegram_token, args.chat_id)
+                log(f"Risk scaling: {float(BASE_RISK_PCT*100):.2f}% → {float(MIN_RISK_PCT*100):.2f}% as DD: 0% → 20%", 
                     args.telegram_token, args.chat_id)
             else:
                 log(f"Weekly dynamic drawdown scaling: DISABLED (fixed {float(BASE_RISK_PCT*100):.2f}% risk)", 
