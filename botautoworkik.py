@@ -30,11 +30,11 @@ import socket
 import platform
 
 # ------------------- CONFIGURATION -------------------
-RISK_PCT = Decimal("0.005")  # 0.5% per trade
+RISK_PCT = Decimal("0.045")  # 0.5% per trade
 SL_PCT = Decimal("0.0075")  # 0.75%
-TP_MULT = Decimal("3.5")
+TP_MULT = Decimal("9")
 TRAIL_TRIGGER_MULT = Decimal("1.25")
-TRAIL_DISTANCE_MULT = Decimal("2")  # 2R trailing distance
+TRAIL_DISTANCE_MULT = Decimal("2")  # 2.5R trailing distance
 VOL_SMA_PERIOD = 16
 RSI_PERIOD = 14
 MAX_TRADES_PER_DAY = 1
@@ -80,13 +80,15 @@ BUFFER_MINUTES = 5
 NEWS_GUARD_ENABLED = True   # ← Will be overridden by --no-news-guard
 if not NEWS_GUARD_ENABLED:
     logging.getLogger().setLevel(logging.WARNING)  # Optional: reduce noise
-# === DRAWDOWN-SCALED RISK (NO ATR) ===
-BASE_RISK_PCT = Decimal("0.005")        # 0.5% when drawdown = 0%
-MAX_DRAWDOWN_PCT = Decimal("0.20")      # Risk → 0 at 20% daily drawdown
-MIN_RISK_PCT = Decimal("0.001")         # Never go below 0.1%
 # CONFIG SLIPAGE
 MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")
 LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'sol_rsi_bot.lock')
+BASE_RISK_PCT = Decimal("0.045")        # 2.25% when drawdown = 0%
+MAX_WEEKLY_DD = Decimal("0.20")         # 10% weekly drawdown → risk collapses  # FIXED NAME
+MIN_RISK_PCT = Decimal("0.002")         # Never go below 0.1%
+MAX_LEVERAGE = Decimal("6")
+# === WEEKLY SCALING QUICK TOGGLE ===
+ENABLE_WEEKLY_SCALING = True      # ← Set to False to disable scaling completely
 
 # ------------------- GLOBAL STATE -------------------
 STOP_REQUESTED = False
@@ -115,14 +117,76 @@ _news_cache: list = []
 _cache_ts = 0.0
 NEWS_LOCK = False          # <--- blocks entry + forces emergency close
 VOLATILITY_ABORT = False   # set by ATR spike check (see trading loop)
-# === DAILY DRAWDOWN PROTECTION ===
-daily_start_equity = None
-account_size = None
-drawdown_protection_enabled = True
+
 last_news_guard_msg: Optional[str] = None
 news_guard_was_active: bool = False
 _last_news_block_reason: Optional[str] = None
+weekly_peak_equity = None
+weekly_start_time  = None
 
+def get_current_risk_pct(current_equity: Decimal, telegram_bot=None, telegram_chat_id=None) -> Decimal:
+    """
+    Call this every time before calculating position size
+    Returns the correct risk % for this trade (smooth + hard cap)
+    """
+    global weekly_peak_equity, weekly_start_time
+   
+    now = datetime.now(timezone.utc)
+    # Monday 00:00 UTC of current week
+    current_monday = now - timedelta(days=now.weekday())
+    current_monday = current_monday.replace(hour=0, minute=0, second=0, microsecond=0)
+   
+    # === NEW WEEK DETECTED → RESET ===
+    if weekly_start_time is None or now >= current_monday + timedelta(weeks=1):
+        weekly_start_time = current_monday
+        weekly_peak_equity = current_equity
+        if telegram_bot and telegram_chat_id:
+            log(f"NEW WEEK -> Weekly peak reset to ${float(current_equity):,.2f}", telegram_bot, telegram_chat_id)
+        else:
+            log(f"NEW WEEK -> Weekly peak reset to ${float(current_equity):,.2f}")
+   
+    # === UPDATE PEAK IF HIGHER ===
+    if weekly_peak_equity is None or current_equity > weekly_peak_equity:
+        weekly_peak_equity = current_equity
+   
+    # === CALCULATE CURRENT WEEKLY DD ===
+    if weekly_peak_equity <= 0:
+        return MIN_RISK_PCT
+   
+    weekly_dd = (weekly_peak_equity - current_equity) / weekly_peak_equity # positive when down
+   
+    if telegram_bot and telegram_chat_id:
+        log(f"Weekly peak: ${float(weekly_peak_equity):,.2f} | Equity: ${float(current_equity):,.2f} | DD: {weekly_dd:.2%}",
+            telegram_bot, telegram_chat_id)
+    else:
+        log(f"Weekly peak: ${float(weekly_peak_equity):,.2f} | Equity: ${float(current_equity):,.2f} | DD: {weekly_dd:.2%}")
+   
+    # === SMOOTH SCALING (can be disabled instantly) ===
+    if not ENABLE_WEEKLY_SCALING:
+        if telegram_bot and telegram_chat_id:
+            log("WEEKLY SCALING DISABLED — using full 2.25% risk", telegram_bot, telegram_chat_id)
+        else:
+            log("WEEKLY SCALING DISABLED — using full 2.25% risk")
+        return BASE_RISK_PCT
+
+    # FIXED: Changed WEEKLY_DD_MAX to MAX_WEEKLY_DD
+    if weekly_dd >= MAX_WEEKLY_DD:
+        if telegram_bot and telegram_chat_id:
+            log("WEEKLY 10% DD GUARD TRIGGERED -> NO NEW TRADES THIS WEEK", telegram_bot, telegram_chat_id)
+        else:
+            log("WEEKLY 10% DD GUARD TRIGGERED -> NO NEW TRADES THIS WEEK")
+        return Decimal("0")
+
+    # Smooth scaling - FIXED: Changed WEEKLY_DD_MAX to MAX_WEEKLY_DD
+    scaling_factor = Decimal("1") - (weekly_dd / MAX_WEEKLY_DD)
+    risk_pct = BASE_RISK_PCT * scaling_factor
+    risk_pct = max(risk_pct, MIN_RISK_PCT)
+
+    if telegram_bot and telegram_chat_id:
+        log(f"Risk for next trade: {risk_pct:.3%} (weekly DD: {weekly_dd:.2%})", telegram_bot, telegram_chat_id)
+    else:
+        log(f"Risk for next trade: {risk_pct:.3%} (weekly DD: {weekly_dd:.2%})")
+    return risk_pct
 # ==================== SINGLE INSTANCE LOCK (Windows + Linux) ====================
 LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'sol_rsi_bot.lock')
 
@@ -339,12 +403,6 @@ def check_volatility_abort(klines: list, period: int = 14) -> bool:
     atr = np.mean(tr[-period:])
     mean20 = np.mean(tr[-20:])
     return atr > mean20 * 3.0
-
-# === DAILY DRAWDOWN PROTECTION ===
-def emergency_close_on_drawdown(client, symbol, bot, chat_id):
-    log("DAILY DRAWDOWN EMERGENCY CLOSE TRIGGERED", bot, chat_id)
-    _request_stop(symbol=symbol, telegram_bot=bot, telegram_chat_id=chat_id)
-    telegram_post(bot, chat_id, "EMERGENCY SHUTDOWN – DRAWDOWN >4%")
 # ------------------- PNL LOGGING -------------------
 def init_pnl_log():
     if not os.path.exists(PNL_LOG_FILE):
@@ -589,7 +647,15 @@ class BinanceClient:
         self.ping_latency = check_time_offset(self.base)
         self.dual_side = self._check_position_mode()
         log(f"Using base URL: {self.base}, Position Mode: {'Hedge' if self.dual_side else 'One-way'}")
-
+        
+    def set_leverage(self, symbol: str, leverage: int):
+        """Set leverage for a symbol"""
+        params = {
+            "symbol": symbol,
+            "leverage": leverage
+        }
+        return self.send_signed_request("POST", "/fapi/v1/leverage", params)
+    
     def _check_position_mode(self):
         try:
             response = self.send_signed_request("GET", "/fapi/v1/positionSide/dual")
@@ -1164,6 +1230,9 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
 
     try:
         while trade_state.active and not STOP_REQUESTED:
+            if current_price is None:
+                time.sleep(1)
+                continue
             # === FETCH KLINES FOR VOLATILITY ===
             try:
                 klines = fetch_klines(client, symbol, "30m", limit=100)
@@ -1174,21 +1243,6 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
             # if NEWS_LOCK and trade_state.active:
             #    emergency_close_on_news(client, symbol, trade_state, telegram_bot, telegram_chat_id)
             #   return
-
-            # DAILY DRAWDOWN CHECK
-            if drawdown_protection_enabled and daily_start_equity is not None:
-                try:
-                    balance = fetch_balance(client)
-                    pos = fetch_open_positions_details(client, symbol)
-                    unrealized_pnl = Decimal(str(pos.get("unRealizedProfit", "0")))
-                    current_equity = balance + unrealized_pnl
-                    drawdown = (daily_start_equity - current_equity) / daily_start_equity
-                    if drawdown > Decimal("0.04"):
-                        log(f"DAILY DRAWDOWN BREACH: {drawdown:.1%} > 4% | AUTO-CLOSING ALL", telegram_bot, telegram_chat_id)
-                        emergency_close_on_drawdown(client, symbol, telegram_bot, telegram_chat_id)
-                        return
-                except Exception as e:
-                    log(f"Drawdown check failed: {e}", telegram_bot, telegram_chat_id)
 
             # VOLATILITY ABORT
             if len(klines) >= 100 and check_volatility_abort(klines):
@@ -1309,15 +1363,17 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                         return  # Exit monitor cleanly
 
                 # --- Update High/Low ---
-                if trade_state.side == "LONG":
-                    if trade_state.highest_price is None or current_price > trade_state.highest_price:
-                        trade_state.highest_price = current_price
-                else:
-                    if trade_state.lowest_price is None or current_price < trade_state.lowest_price:
-                        trade_state.lowest_price = current_price
+                                # --- Update High/Low ---
+                if current_price is not None:
+                    if trade_state.side == "LONG":
+                        if trade_state.highest_price is None or current_price > trade_state.highest_price:
+                            trade_state.highest_price = current_price
+                    else:  # SHORT
+                        if trade_state.lowest_price is None or current_price < trade_state.lowest_price:
+                            trade_state.lowest_price = current_price
 
                 # --- Trailing Activation ---
-                if not trade_state.trail_activated and trade_state.trail_activation_price:
+                if not trade_state.trail_activated and trade_state.trail_activation_price and current_price is not None:
                     trail_activation_price_dec = Decimal(str(trade_state.trail_activation_price))
                     if (trade_state.side == "LONG" and current_price >= trail_activation_price_dec) or \
                        (trade_state.side == "SHORT" and current_price <= trail_activation_price_dec):
@@ -1341,7 +1397,7 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                         trade_state.last_trail_alert = time.time()
 
                 # --- TRAILING UPDATES (NATIVE BINANCE TRACKING ONLY) ---
-                if trade_state.trail_activated and time.time() - trade_state.last_trail_alert >= TRAIL_UPDATE_THROTTLE:
+                if trade_state.trail_activated and time.time() - trade_state.last_trail_alert >= TRAIL_UPDATE_THROTTLE and current_price is not None:
                     R_dec = Decimal(str(trade_state.risk))
                     updated = False
                     new_stop_f = None
@@ -1399,14 +1455,6 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
     min_notional = filters['minNotional']
     max_trades_alert_sent = False
 
-    # === DAILY RESET STATE ===
-    current_date = datetime.now(timezone.utc).date()
-    if last_trade_date != current_date:
-        trades_today = 0
-        last_trade_date = current_date
-        max_trades_alert_sent = False
-    daily_start_balance = fetch_balance(client)
-
     signal.signal(signal.SIGINT, lambda s, f: _request_stop(s, f, symbol, telegram_bot, telegram_chat_id))
     signal.signal(signal.SIGTERM, lambda s, f: _request_stop(s, f, symbol, telegram_bot, telegram_chat_id))
     log(f"Starting bot with symbol={symbol}, timeframe={timeframe}, risk_pct={risk_pct*100}%")
@@ -1432,14 +1480,15 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
     while not STOP_REQUESTED and not os.path.exists("stop.txt"):
         try:
             # === DAILY RESET CHECK (UTC MIDNIGHT) ===
-            current_date = datetime.now(timezone.utc).date()
-            if last_trade_date != current_date:
+            now_date = datetime.now(timezone.utc).date()
+            if last_trade_date != now_date:
+                old_date = last_trade_date or "None"
+                last_trade_date = now_date
                 trades_today = 0
-                last_trade_date = current_date
-                daily_start_balance = fetch_balance(client)
                 max_trades_alert_sent = False
-                log(f"New UTC day: {current_date}. Resetting trade counter and balance.", telegram_bot, telegram_chat_id)
-
+                daily_start_balance = fetch_balance(client)
+                daily_start_equity = daily_start_balance
+                log(f"NEW DAY → {old_date} to {now_date} | Trades reset to 0 | Equity: ${float(daily_start_balance):.2f}", telegram_bot, telegram_chat_id)
             # === MAX TRADES PER DAY ===
             if trades_today >= max_trades_per_day:
                 if not max_trades_alert_sent:
@@ -1447,15 +1496,19 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     max_trades_alert_sent = True
                 time.sleep(60)
                 continue
+            
+             # === WEEKLY DYNAMIC RISK SCALING (CALL IT HERE) ===
+            current_balance = fetch_balance(client)
+            risk_pct = get_current_risk_pct(current_balance, telegram_bot, telegram_chat_id)   # ← your function returns 0 when blocked
 
-            # === MAX DAILY LOSS PROTECTION ===
-            if use_max_loss:
-                current_bal = fetch_balance(client)
-                loss_threshold = daily_start_balance * (max_daily_loss_pct / Decimal("100"))
-                if daily_start_balance - current_bal > loss_threshold:
-                    log(f"Max daily loss reached ({loss_threshold:.2f} USDT). Waiting for next day.", telegram_bot, telegram_chat_id)
-                    time.sleep(60)
-                    continue
+            # HARD 10% WEEKLY BLOCK
+            if risk_pct <= Decimal("0"):
+                log("WEEKLY % DD GUARD → NO NEW TRADES THIS WEEK", telegram_bot, telegram_chat_id)
+                pending_entry = False
+                continue
+
+            # Use the scaled risk_pct for position size
+            log(f"Risk allowed: {risk_pct:.3%}", telegram_bot, telegram_chat_id)
 
             # === GET SERVER TIME ===
             try:
@@ -1620,17 +1673,53 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     time.sleep(1)
                     continue
 
-                # === DRAWDOWN-SCALED RISK (SOFT THROTTLE) ===  ← INDENTED CORRECTLY
-                bal = fetch_balance(client)
-                drawdown = max(Decimal('0'), (daily_start_equity - bal) / daily_start_equity)
-                dynamic_risk_pct = BASE_RISK_PCT * (Decimal('1') - drawdown / MAX_DRAWDOWN_PCT)
-                dynamic_risk_pct = max(dynamic_risk_pct, MIN_RISK_PCT)
+                                # === FINAL POSITION SIZING — WEEKLY SCALED RISK ONLY ===
+                # risk_pct comes from get_current_risk_pct() — this is the ONLY source of truth
+                R = entry_price * SL_PCT
+                
+                # Calculate weekly drawdown for logging
+                weekly_dd_percent = Decimal("0")
+                if weekly_peak_equity and weekly_peak_equity > 0:
+                    weekly_dd_percent = (weekly_peak_equity - current_balance) / weekly_peak_equity * Decimal("100")
 
-                risk_amount = bal * dynamic_risk_pct
-                qty = risk_amount / R
+                # Risk amount in USD
+                risk_amount_usd = current_balance * risk_pct
+
+                # Hard leverage safety cap (6× equity → ~16.6× position if price = $100)
+                max_notional_by_leverage = current_balance * MAX_LEVERAGE
+                max_qty_by_leverage = max_notional_by_leverage / entry_price
+
+                # Final quantity = smaller of risk-based or leverage-capped
+                qty_raw = risk_amount_usd / R
+                qty = min(qty_raw, max_qty_by_leverage)
                 qty_api = quantize_qty(qty, step_size)
 
-                log(f"Risk: DD={float(drawdown*100):.2f}% -> {float(dynamic_risk_pct*100):.3f}% | Qty={float(qty_api):.3f}", telegram_bot, telegram_chat_id)
+                # Safety floor — never go below min notional
+                if (qty_api * entry_price) < min_notional:
+                    log(f"Qty too small ({qty_api * entry_price:.2f} < {float(min_notional):.2f} min notional) -> SKIP", telegram_bot, telegram_chat_id)
+                    pending_entry = False
+                    continue
+
+                # Calculate actual leverage being used
+                position_notional = qty_api * entry_price
+                actual_leverage = position_notional / current_balance
+
+                # Final log — shows the REAL risk you're taking
+                actual_risk_pct = (qty_api * R) / current_balance * Decimal("100")
+                
+                # COMPREHENSIVE ENTRY LOG
+                log(f"===== TRADE ENTRY DETAILS =====", telegram_bot, telegram_chat_id)
+                log(f"Direction: {side_text} | Price: ${float(entry_price):.4f}", telegram_bot, telegram_chat_id)
+                log(f"Quantity: {float(qty_api):.5f} SOL | Notional: ${float(position_notional):.2f}", telegram_bot, telegram_chat_id)
+                log(f"Leverage: {float(actual_leverage):.2f}x | Max Allowed: {float(MAX_LEVERAGE)}x", telegram_bot, telegram_chat_id)
+                log(f"Stop Loss: {float(SL_PCT*100):.2f}% | Take Profit: {float(TP_MULT)}R", telegram_bot, telegram_chat_id)
+                log(f"Risk Allocation:", telegram_bot, telegram_chat_id)
+                log(f"  • Weekly DD: {float(weekly_dd_percent):.2f}%", telegram_bot, telegram_chat_id)
+                log(f"  • Base Risk: {float(BASE_RISK_PCT*100):.2f}%", telegram_bot, telegram_chat_id)
+                log(f"  • Scaled Risk: {float(risk_pct*100):.3f}%", telegram_bot, telegram_chat_id)
+                log(f"  • Actual Risk: {float(actual_risk_pct):.3f}% (${float(qty_api * R):.2f})", telegram_bot, telegram_chat_id)
+                log(f"  • Balance: ${float(current_balance):.2f}", telegram_bot, telegram_chat_id)
+                log(f"===== END ENTRY DETAILS =====", telegram_bot, telegram_chat_id)
 
                 # === PRICE LEVELS ===
                 sl_price_dec_quant = quantize_price(sl_price_dec, tick_size, sl_rounding)
@@ -1768,7 +1857,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
 
                 # === INCREMENT TRADE COUNTER & UPDATE DATE ===
                 trades_today += 1
-                last_trade_date = current_date
+                last_trade_date = now_date
                 pending_entry = False
 
                 # === MONITOR TRADE ===
@@ -1889,14 +1978,15 @@ if __name__ == "__main__":
     parser.add_argument("--symbol", default="SOLUSDT", help="Trading symbol (default: SOLUSDT)")
     parser.add_argument("--timeframe", default="30m", help="Timeframe (default: 30m)")
     parser.add_argument("--max-trades", type=int, default=1, help="Max trades per day (default: 1)")
-    parser.add_argument("--risk-pct", type=float, default=0.5, help="Risk percentage per trade (default: 0.5%)")
-    parser.add_argument("--max-loss-pct", type=float, default=5.0, help="Max daily loss percentage (default: 5%)")
-    parser.add_argument("--tp-mult", type=float, default=3.5, help="Take-profit multiplier (default: 3.5)")
+    parser.add_argument("--risk-pct", type=float, default=4.5, help="Risk percentage per trade (default: 4.5%)")
+    parser.add_argument("--max-loss-pct", type=float, default=4.5, help="Max daily loss percentage (default: 4.5%)")
+    parser.add_argument("--tp-mult", type=float, default=9, help="Take-profit multiplier (default: 9)")
     parser.add_argument("--no-trailing", dest='use_trailing', action='store_false', help="Disable trailing stop")
     parser.add_argument("--no-prevent-same-bar", dest='prevent_same_bar', action='store_false')
     parser.add_argument("--no-require-no-pos", dest='require_no_pos', action='store_false')
     parser.add_argument("--no-use-max-loss", dest='use_max_loss', action='store_false')
     parser.add_argument("--use-volume-filter", action='store_true', default=False)
+    parser.add_argument("--no-volume-filter", action='store_false', dest='use_volume_filter')
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--no-news-guard", action="store_true", help="Completely disable news/economic calendar guard")
@@ -1974,12 +2064,23 @@ if __name__ == "__main__":
             balance = fetch_balance(client)
             account_size = balance
             daily_start_equity = balance
+            
+            # Set leverage on Binance
+            leverage_to_set = 6  # or whatever you want
+            client.set_leverage(args.symbol, leverage_to_set)
+            log(f"Set Binance leverage to {leverage_to_set}x for {args.symbol}", args.telegram_token, args.chat_id)
 
             # Format risk % safely and precisely
             risk_pct_display = float(Decimal(str(args.risk_pct)))
 
-            log(f"Daily drawdown protection ENABLED. Start equity: {float(daily_start_equity):.2f} USD",
-                args.telegram_token, args.chat_id)
+            if ENABLE_WEEKLY_SCALING:
+                log(f"Weekly dynamic drawdown scaling: ENABLED (10% max)", args.telegram_token, args.chat_id)
+                log(f"Risk scaling: {float(BASE_RISK_PCT*100):.2f}% → {float(MIN_RISK_PCT*100):.2f}% as DD: 0% → 10%", 
+                    args.telegram_token, args.chat_id)
+            else:
+                log(f"Weekly dynamic drawdown scaling: DISABLED (fixed {float(BASE_RISK_PCT*100):.2f}% risk)", 
+                    args.telegram_token, args.chat_id)
+
             log(f"Fetched balance: {float(balance):.2f} USDT", args.telegram_token, args.chat_id)
 
             if NEWS_GUARD_ENABLED:
