@@ -78,8 +78,8 @@ HIGH_IMPACT_KEYWORDS = {
 BUFFER_MINUTES = 5
 # === CONFIG: NEWS GUARD ===
 NEWS_GUARD_ENABLED = True   # ← Will be overridden by --no-news-guard
-if not NEWS_GUARD_ENABLED:
-    logging.getLogger().setLevel(logging.WARNING)  # Optional: reduce noise
+# if not NEWS_GUARD_ENABLED:
+    # logging.getLogger().setLevel(logging.WARNING)  # Optional: reduce noise
 # CONFIG SLIPAGE
 MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")
 LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'sol_rsi_bot.lock')
@@ -1389,7 +1389,6 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                         return  # Exit monitor cleanly
 
                 # --- Update High/Low ---
-                                # --- Update High/Low ---
                 if current_price is not None:
                     if trade_state.side == "LONG":
                         if trade_state.highest_price is None or current_price > trade_state.highest_price:
@@ -1825,79 +1824,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 tp_price_dec_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
                 tp_price_f = float(tp_price_dec_quant)
                 trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, tick_size, ROUND_DOWN if buy_signal else ROUND_UP)
-                # === PLACE MARKET ORDER ===
-                # Kill any zombie orders from previous trades/crashes BEFORE opening new position
-                force_cancel_all_orders(client, symbol, telegram_bot, telegram_chat_id)
-                log(f"Sending MARKET {side_text} order: qty={qty_api}, entry_price={entry_price_f}", telegram_bot, telegram_chat_id)
-                try:
-                    order_res = client.send_signed_request("POST", "/fapi/v1/order", {
-                        "symbol": symbol,
-                        "side": side_text,
-                        "type": "MARKET",
-                        "quantity": str(qty_api)
-                    })
-                    log(f"Market order placed: {order_res}", telegram_bot, telegram_chat_id)
-                except Exception as e:
-                    log(f"Failed to place market order: {e}", telegram_bot, telegram_chat_id)
-                    pending_entry = False
-                    time.sleep(1)
-                    continue
-
-                # === WAIT FOR FILL ===
-                start_time = time.time()
-                actual_qty = None
-                while not STOP_REQUESTED and not os.path.exists("stop.txt"):
-                    pos = fetch_open_positions_details(client, symbol)
-                    pos_amt = Decimal(str(pos.get("positionAmt", "0"))) if pos else Decimal('0')
-                    if pos_amt != Decimal('0'):
-                        actual_qty = abs(pos_amt)
-                        break
-
-                    if time.time() - start_time > ORDER_FILL_TIMEOUT:
-                        try:
-                            client.send_signed_request("DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": order_res.get("orderId")})
-                        except Exception as e:
-                            log(f"Failed to cancel timed-out order: {e}", telegram_bot, telegram_chat_id)
-                        log("Order fill timed out. Cancelling and skipping.", telegram_bot, telegram_chat_id)
-                        pending_entry = False
-                        break
-                    time.sleep(0.5)
-
-                if actual_qty is None:
-                    pending_entry = False
-                    continue
-
-                # === GET ACTUAL FILL PRICE ===
-                actual_fill_price = client.get_latest_fill_price(symbol, order_res.get("orderId"))
-                if actual_fill_price is None:
-                    actual_fill_price = entry_price
-                actual_fill_price_f = float(actual_fill_price)
-                actual_fill_price = Decimal(str(actual_fill_price_f))
-
-                # === RECALCULATE LEVELS USING ACTUAL FILL ===
-                if buy_signal:
-                    sl_price_dec = actual_fill_price * (Decimal("1") - SL_PCT)
-                    R = actual_fill_price * SL_PCT
-                    tp_price_dec = actual_fill_price + (tp_mult * R)
-                    trail_activation_price_dec = actual_fill_price + (TRAIL_TRIGGER_MULT * R)
-                    sl_rounding = ROUND_DOWN
-                    tp_rounding = ROUND_UP
-                    trail_rounding = ROUND_DOWN
-                else:
-                    sl_price_dec = actual_fill_price * (Decimal("1") + SL_PCT)
-                    R = actual_fill_price * SL_PCT
-                    tp_price_dec = actual_fill_price - (tp_mult * R)
-                    trail_activation_price_dec = actual_fill_price - (TRAIL_TRIGGER_MULT * R)
-                    sl_rounding = ROUND_UP
-                    tp_rounding = ROUND_DOWN
-                    trail_rounding = ROUND_UP
-
-                sl_price_dec_quant = quantize_price(sl_price_dec, tick_size, sl_rounding)
-                sl_price_f = float(sl_price_dec_quant)
-                tp_price_dec_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
-                tp_price_f = float(tp_price_dec_quant)
-                trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, tick_size, ROUND_DOWN if buy_signal else ROUND_UP)
-
+                
                 # === TRAILING BUFFER CHECK ===
                 try:
                     ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
