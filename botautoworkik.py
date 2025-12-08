@@ -2076,6 +2076,7 @@ if __name__ == "__main__":
     parser.add_argument("--timeframe", default="30m", help="Timeframe (default: 30m)")
     parser.add_argument("--max-trades", type=int, default=1, help="Max trades per day (default: 1)")
     parser.add_argument("--risk-pct", type=float, default=6.8, help="Risk percentage per trade (default: 6.8%)")
+    parser.add_argument("--max-loss-pct", type=float, default=6.8, help="Max daily loss percentage (default: 6.8%)")
     parser.add_argument("--tp-mult", type=float, default=9, help="Take-profit multiplier (default: 9)")
     parser.add_argument("--no-trailing", dest='use_trailing', action='store_false', help="Disable trailing stop")
     parser.add_argument("--no-prevent-same-bar", dest='prevent_same_bar', action='store_false')
