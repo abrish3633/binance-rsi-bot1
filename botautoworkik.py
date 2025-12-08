@@ -1682,17 +1682,11 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     time.sleep(1)
                     continue
 
-                # === FINAL POSITION SIZING — WEEKLY SCALED RISK ONLY ===
-                # risk_pct comes from get_current_risk_pct() — this is the ONLY source of truth
+                # === FINAL POSITION SIZING — FIXED RISK ===
                 R = entry_price * SL_PCT
                 
-                # Calculate weekly drawdown for logging
-                weekly_dd_percent = Decimal("0")
-                if weekly_peak_equity and weekly_peak_equity > 0:
-                    weekly_dd_percent = (weekly_peak_equity - current_balance) / weekly_peak_equity * Decimal("100")
-
-                # Risk amount in USD
-                risk_amount_usd = current_balance * risk_pct
+                # Fixed risk calculation (no scaling)
+                risk_amount_usd = current_balance * BASE_RISK_PCT
 
                 # Hard leverage safety cap (6× equity → ~16.6× position if price = $100)
                 max_notional_by_leverage = current_balance * MAX_LEVERAGE
@@ -1716,18 +1710,14 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 # Final log — shows the REAL risk you're taking
                 actual_risk_pct = (qty_api * R) / current_balance * Decimal("100")
                 
-                # COMPREHENSIVE ENTRY LOG
+                # SIMPLIFIED ENTRY LOG (removed scaled WDD references)
                 log(f"===== TRADE ENTRY DETAILS =====", telegram_bot, telegram_chat_id)
                 log(f"Direction: {side_text} | Price: ${float(entry_price):.4f}", telegram_bot, telegram_chat_id)
                 log(f"Quantity: {float(qty_api):.5f} SOL | Notional: ${float(position_notional):.2f}", telegram_bot, telegram_chat_id)
                 log(f"Leverage: {float(actual_leverage):.2f}x | Max Allowed: {float(MAX_LEVERAGE)}x", telegram_bot, telegram_chat_id)
                 log(f"Stop Loss: {float(SL_PCT*100):.2f}% | Take Profit: {float(TP_MULT)}R", telegram_bot, telegram_chat_id)
-                log(f"Risk Allocation:", telegram_bot, telegram_chat_id)
-                log(f"  • Weekly DD: {float(weekly_dd_percent):.2f}%", telegram_bot, telegram_chat_id)
-                log(f"  • Base Risk: {float(BASE_RISK_PCT*100):.2f}%", telegram_bot, telegram_chat_id)
-                log(f"  • Scaled Risk: {float(risk_pct*100):.3f}%", telegram_bot, telegram_chat_id)
-                log(f"  • Actual Risk: {float(actual_risk_pct):.3f}% (${float(qty_api * R):.2f})", telegram_bot, telegram_chat_id)
-                log(f"  • Balance: ${float(current_balance):.2f}", telegram_bot, telegram_chat_id)
+                log(f"Risk: {float(BASE_RISK_PCT*100):.2f}% (${float(risk_amount_usd):.2f})", telegram_bot, telegram_chat_id)
+                log(f"Balance: ${float(current_balance):.2f}", telegram_bot, telegram_chat_id)
                 log(f"===== END ENTRY DETAILS =====", telegram_bot, telegram_chat_id)
 
                 # === PRICE LEVELS ===
@@ -1737,6 +1727,78 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 tp_price_f = float(tp_price_dec_quant)
                 trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, tick_size, ROUND_DOWN if buy_signal else ROUND_UP)
 
+                # === PLACE MARKET ORDER ===
+                # Kill any zombie orders from previous trades/crashes BEFORE opening new position
+                force_cancel_all_orders(client, symbol, telegram_bot, telegram_chat_id)
+                log(f"Sending MARKET {side_text} order: qty={qty_api}, entry_price={entry_price_f}", telegram_bot, telegram_chat_id)
+                try:
+                    order_res = client.send_signed_request("POST", "/fapi/v1/order", {
+                        "symbol": symbol,
+                        "side": side_text,
+                        "type": "MARKET",
+                        "quantity": str(qty_api)
+                    })
+                    log(f"Market order placed: {order_res}", telegram_bot, telegram_chat_id)
+                except Exception as e:
+                    log(f"Failed to place market order: {e}", telegram_bot, telegram_chat_id)
+                    pending_entry = False
+                    time.sleep(1)
+                    continue
+
+                # === WAIT FOR FILL ===
+                start_time = time.time()
+                actual_qty = None
+                while not STOP_REQUESTED and not os.path.exists("stop.txt"):
+                    pos = fetch_open_positions_details(client, symbol)
+                    pos_amt = Decimal(str(pos.get("positionAmt", "0"))) if pos else Decimal('0')
+                    if pos_amt != Decimal('0'):
+                        actual_qty = abs(pos_amt)
+                        break
+
+                    if time.time() - start_time > ORDER_FILL_TIMEOUT:
+                        try:
+                            client.send_signed_request("DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": order_res.get("orderId")})
+                        except Exception as e:
+                            log(f"Failed to cancel timed-out order: {e}", telegram_bot, telegram_chat_id)
+                        log("Order fill timed out. Cancelling and skipping.", telegram_bot, telegram_chat_id)
+                        pending_entry = False
+                        break
+                    time.sleep(0.5)
+
+                if actual_qty is None:
+                    pending_entry = False
+                    continue
+
+                # === GET ACTUAL FILL PRICE ===
+                actual_fill_price = client.get_latest_fill_price(symbol, order_res.get("orderId"))
+                if actual_fill_price is None:
+                    actual_fill_price = entry_price
+                actual_fill_price_f = float(actual_fill_price)
+                actual_fill_price = Decimal(str(actual_fill_price_f))
+
+                # === RECALCULATE LEVELS USING ACTUAL FILL ===
+                if buy_signal:
+                    sl_price_dec = actual_fill_price * (Decimal("1") - SL_PCT)
+                    R = actual_fill_price * SL_PCT
+                    tp_price_dec = actual_fill_price + (tp_mult * R)
+                    trail_activation_price_dec = actual_fill_price + (TRAIL_TRIGGER_MULT * R)
+                    sl_rounding = ROUND_DOWN
+                    tp_rounding = ROUND_UP
+                    trail_rounding = ROUND_DOWN
+                else:
+                    sl_price_dec = actual_fill_price * (Decimal("1") + SL_PCT)
+                    R = actual_fill_price * SL_PCT
+                    tp_price_dec = actual_fill_price - (tp_mult * R)
+                    trail_activation_price_dec = actual_fill_price - (TRAIL_TRIGGER_MULT * R)
+                    sl_rounding = ROUND_UP
+                    tp_rounding = ROUND_DOWN
+                    trail_rounding = ROUND_UP
+
+                sl_price_dec_quant = quantize_price(sl_price_dec, tick_size, sl_rounding)
+                sl_price_f = float(sl_price_dec_quant)
+                tp_price_dec_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
+                tp_price_f = float(tp_price_dec_quant)
+                trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, tick_size, ROUND_DOWN if buy_signal else ROUND_UP)
                 # === PLACE MARKET ORDER ===
                 # Kill any zombie orders from previous trades/crashes BEFORE opening new position
                 force_cancel_all_orders(client, symbol, telegram_bot, telegram_chat_id)
