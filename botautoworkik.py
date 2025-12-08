@@ -30,7 +30,7 @@ import socket
 import platform
 
 # ------------------- CONFIGURATION -------------------
-RISK_PCT = Decimal("0.045")  # 0.5% per trade
+RISK_PCT = Decimal("0.068")  # 6.8% per trade
 SL_PCT = Decimal("0.0075")  # 0.75%
 TP_MULT = Decimal("9")
 TRAIL_TRIGGER_MULT = Decimal("1.25")
@@ -2075,8 +2075,7 @@ if __name__ == "__main__":
     parser.add_argument("--symbol", default="SOLUSDT", help="Trading symbol (default: SOLUSDT)")
     parser.add_argument("--timeframe", default="30m", help="Timeframe (default: 30m)")
     parser.add_argument("--max-trades", type=int, default=1, help="Max trades per day (default: 1)")
-    parser.add_argument("--risk-pct", type=float, default=4.5, help="Risk percentage per trade (default: 4.5%)")
-    parser.add_argument("--max-loss-pct", type=float, default=4.5, help="Max daily loss percentage (default: 4.5%)")
+    parser.add_argument("--risk-pct", type=float, default=6.8, help="Risk percentage per trade (default: 6.8%)")
     parser.add_argument("--tp-mult", type=float, default=9, help="Take-profit multiplier (default: 9)")
     parser.add_argument("--no-trailing", dest='use_trailing', action='store_false', help="Disable trailing stop")
     parser.add_argument("--no-prevent-same-bar", dest='prevent_same_bar', action='store_false')
@@ -2163,7 +2162,7 @@ if __name__ == "__main__":
             daily_start_equity = balance
             
             # Set leverage on Binance
-            leverage_to_set = 6  # or whatever you want
+            leverage_to_set = 9  # or whatever you want
             client.set_leverage(args.symbol, leverage_to_set)
             log(f"Set Binance leverage to {leverage_to_set}x for {args.symbol}", args.telegram_token, args.chat_id)
 
