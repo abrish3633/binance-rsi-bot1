@@ -944,11 +944,11 @@ def closes_and_volumes_from_klines(klines):
     return closes, volumes, close_times, opens
 
 # ------------------- DATA FETCHING -------------------
-def fetch_klines(client, symbol, interval, limit=max(100, VOL_SMA_PERIOD + 50)):
+def fetch_klines(client, symbol, interval, limit=max(500, VOL_SMA_PERIOD * 3)):
     requested = interval
     if requested == "45m":
         interval = "15m"
-        limit = max(limit, 300)  # Need enough 15m candles
+        limit = max(limit, 1500)  # Need enough 15m candles
 
     try:
         raw = client.public_request("/fapi/v1/klines", {
@@ -970,7 +970,25 @@ def fetch_klines(client, symbol, interval, limit=max(100, VOL_SMA_PERIOD + 50)):
     except Exception as e:
         log(f"Klines fetch failed: {e}", None, None)
         return []
-
+    
+def ensure_tv_quality_data(klines, timeframe):
+    """
+    Quick check if we have TradingView-quality data
+    """
+    if not klines:
+        return False, "No data"
+    
+    # TradingView shows ~500 candles minimum
+    if len(klines) < 100:
+        return False, f"Only {len(klines)} candles (TV shows 500+)"
+    
+    # Check recent candles are valid - FIXED INDEXING
+    for i in range(max(0, len(klines)-3), len(klines)):  # Fixed: direct indexing
+        candle = klines[i]
+        if float(candle[4]) <= 0:  # Close price
+            return False, f"Invalid price in candle {i}"
+    
+    return True, f"OK: {len(klines)} candles"
 def fetch_balance(client: BinanceClient):
     try:
         data = client.send_signed_request("GET", "/fapi/v2/account")
@@ -1542,10 +1560,12 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             # ------------------------------------------------------------
             try:
                 klines = fetch_klines(client, symbol, timeframe)
+                
             except Exception as e:
                 log(f"Klines fetch failed: {e}", telegram_bot, telegram_chat_id)
                 time.sleep(2)
                 continue
+            
 
             if len(klines) < RSI_PERIOD + VOL_SMA_PERIOD + 1:
                 current_time = time.time()
@@ -1553,6 +1573,11 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     log("No klines yet — waiting for data...", telegram_bot, telegram_chat_id)
                     last_no_klines_log = current_time
                 time.sleep(1)
+                continue
+            is_ok, msg = ensure_tv_quality_data(klines, timeframe)
+            if not is_ok:
+                log(f"Data issue: {msg}", telegram_bot, telegram_chat_id)
+                time.sleep(2)
                 continue
 
             # ------------------------------------------------------------
@@ -1695,6 +1720,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 # Final quantity = smaller of risk-based or leverage-capped
                 qty_raw = risk_amount_usd / R
                 qty = min(qty_raw, max_qty_by_leverage)
+                qty = qty * Decimal("0.4")
                 qty_api = quantize_qty(qty, step_size)
 
                 # Safety floor — never go below min notional
