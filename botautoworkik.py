@@ -1720,7 +1720,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 # Final quantity = smaller of risk-based or leverage-capped
                 qty_raw = risk_amount_usd / R
                 qty = min(qty_raw, max_qty_by_leverage)
-                qty = qty * Decimal("0.9")
+                qty = qty * Decimal("0.7")
                 qty_api = quantize_qty(qty, step_size)
 
                 # Safety floor — never go below min notional
