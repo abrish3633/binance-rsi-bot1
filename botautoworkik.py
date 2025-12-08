@@ -84,8 +84,6 @@ if not NEWS_GUARD_ENABLED:
 MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")
 LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'sol_rsi_bot.lock')
 BASE_RISK_PCT = Decimal("0.045")        # 2.25% when drawdown = 0%
-MAX_WEEKLY_DD = Decimal("0.20")         # 10% weekly drawdown → risk collapses  # FIXED NAME
-MIN_RISK_PCT = Decimal("0.002")         # Never go below 0.1%
 MAX_LEVERAGE = Decimal("6")
 # === WEEKLY SCALING QUICK TOGGLE ===
 ENABLE_WEEKLY_SCALING = True      # ← Set to False to disable scaling completely
@@ -124,69 +122,46 @@ _last_news_block_reason: Optional[str] = None
 weekly_peak_equity = None
 weekly_start_time  = None
 
+# Add these 3 lines near other global state variables
+CONSEC_LOSSES = 0
+USE_CONSEC_LOSS_GUARD = True
+MAX_CONSEC_LOSSES = 3
+
 def get_current_risk_pct(current_equity: Decimal, telegram_bot=None, telegram_chat_id=None) -> Decimal:
     """
-    Call this every time before calculating position size
-    Returns the correct risk % for this trade (smooth + hard cap)
+    SIMPLE FIXED 20% WEEKLY DD STOP (Pine Script style)
+    Returns BASE_RISK_PCT if under 20% DD, returns 0 if at/over 20% DD
     """
-    global weekly_peak_equity, weekly_start_time
-   
+    global weekly_peak_equity, weekly_start_time, CONSEC_LOSSES
+    
     now = datetime.now(timezone.utc)
-    # Monday 00:00 UTC of current week
     current_monday = now - timedelta(days=now.weekday())
     current_monday = current_monday.replace(hour=0, minute=0, second=0, microsecond=0)
-   
+    
     # === NEW WEEK DETECTED → RESET ===
     if weekly_start_time is None or now >= current_monday + timedelta(weeks=1):
         weekly_start_time = current_monday
         weekly_peak_equity = current_equity
+        CONSEC_LOSSES = 0  # Reset loss streak weekly
         if telegram_bot and telegram_chat_id:
             log(f"NEW WEEK -> Weekly peak reset to ${float(current_equity):,.2f}", telegram_bot, telegram_chat_id)
-        else:
-            log(f"NEW WEEK -> Weekly peak reset to ${float(current_equity):,.2f}")
-   
+    
     # === UPDATE PEAK IF HIGHER ===
     if weekly_peak_equity is None or current_equity > weekly_peak_equity:
         weekly_peak_equity = current_equity
-   
-    # === CALCULATE CURRENT WEEKLY DD ===
+    
+    # === CHECK 20% DD LIMIT ===
     if weekly_peak_equity <= 0:
-        return MIN_RISK_PCT
-   
-    weekly_dd = (weekly_peak_equity - current_equity) / weekly_peak_equity # positive when down
-   
-    if telegram_bot and telegram_chat_id:
-        log(f"Weekly peak: ${float(weekly_peak_equity):,.2f} | Equity: ${float(current_equity):,.2f} | DD: {weekly_dd:.2%}",
-            telegram_bot, telegram_chat_id)
-    else:
-        log(f"Weekly peak: ${float(weekly_peak_equity):,.2f} | Equity: ${float(current_equity):,.2f} | DD: {weekly_dd:.2%}")
-   
-    # === SMOOTH SCALING (can be disabled instantly) ===
-    if not ENABLE_WEEKLY_SCALING:
-        if telegram_bot and telegram_chat_id:
-            log("WEEKLY SCALING DISABLED — using full 2.25% risk", telegram_bot, telegram_chat_id)
-        else:
-            log("WEEKLY SCALING DISABLED — using full 2.25% risk")
-        return BASE_RISK_PCT
-
-    # FIXED: Changed WEEKLY_DD_MAX to MAX_WEEKLY_DD
-    if weekly_dd >= MAX_WEEKLY_DD:
-        if telegram_bot and telegram_chat_id:
-            log("WEEKLY 10% DD GUARD TRIGGERED -> NO NEW TRADES THIS WEEK", telegram_bot, telegram_chat_id)
-        else:
-            log("WEEKLY 10% DD GUARD TRIGGERED -> NO NEW TRADES THIS WEEK")
         return Decimal("0")
-
-    # Smooth scaling - FIXED: Changed WEEKLY_DD_MAX to MAX_WEEKLY_DD
-    scaling_factor = Decimal("1") - (weekly_dd / MAX_WEEKLY_DD)
-    risk_pct = BASE_RISK_PCT * scaling_factor
-    risk_pct = max(risk_pct, MIN_RISK_PCT)
-
-    if telegram_bot and telegram_chat_id:
-        log(f"Risk for next trade: {risk_pct:.3%} (weekly DD: {weekly_dd:.2%})", telegram_bot, telegram_chat_id)
-    else:
-        log(f"Risk for next trade: {risk_pct:.3%} (weekly DD: {weekly_dd:.2%})")
-    return risk_pct
+    
+    weekly_dd = (weekly_peak_equity - current_equity) / weekly_peak_equity
+    
+    if weekly_dd >= Decimal("0.20"):  # HARD 20% STOP
+        msg = f"WEEKLY 20% DD STOP -> NO NEW TRADES (DD: {weekly_dd:.2%})"
+        log(msg, telegram_bot, telegram_chat_id)
+        return Decimal("0")
+    
+    return Decimal("1")  # Return 1 to indicate trading is allowed
 # ==================== SINGLE INSTANCE LOCK (Windows + Linux) ====================
 LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'sol_rsi_bot.lock')
 
@@ -411,11 +386,23 @@ def init_pnl_log():
             writer.writeheader()
 
 def log_pnl(trade_id, side, entry, exit_price, qty, R):
+    global CONSEC_LOSSES
+    
     if side == 'LONG':
         pnl_usd = (exit_price - entry) * qty
     else:
         pnl_usd = (entry - exit_price) * qty
     pnl_r = pnl_usd / R if R > 0 else 0
+    
+    # === CONSECUTIVE LOSS TRACKING ===
+    loss_pct = abs(pnl_usd) / (entry * qty) if pnl_usd < 0 else 0
+    is_full_loss = loss_pct >= 0.0074  # ~0.75% loss (1R)
+    
+    if pnl_usd < 0 and is_full_loss:
+        CONSEC_LOSSES += 1
+    else:
+        CONSEC_LOSSES = 0  # Any profit or partial loss resets streak
+    
     row = {
         'date': datetime.now(timezone.utc).isoformat(),
         'trade_id': trade_id,
@@ -423,12 +410,14 @@ def log_pnl(trade_id, side, entry, exit_price, qty, R):
         'entry': entry,
         'exit': exit_price,
         'pnl_usd': float(pnl_usd),
-        'pnl_r': float(pnl_r)
+        'pnl_r': float(pnl_r),
+        'loss_streak': CONSEC_LOSSES  # ← NEW FIELD
     }
     pnl_data.append(row)
     with open(PNL_LOG_FILE, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=row.keys())
         writer.writerow(row)
+    
     return row
 
 # ------------------- LOGGING SETUP -------------------
@@ -489,6 +478,8 @@ def send_trade_telegram(trade_details, bot, chat_id):
     telegram_post(bot, chat_id, message)
 
 def send_closure_telegram(symbol, side, entry_price, exit_price, qty, pnl_usd, pnl_r, reason, bot, chat_id):
+    global CONSEC_LOSSES
+    
     message = (
         f"Position Closed:\n"
         f"- Symbol: {symbol}\n"
@@ -498,6 +489,7 @@ def send_closure_telegram(symbol, side, entry_price, exit_price, qty, pnl_usd, p
         f"- Reason: {reason}\n"
         f"- Qty: {qty}\n"
         f"- PNL: {pnl_usd:.2f} USDT ({pnl_r:.2f}R)\n"
+        f"- Loss Streak: {CONSEC_LOSSES}"
     )
     telegram_post(bot, chat_id, message)
 
@@ -986,7 +978,23 @@ def fetch_balance(client: BinanceClient):
     except Exception as e:
         log(f"Balance fetch failed: {str(e)}")
         raise
-
+    
+def trading_allowed(client, symbol, telegram_bot, telegram_chat_id) -> bool:
+    """Simple check for weekly DD and consecutive loss guards"""
+    global CONSEC_LOSSES
+    
+    # 1. Weekly DD Guard (20% hard stop)
+    current_balance = fetch_balance(client)
+    risk_allowed = get_current_risk_pct(current_balance, telegram_bot, telegram_chat_id)
+    if risk_allowed <= Decimal("0"):
+        return False  # Weekly DD stop triggered
+    
+    # 2. Consecutive Loss Guard (3 losses)
+    if USE_CONSEC_LOSS_GUARD and CONSEC_LOSSES >= MAX_CONSEC_LOSSES:
+        log(f"3 CONSECUTIVE LOSS STOP - NO NEW TRADES", telegram_bot, telegram_chat_id)
+        return False
+    
+    return True
 def has_active_position(client: BinanceClient, symbol: str):
     try:
         positions = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
@@ -1439,8 +1447,7 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                 pass
 # ------------------- TRADING LOOP -------------------
 def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, telegram_bot, telegram_chat_id):
-    global last_news_guard_msg, news_guard_was_active
-    global last_trade_date
+    global last_news_guard_msg, news_guard_was_active   
     global last_no_klines_log
     interval_seconds = interval_ms(timeframe) / 1000.0  # tf in seconds
     trades_today = 0
@@ -1454,6 +1461,10 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
     tick_size = filters['tickSize']
     min_notional = filters['minNotional']
     max_trades_alert_sent = False
+    
+    # === FIX: Initialize last_trade_date ONCE, before the loop ===
+    last_trade_date = datetime.now(timezone.utc).date()
+    log(f"Bot started on {last_trade_date}. Trades today: {trades_today}", telegram_bot, telegram_chat_id)
 
     signal.signal(signal.SIGINT, lambda s, f: _request_stop(s, f, symbol, telegram_bot, telegram_chat_id))
     signal.signal(signal.SIGTERM, lambda s, f: _request_stop(s, f, symbol, telegram_bot, telegram_chat_id))
@@ -1497,17 +1508,17 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 time.sleep(60)
                 continue
             
-             # === WEEKLY DYNAMIC RISK SCALING (CALL IT HERE) ===
-            current_balance = fetch_balance(client)
-            risk_pct = get_current_risk_pct(current_balance, telegram_bot, telegram_chat_id)   # ← your function returns 0 when blocked
-
-            # HARD 10% WEEKLY BLOCK
-            if risk_pct <= Decimal("0"):
-                log("WEEKLY % DD GUARD → NO NEW TRADES THIS WEEK", telegram_bot, telegram_chat_id)
+            # === CHECK TRADING PERMISSION ===
+            if not trading_allowed(client, symbol, telegram_bot, telegram_chat_id):
+                log("Trading blocked by weekly DD or consecutive loss guard", telegram_bot, telegram_chat_id)
                 pending_entry = False
+                last_processed_time = close_time
+                time.sleep(1)
                 continue
-
-            # Use the scaled risk_pct for position size
+            
+            # Get current balance for position sizing
+            current_balance = fetch_balance(client)
+            risk_pct = BASE_RISK_PCT  # Always full 4.5% risk when trading is allowed
             log(f"Risk allowed: {risk_pct:.3%}", telegram_bot, telegram_chat_id)
 
             # === GET SERVER TIME ===
@@ -1585,8 +1596,6 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 trading_loop.last_candle_state = current_state
 
             # === ENTRY GUARDS ===
-            
-            # === NEWS GUARD – MUST BE INSIDE THE LOOP ===
 
             if NEWS_GUARD_ENABLED:
                 blocked, reason = is_news_blocked()
@@ -1673,7 +1682,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     time.sleep(1)
                     continue
 
-                                # === FINAL POSITION SIZING — WEEKLY SCALED RISK ONLY ===
+                # === FINAL POSITION SIZING — WEEKLY SCALED RISK ONLY ===
                 # risk_pct comes from get_current_risk_pct() — this is the ONLY source of truth
                 R = entry_price * SL_PCT
                 
@@ -2073,14 +2082,9 @@ if __name__ == "__main__":
             # Format risk % safely and precisely
             risk_pct_display = float(Decimal(str(args.risk_pct)))
 
-            if ENABLE_WEEKLY_SCALING:
-                log(f"Weekly dynamic drawdown scaling: ENABLED (20% max)", args.telegram_token, args.chat_id)
-                log(f"Risk scaling: {float(BASE_RISK_PCT*100):.2f}% → {float(MIN_RISK_PCT*100):.2f}% as DD: 0% → 20%", 
-                    args.telegram_token, args.chat_id)
-            else:
-                log(f"Weekly dynamic drawdown scaling: DISABLED (fixed {float(BASE_RISK_PCT*100):.2f}% risk)", 
-                    args.telegram_token, args.chat_id)
-
+            log(f"Simple Weekly DD Guard: 20% hard stop", args.telegram_token, args.chat_id)
+            log(f"Consecutive Loss Guard: 3 full losses stop", args.telegram_token, args.chat_id)
+            log(f"Base Risk: {float(BASE_RISK_PCT*100):.2f}% per trade", args.telegram_token, args.chat_id)
             log(f"Fetched balance: {float(balance):.2f} USDT", args.telegram_token, args.chat_id)
 
             if NEWS_GUARD_ENABLED:
@@ -2126,4 +2130,3 @@ if __name__ == "__main__":
             except:
                 pass  # Never die from logging
             time.sleep(15)
-
