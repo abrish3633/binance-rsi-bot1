@@ -754,45 +754,47 @@ class BinanceClient:
             log(f"Failed to fetch fill price: {str(e)}")
             return None
 
-    def place_stop_market(self, symbol: str, side: str, quantity: Decimal, stop_price: Decimal, reduce_only: bool = True, position_side: str = None):
+    # === NEW 2025+ BINANCE ALGO ORDERS (REQUIRED FOR STOP, TP, TRAILING) ===
+    def place_algo_order(self, order_type: str, symbol: str, side: str, quantity: Decimal,
+                         stop_price: Decimal = None, activation_price: Decimal = None,
+                         callback_rate: Decimal = None, reduce_only: bool = True):
+        """
+        Unified method for Binance Algo Orders API
+        Required for STOP, TAKE_PROFIT, TRAILING_STOP on SOLUSDT and most symbols
+        """
         params = {
             "symbol": symbol,
             "side": side,
-            "type": "STOP_MARKET",
-            "stopPrice": str(stop_price),
+            "type": order_type,           # "STOP", "TAKE_PROFIT", or "TRAILING_STOP"
             "quantity": str(quantity),
-            "reduceOnly": "true" if reduce_only else "false"
+            "reduceOnly": str(reduce_only).lower(),
+            "timeInForce": "GTE_GTC",     # Good Till Executed (required for algo orders)
         }
-        if self.dual_side and position_side:
-            params["positionSide"] = position_side
-        return self.send_signed_request("POST", "/fapi/v1/order", params)
 
-    def place_take_profit_market(self, symbol: str, side: str, quantity: Decimal, stop_price: Decimal, reduce_only: bool = True, position_side: str = None):
-        params = {
-            "symbol": symbol,
-            "side": side,
-            "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": str(stop_price),
-            "quantity": str(quantity),
-            "reduceOnly": "true" if reduce_only else "false"
-        }
-        if self.dual_side and position_side:
-            params["positionSide"] = position_side
-        return self.send_signed_request("POST", "/fapi/v1/order", params)
+        if order_type in ["STOP", "TAKE_PROFIT"]:
+            params["stopPrice"] = str(stop_price)
+            params["workingType"] = "CONTRACT_PRICE"
+        elif order_type == "TRAILING_STOP":
+            params["activationPrice"] = str(activation_price)
+            params["callbackRate"] = str(callback_rate)
 
-    def place_trailing_stop_market(self, symbol: str, side: str, quantity: Decimal, callback_rate: Decimal, activation_price: Decimal, reduce_only: bool = True, position_side: str = None):
-        params = {
-            "symbol": symbol,
-            "side": side,
-            "type": "TRAILING_STOP_MARKET",
-            "callbackRate": str(callback_rate),
-            "activationPrice": str(activation_price),
-            "quantity": str(quantity),
-            "reduceOnly": "true" if reduce_only else "false"
-        }
-        if self.dual_side and position_side:
-            params["positionSide"] = position_side
-        return self.send_signed_request("POST", "/fapi/v1/order", params)
+        return self.send_signed_request("POST", "/fapi/v1/algo/futures/newOrder", params)
+
+    # === WRAPPERS — KEEP SAME NAMES SO YOUR place_orders() WORKS UNCHANGED ===
+    def place_stop_market(self, symbol: str, side: str, quantity: Decimal, stop_price: Decimal,
+                          reduce_only: bool = True, position_side: str = None):
+        return self.place_algo_order("STOP", symbol, side, quantity, stop_price=stop_price, reduce_only=reduce_only)
+
+    def place_take_profit_market(self, symbol: str, side: str, quantity: Decimal, stop_price: Decimal,
+                                reduce_only: bool = True, position_side: str = None):
+        return self.place_algo_order("TAKE_PROFIT", symbol, side, quantity, stop_price=stop_price, reduce_only=reduce_only)
+
+    def place_trailing_stop_market(self, symbol: str, side: str, quantity: Decimal,
+                                  callback_rate: Decimal, activation_price: Decimal,
+                                  reduce_only: bool = True, position_side: str = None):
+        return self.place_algo_order("TRAILING_STOP", symbol, side, quantity,
+                                     activation_price=activation_price, callback_rate=callback_rate,
+                                     reduce_only=reduce_only)
 
 # ------------------- INDICATORS (WILDER RSI) -------------------
 def compute_rsi(closes, period=RSI_PERIOD):
