@@ -778,7 +778,7 @@ class BinanceClient:
             params["activationPrice"] = str(activation_price)
             params["callbackRate"] = str(callback_rate)
 
-        return self.send_signed_request("POST", "/fapi/v1/algo/futures/newOrder", params)
+        return self.send_signed_request("POST", "/fapi/v1/algoOrder", params)
 
     # === WRAPPERS — KEEP SAME NAMES SO YOUR place_orders() WORKS UNCHANGED ===
     def place_stop_market(self, symbol: str, side: str, quantity: Decimal, stop_price: Decimal,
@@ -916,28 +916,62 @@ def place_orders(client, symbol, trade_state, tick_size, telegram_bot=None, tele
     tp_price_dec_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
     trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, tick_size, ROUND_DOWN if trade_state.side == "LONG" else ROUND_UP)
     callback_rate = TRAIL_DISTANCE_MULT * SL_PCT * Decimal('100')
+    
+    # === EMERGENCY SAFETY COUNTER ===
+    failures = 0
+    
+    # SL
     try:
         sl_order = client.place_stop_market(symbol, close_side, qty_dec, sl_price_dec_quant, reduce_only=True, position_side=pos_side)
         trade_state.sl_order_id = sl_order.get("orderId")
         trade_state.sl = float(sl_price_dec_quant)
         log(f"Placed STOP_MARKET SL: {sl_order}", telegram_bot, telegram_chat_id)
     except Exception as e:
+        failures += 1
         log(f"Failed to place SL: {str(e)}", telegram_bot, telegram_chat_id)
+    
+    # TP
     try:
         tp_order = client.place_take_profit_market(symbol, close_side, qty_dec, tp_price_dec_quant, reduce_only=True, position_side=pos_side)
         trade_state.tp_order_id = tp_order.get("orderId")
         trade_state.tp = float(tp_price_dec_quant)
         log(f"Placed TAKE_PROFIT_MARKET TP: {tp_order}", telegram_bot, telegram_chat_id)
     except Exception as e:
+        failures += 1
         log(f"Failed to place TP: {str(e)}", telegram_bot, telegram_chat_id)
+    
+    # Trailing
     try:
         trail_order = client.place_trailing_stop_market(symbol, close_side, qty_dec, callback_rate, trail_activation_price_dec_quant, reduce_only=True, position_side=pos_side)
         trade_state.trail_order_id = trail_order.get("orderId")
         trade_state.trail_activation_price = float(trail_activation_price_dec_quant)
         log(f"Placed TRAILING_STOP_MARKET: {trail_order}", telegram_bot, telegram_chat_id)
     except Exception as e:
+        failures += 1
         log(f"Failed to place trailing stop: {str(e)}", telegram_bot, telegram_chat_id)
-
+    
+    # === CRITICAL SAFETY: CLOSE IF ALL 3 FAIL ===
+    if failures >= 3:
+        emergency_msg = (
+            f"🚨 EMERGENCY CLOSE: ALL PROTECTIVE ORDERS FAILED 🚨\n"
+            f"Symbol: {symbol} | Side: {trade_state.side}\n"
+            f"Entry: {trade_state.entry_price:.4f} | Qty: {trade_state.qty}\n"
+            f"Closing naked position IMMEDIATELY to prevent risk!"
+        )
+        log(emergency_msg, telegram_bot, telegram_chat_id)
+        if telegram_bot and telegram_chat_id:
+            telegram_post(telegram_bot, telegram_chat_id, emergency_msg)
+        
+        # Force close position
+        try:
+            _request_stop(symbol=symbol, telegram_bot=telegram_bot, telegram_chat_id=telegram_chat_id)
+            log(f"EMERGENCY: Position closed due to {failures} order failures.", telegram_bot, telegram_chat_id)
+        except Exception as close_e:
+            log(f"EMERGENCY CLOSE FAILED: {close_e} — MANUAL INTERVENTION REQUIRED!", telegram_bot, telegram_chat_id)
+        
+        # Reset trade state
+        trade_state.active = False
+        return  # Exit early
 # ------------------- HELPER: KLINE DATA EXTRACTION -------------------
 def closes_and_volumes_from_klines(klines):
     closes = [float(k[4]) for k in klines]
