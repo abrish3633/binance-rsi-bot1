@@ -392,7 +392,8 @@ def log_pnl(trade_id, side, entry, exit_price, qty, R):
         pnl_usd = (exit_price - entry) * qty
     else:
         pnl_usd = (entry - exit_price) * qty
-    pnl_r = pnl_usd / R if R > 0 else 0
+    total_risk = qty * R
+    pnl_r = pnl_usd / total_risk if total_risk > 0 else 0
     
     # === CONSECUTIVE LOSS TRACKING ===
     loss_pct = abs(pnl_usd) / (entry * qty) if pnl_usd < 0 else 0
@@ -1281,9 +1282,15 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                 debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
                 last_recovery_check = time.time()
 
-            # --- Get Latest Price ---
+                        # --- Get Latest Price (WITH SANITY CHECK) ---
             try:
-                current_price = _price_queue.get_nowait()
+                price_candidate = _price_queue.get_nowait()
+                # CRITICAL: Reject insane prices (0, negative, or absurdly high)
+                if (price_candidate <= Decimal('0') or 
+                    price_candidate > Decimal('1000')):  # SOL will never be >$1000 soon
+                    log(f"IGNORED INSANE PRICE: {price_candidate}", telegram_bot, telegram_chat_id)
+                    continue
+                current_price = price_candidate
             except queue.Empty:
                 pass
 
@@ -1397,11 +1404,16 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                         if trade_state.lowest_price is None or current_price < trade_state.lowest_price:
                             trade_state.lowest_price = current_price
 
-                # --- Trailing Activation ---
-                if not trade_state.trail_activated and trade_state.trail_activation_price and current_price is not None:
+                # --- Trailing Activation (WITH INSANE PRICE PROTECTION) ---
+                if (not trade_state.trail_activated and 
+                    trade_state.trail_activation_price and 
+                    current_price is not None and 
+                    current_price > Decimal('1')):  # ← THIS LINE KILLS THE BUG FOREVER
+
                     trail_activation_price_dec = Decimal(str(trade_state.trail_activation_price))
-                    if (trade_state.side == "LONG" and current_price >= trail_activation_price_dec) or \
-                       (trade_state.side == "SHORT" and current_price <= trail_activation_price_dec):
+                    if ((trade_state.side == "LONG" and current_price >= trail_activation_price_dec) or
+                        (trade_state.side == "SHORT" and current_price <= trail_activation_price_dec)):
+
                         trade_state.trail_activated = True
                         R_dec = Decimal(str(trade_state.risk))
                         activation_dec = Decimal(str(trade_state.trail_activation_price))
@@ -1420,7 +1432,6 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                         )
                         trade_state.current_trail_stop = init_stop
                         trade_state.last_trail_alert = time.time()
-
                 # --- TRAILING UPDATES (NATIVE BINANCE TRACKING ONLY) ---
                 if trade_state.trail_activated and time.time() - trade_state.last_trail_alert >= TRAIL_UPDATE_THROTTLE and current_price is not None:
                     R_dec = Decimal(str(trade_state.risk))
