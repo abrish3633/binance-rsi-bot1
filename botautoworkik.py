@@ -736,8 +736,11 @@ class BinanceClient:
         return response if isinstance(response, list) else []
 
     def cancel_all_open_orders(self, symbol: str):
-        params = {"symbol": symbol}
-        return self.send_signed_request("DELETE", "/fapi/v1/allOpenOrders", params)
+        try:
+            self.send_signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
+            self.send_signed_request("DELETE", "/fapi/v1/cancelAllOpenAlgoOrders", {"symbol": symbol})
+        except Exception as e:
+            log(f"Failed to cancel open orders: {e}")
 
     def cancel_order(self, symbol: str, order_id: int):
         params = {"symbol": symbol, "orderId": order_id}
@@ -867,7 +870,6 @@ def aggregate_klines_to_45m(klines_15m):
 
     aggregated.reverse()
     return aggregated
-
 # ------------------- SYMBOL FILTERS -------------------
 def get_symbol_filters(client: BinanceClient, symbol: str):
     global symbol_filters_cache
@@ -919,6 +921,7 @@ def place_orders(client, symbol, trade_state, tick_size, telegram_bot=None, tele
     try:
         sl_order = client.place_stop_market(symbol, close_side, qty_dec, sl_price_dec_quant, reduce_only=True, position_side=pos_side)
         trade_state.sl_order_id = sl_order.get("orderId")
+        trade_state.sl_algo_id = sl_order.get("algoId")  # ← ADD THESE 3 LINES
         trade_state.sl = float(sl_price_dec_quant)
         log(f"Placed STOP_MARKET SL: {sl_order}", telegram_bot, telegram_chat_id)
     except Exception as e:
@@ -929,6 +932,7 @@ def place_orders(client, symbol, trade_state, tick_size, telegram_bot=None, tele
     try:
         tp_order = client.place_take_profit_market(symbol, close_side, qty_dec, tp_price_dec_quant, reduce_only=True, position_side=pos_side)
         trade_state.tp_order_id = tp_order.get("orderId")
+        trade_state.tp_algo_id = tp_order.get("algoId")  # ← ADD THESE 3 LINES
         trade_state.tp = float(tp_price_dec_quant)
         log(f"Placed TAKE_PROFIT_MARKET TP: {tp_order}", telegram_bot, telegram_chat_id)
     except Exception as e:
@@ -939,6 +943,7 @@ def place_orders(client, symbol, trade_state, tick_size, telegram_bot=None, tele
     try:
         trail_order = client.place_trailing_stop_market(symbol, close_side, qty_dec, callback_rate, trail_activation_price_dec_quant, reduce_only=True, position_side=pos_side)
         trade_state.trail_order_id = trail_order.get("orderId")
+        trade_state.trail_algo_id = trail_order.get("algoId")
         trade_state.trail_activation_price = float(trail_activation_price_dec_quant)
         log(f"Placed TRAILING_STOP_MARKET: {trail_order}", telegram_bot, telegram_chat_id)
     except Exception as e:
@@ -1600,10 +1605,14 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 server_time = int(time.time() * 1000)
 
             # === WAIT FOR NEXT CANDLE CLOSE ===
-            next_close_ms = last_processed_time + interval_ms(timeframe)
+            # Calculate next 45m boundary from current server time
+            interval_ms_val = interval_ms(timeframe)
+            current_45m_boundary = (server_time // interval_ms_val) * interval_ms_val
+            next_close_ms = current_45m_boundary + interval_ms_val
+            
             sleep_seconds = max(1.0, (next_close_ms - server_time + 500) / 1000.0)
             if sleep_seconds > 1:
-                log(f"Waiting for candle close in {sleep_seconds:.2f}s ...", telegram_bot, telegram_chat_id)
+                log(f"Waiting for next {timeframe} candle close in {sleep_seconds:.2f}s ...", telegram_bot, telegram_chat_id)
                 _safe_sleep(sleep_seconds)
                 continue
 
@@ -1950,9 +1959,20 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
 
             # === UPDATE LAST PROCESSED TIME ===
             last_processed_time = close_time
-            next_close_ms = last_processed_time + interval_ms(timeframe)
+            
+            # Recalculate next 45m boundary for proper scheduling
+            try:
+                server_time_response = client.public_request("/fapi/v1/time")
+                server_time = server_time_response["serverTime"]
+            except Exception as e:
+                server_time = int(time.time() * 1000)
+                
+            interval_ms_val = interval_ms(timeframe)
+            current_45m_boundary = (server_time // interval_ms_val) * interval_ms_val
+            next_close_ms = current_45m_boundary + interval_ms_val
+            
             sleep_seconds = max(1.0, (next_close_ms - server_time + 500) / 1000.0)
-            log(f"Waiting for candle close in {sleep_seconds:.2f}s ...", telegram_bot, telegram_chat_id)
+            log(f"Waiting for next {timeframe} candle close in {sleep_seconds:.2f}s ...", telegram_bot, telegram_chat_id)
             _safe_sleep(sleep_seconds)
 
         except Exception as e:
@@ -1980,6 +2000,8 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
 
 def interval_ms(interval):
     interval = interval.strip().lower()
+    if interval == "45m":
+        return 45 * 60 * 1000  # 2700000 ms
     if interval.endswith("m"):
         try:
             minutes = int(interval[:-1])
