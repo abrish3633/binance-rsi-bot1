@@ -763,6 +763,7 @@ class BinanceClient:
         Required for STOP, TAKE_PROFIT, TRAILING_STOP on SOLUSDT and most symbols
         """
         params = {
+            "algoType": "CONDITIONAL",  # ← ADD THIS LINE (MANDATORY FOR 2025)
             "symbol": symbol,
             "side": side,
             "type": order_type,           # "STOP", "TAKE_PROFIT", or "TRAILING_STOP"
