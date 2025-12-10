@@ -754,7 +754,6 @@ class BinanceClient:
             log(f"Failed to fetch fill price: {str(e)}")
             return None
 
-        # === FINAL 2025 BINANCE ALGO ORDERS — TESTED & WORKING ===
     def place_algo_order(self, symbol: str, side: str, quantity: Decimal,
                          order_type: str, trigger_price: Decimal = None,
                          activation_price: Decimal = None, callback_rate: Decimal = None,
@@ -763,13 +762,13 @@ class BinanceClient:
             "algoType": "CONDITIONAL",
             "symbol": symbol,
             "side": side,
-            "orderType": order_type,           # ← MUST be STOP_MARKET, TAKE_PROFIT_MARKET, TRAILING_STOP_MARKET
+            "type": order_type,           # ← FIXED: lowercase 't' — this was the bug
             "quantity": str(quantity),
             "reduceOnly": "true" if reduce_only else "false",
             "timeInForce": "GTE_GTC"
         }
         if trigger_price is not None:
-            params["triggerPrice"] = str(trigger_price)     # ← NOT stopPrice
+            params["triggerPrice"] = str(trigger_price)     # ← Docs confirm: triggerPrice for SL/TP
             params["workingType"] = "CONTRACT_PRICE"
         if activation_price is not None:
             params["activationPrice"] = str(activation_price)
