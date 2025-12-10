@@ -1090,63 +1090,74 @@ class TradeState:
         self.sl_order_id = None
         self.tp_order_id = None
         self.trail_order_id = None
+        self.sl_algo_id     = None
+        self.tp_algo_id     = None
+        self.trail_algo_id  = None
 def debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot=None, telegram_chat_id=None):
-    """Recover missing SL/TP/Trailing orders. Idempotent. Thread-safe. No fake 'Stop Requested'."""
+    """Recover missing SL/TP/Trailing orders. Idempotent. Thread-safe. Supports 2025 Algo Orders."""
     if not trade_state.active:
         return
-
     try:
-        # Fetch current open orders once – efficient and safe
-        open_orders = {o["orderId"]: o for o in client.get_open_orders(symbol)}
-
-        recovered_something = False  # Track if we actually re-issued anything
-
+        # === STEP 1: Fetch REGULAR open orders ===
+        regular_open_orders = {o["orderId"]: o for o in client.get_open_orders(symbol)}
+        
+        # === STEP 2: Fetch ALGO open orders (NEW 2025 REQUIRED) ===
+        algo_open_orders_resp = client.send_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
+        algo_open_orders = algo_open_orders_resp if isinstance(algo_open_orders_resp, list) else []
+        algo_open_ids = {o.get("algoId") for o in algo_open_orders}
+        
+        # === STEP 3: Combined check (regular + algo) ===
+        all_open_ids = set(regular_open_orders.keys()) | algo_open_ids
+        recovered_something = False
+        
         # === RECOVER SL ===
-        if trade_state.sl_order_id and trade_state.sl_order_id not in open_orders:
-            log(f"SL missing (ID={trade_state.sl_order_id}). Re-issuing...", telegram_bot, telegram_chat_id)
+        sl_id = trade_state.sl_order_id or trade_state.sl_algo_id  # Fallback to either
+        if sl_id and sl_id not in all_open_ids:
+            log(f"SL missing (ID={sl_id}). Re-issuing...", telegram_bot, telegram_chat_id)
             sl_price = _calc_sl_price(trade_state.entry_price, trade_state.side, tick_size)
             new_sl = _place_stop_market(client, symbol, trade_state, sl_price)
             if new_sl:
-                trade_state.sl_order_id = new_sl["orderId"]
+                # === 2025 FIX: Handle both orderId (old) and algoId (new) ===
+                trade_state.sl_order_id   = new_sl.get("orderId")
+                trade_state.sl_algo_id    = new_sl.get("algoId")    # NEW FIELD
                 trade_state.sl = float(sl_price)
-                _tg_notify("SL Recovered", f"New Stop: {trade_state.sl:.4f}\nOrder ID: {trade_state.sl_order_id}", symbol, telegram_bot, telegram_chat_id)
+                _tg_notify("SL Recovered", f"New Stop: {trade_state.sl:.4f}\nID: {trade_state.sl_algo_id or trade_state.sl_order_id}", symbol, telegram_bot, telegram_chat_id)
                 recovered_something = True
-
+        
         # === RECOVER TP ===
-        if trade_state.tp_order_id and trade_state.tp_order_id not in open_orders:
-            log(f"TP missing (ID={trade_state.tp_order_id}). Re-issuing...", telegram_bot, telegram_chat_id)
+        tp_id = trade_state.tp_order_id or trade_state.tp_algo_id
+        if tp_id and tp_id not in all_open_ids:
+            log(f"TP missing (ID={tp_id}). Re-issuing...", telegram_bot, telegram_chat_id)
             tp_price = _calc_tp_price(trade_state.entry_price, trade_state.side, tick_size)
             new_tp = _place_take_profit(client, symbol, trade_state, tp_price)
             if new_tp:
-                trade_state.tp_order_id = new_tp["orderId"]
+                trade_state.tp_order_id   = new_tp.get("orderId")
+                trade_state.tp_algo_id    = new_tp.get("algoId")    # NEW
                 trade_state.tp = float(tp_price)
-                _tg_notify("TP Recovered", f"New TP: {trade_state.tp:.4f}\nOrder ID: {trade_state.tp_order_id}", symbol, telegram_bot, telegram_chat_id)
+                _tg_notify("TP Recovered", f"New TP: {trade_state.tp:.4f}\nID: {trade_state.tp_algo_id or trade_state.tp_order_id}", symbol, telegram_bot, telegram_chat_id)
                 recovered_something = True
-
+        
         # === RECOVER TRAILING ===
-        if trade_state.trail_order_id and trade_state.trail_order_id not in open_orders:
-            log(f"Trailing missing (ID={trade_state.trail_order_id}). Re-issuing...", telegram_bot, telegram_chat_id)
+        trail_id = trade_state.trail_order_id or trade_state.trail_algo_id
+        if trail_id and trail_id not in all_open_ids:
+            log(f"Trailing missing (ID={trail_id}). Re-issuing...", telegram_bot, telegram_chat_id)
             act_price = _calc_trail_activation(trade_state.entry_price, trade_state.side, tick_size)
             new_trail = _place_trailing_stop(client, symbol, trade_state, act_price)
             if new_trail:
-                trade_state.trail_order_id = new_trail["orderId"]
+                trade_state.trail_order_id    = new_trail.get("orderId")
+                trade_state.trail_algo_id     = new_trail.get("algoId")  # NEW
                 trade_state.trail_activation_price = float(act_price)
                 trade_state.current_trail_stop = float(new_trail.get("stopPrice") or act_price)
-                _tg_notify("Trailing Recovered", f"Activation: {trade_state.trail_activation_price:.4f}\nOrder ID: {trade_state.trail_order_id}", symbol, telegram_bot, telegram_chat_id)
+                _tg_notify("Trailing Recovered", f"Activation: {trade_state.trail_activation_price:.4f}\nID: {trade_state.trail_algo_id or trade_state.trail_order_id}", symbol, telegram_bot, telegram_chat_id)
                 recovered_something = True
-
-        # Optional: quiet confirmation when all good (uncomment if you want)
+        
+        # Optional: quiet confirmation when all good
         # if not recovered_something:
-        #     log("All protective orders confirmed present.", telegram_bot, telegram_chat_id)
-
+        #     log("All protective orders confirmed present (regular + algo).", telegram_bot, telegram_chat_id)
     except Exception as e:
         log(f"Recovery failed: {e}", telegram_bot, telegram_chat_id)
-
-    # CRITICAL: Always return here – prevents fall-through into closure logic
-    # This single line eliminates 99% of all false "Stop Loss" / "Take Profit" reports
     return
 
-# === ANGRY BOUNCER – KILLS ZOMBIE ORDERS DEAD ===
 def force_cancel_all_orders(client, symbol, telegram_bot=None, telegram_chat_id=None):
     """Cancel every single open order, even the stubborn reduceOnly ones Binance loves to protect."""
     try:
@@ -1354,10 +1365,10 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                             open_orders = []
                         open_order_ids = {o["orderId"] for o in open_orders}
 
-                        # Use the CURRENT order IDs (updated by recovery function)
-                        current_sl_id     = trade_state.sl_order_id
-                        current_tp_id     = trade_state.tp_order_id
-                        current_trail_id  = trade_state.trail_order_id
+                        # === NEW 2025+ FIX: Binance now returns algoId instead of orderId ===
+                        current_sl_id     = trade_state.sl_order_id or trade_state.sl_algo_id
+                        current_tp_id     = trade_state.tp_order_id or trade_state.tp_algo_id
+                        current_trail_id  = trade_state.trail_order_id or trade_state.trail_algo_id
 
                         reason = "Unknown"
                         exit_price = None
