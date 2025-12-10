@@ -1596,49 +1596,34 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             risk_pct = BASE_RISK_PCT  # Always full 4.5% risk when trading is allowed
             log(f"Risk allowed: {risk_pct:.3%}", telegram_bot, telegram_chat_id)
 
-            # === GET SERVER TIME ===
-            try:
-                server_time_response = client.public_request("/fapi/v1/time")
-                server_time = server_time_response["serverTime"]
-            except Exception as e:
-                log(f"Failed to get server time: {e}. Using local time.", telegram_bot, telegram_chat_id)
-                server_time = int(time.time() * 1000)
-
-            # === WAIT FOR NEXT CANDLE CLOSE ===
-            # Calculate next 45m boundary from current server time
-            interval_ms_val = interval_ms(timeframe)
-            current_45m_boundary = (server_time // interval_ms_val) * interval_ms_val
-            next_close_ms = current_45m_boundary + interval_ms_val
-            
-            sleep_seconds = max(1.0, (next_close_ms - server_time + 500) / 1000.0)
-            if sleep_seconds > 1:
-                log(f"Waiting for next {timeframe} candle close in {sleep_seconds:.2f}s ...", telegram_bot, telegram_chat_id)
-                _safe_sleep(sleep_seconds)
-                continue
-
             # ------------------------------------------------------------
             # 5. FETCH FRESH KLINES (WITH 45m AGGREGATION)
             # ------------------------------------------------------------
             try:
                 klines = fetch_klines(client, symbol, timeframe)
-                
             except Exception as e:
-                log(f"Klines fetch failed: {e}", telegram_bot, telegram_chat_id)
-                time.sleep(2)
+                log(f"Klines fetch failed during alignment: {e}", telegram_bot, telegram_chat_id)
+                time.sleep(5)
                 continue
-            
 
-            if len(klines) < RSI_PERIOD + VOL_SMA_PERIOD + 1:
-                current_time = time.time()
-                if current_time - last_no_klines_log >= interval_seconds:
-                    log("No klines yet — waiting for data...", telegram_bot, telegram_chat_id)
-                    last_no_klines_log = current_time
-                time.sleep(1)
+            if len(klines) < 10:
+                log("Not enough klines yet for alignment — waiting...", telegram_bot, telegram_chat_id)
+                time.sleep(10)
                 continue
-            is_ok, msg = ensure_tv_quality_data(klines, timeframe)
-            if not is_ok:
-                log(f"Data issue: {msg}", telegram_bot, telegram_chat_id)
-                time.sleep(2)
+
+            # === GET LATEST CANDLE CLOSE TIME (THIS IS WHAT MATTERS FOR 45m) ===
+            latest_close_time = int(klines[-1][6])  # close time in ms
+
+            # === ALIGN TO ACTUAL 45m CANDLE BOUNDARIES (NOT BINANCE SERVER MATH) ===
+            now_ms = int(time.time() * 1000)
+            next_expected_close = latest_close_time + interval_ms(timeframe)
+
+            sleep_until_next = (next_expected_close - now_ms) / 1000.0 + 1.0  # +1s buffer
+
+            if sleep_until_next > 1:
+                dt_next = datetime.fromtimestamp(next_expected_close / 1000, tz=timezone.utc)
+                log(f"Waiting for next {timeframe} candle close in {sleep_until_next:.1f}s → {dt_next.strftime('%H:%M')} UTC", telegram_bot, telegram_chat_id)
+                _safe_sleep(sleep_until_next)
                 continue
 
             # ------------------------------------------------------------
@@ -1959,20 +1944,9 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
 
             # === UPDATE LAST PROCESSED TIME ===
             last_processed_time = close_time
-            
-            # Recalculate next 45m boundary for proper scheduling
-            try:
-                server_time_response = client.public_request("/fapi/v1/time")
-                server_time = server_time_response["serverTime"]
-            except Exception as e:
-                server_time = int(time.time() * 1000)
-                
-            interval_ms_val = interval_ms(timeframe)
-            current_45m_boundary = (server_time // interval_ms_val) * interval_ms_val
-            next_close_ms = current_45m_boundary + interval_ms_val
-            
+            next_close_ms = ((server_time // interval_ms(timeframe)) * interval_ms(timeframe)) + interval_ms(timeframe)
             sleep_seconds = max(1.0, (next_close_ms - server_time + 500) / 1000.0)
-            log(f"Waiting for next {timeframe} candle close in {sleep_seconds:.2f}s ...", telegram_bot, telegram_chat_id)
+            log(f"Waiting for candle close in {sleep_seconds:.2f}s ...", telegram_bot, telegram_chat_id)
             _safe_sleep(sleep_seconds)
 
         except Exception as e:
