@@ -378,6 +378,32 @@ def check_volatility_abort(klines: list, period: int = 14) -> bool:
     atr = np.mean(tr[-period:])
     mean20 = np.mean(tr[-20:])
     return atr > mean20 * 3.0
+
+def get_next_45m_close_ms(current_ms: int) -> int:
+    """Return the next standard 45m candle close time (xx:14, xx:59, xx:44 UTC)."""
+    dt = datetime.fromtimestamp(current_ms / 1000, tz=timezone.utc)
+    
+    boundaries = [14, 59, 44]  # standard 45m grid
+    
+    hour = dt.hour
+    minute = dt.minute
+    
+    next_minute = None
+    for m in boundaries:
+        if minute < m:
+            next_minute = m
+            break
+    
+    if next_minute is None:
+        hour = (hour + 1) % 24
+        next_minute = 14
+    
+    next_dt = dt.replace(hour=hour, minute=next_minute, second=0, microsecond=0)
+    if next_dt <= dt:
+        next_dt += timedelta(hours=1)
+        next_dt = next_dt.replace(minute=14)
+    
+    return int(next_dt.timestamp() * 1000)
 # ------------------- PNL LOGGING -------------------
 def init_pnl_log():
     if not os.path.exists(PNL_LOG_FILE):
@@ -736,11 +762,39 @@ class BinanceClient:
         return response if isinstance(response, list) else []
 
     def cancel_all_open_orders(self, symbol: str):
+        """FINAL ZOMBIE KILLER — 2025 compliant. Smart logs + full annihilation."""
         try:
-            self.send_signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
-            self.send_signed_request("DELETE", "/fapi/v1/cancelAllOpenAlgoOrders", {"symbol": symbol})
+            # 1. Cancel all regular orders — instant bulk cancel
+            self.send_signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol, "recvWindow": 60000})
+            log(f"[ZOMBIE KILLER] All regular orders nuked for {symbol}")
+
+            # 2. Handle algo orders (STOP/TP/TRAILING) — smart detection + accurate logs
+            try:
+                resp = self.send_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
+                algo_orders = resp if isinstance(resp, list) else []
+                
+                if not algo_orders:
+                    log(f"[ZOMBIE KILLER] No algo orders found — clean")
+                    return
+
+                log(f"[ZOMBIE KILLER] Found {len(algo_orders)} algo order(s) → TERMINATING")
+                for order in algo_orders:
+                    algo_id = order.get("algoId")
+                    order_type = order.get("orderType", "ALGO")
+                    if algo_id:
+                        self.send_signed_request("DELETE", "/fapi/v1/algoOrder", {
+                            "symbol": symbol,
+                            "algoId": str(algo_id)
+                        })
+                        log(f"[ZOMBIE KILLER] TERMINATED {order_type} algoId={algo_id}")
+                        time.sleep(0.1)  # Rate limit safety
+
+            except Exception as e:
+                log(f"[ZOMBIE KILLER] Algo cleanup failed: {e}")
+
         except Exception as e:
-            log(f"Failed to cancel open orders: {e}")
+            log(f"[ZOMBIE KILLER] Critical failure: {e}")
+    
 
     def cancel_order(self, symbol: str, order_id: int):
         params = {"symbol": symbol, "orderId": order_id}
@@ -1157,23 +1211,7 @@ def debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, tel
     except Exception as e:
         log(f"Recovery failed: {e}", telegram_bot, telegram_chat_id)
     return
-
-def force_cancel_all_orders(client, symbol, telegram_bot=None, telegram_chat_id=None):
-    """Cancel every single open order, even the stubborn reduceOnly ones Binance loves to protect."""
-    try:
-        open_orders = client.get_open_orders(symbol)
-        if not open_orders:
-            return
-        log(f"Found {len(open_orders)} zombie order(s). Executing purge...", telegram_bot, telegram_chat_id)
-        for order in open_orders:
-            try:
-                client.cancel_order(symbol, order["orderId"])
-                log(f"Killed zombie order {order['orderId']} ({order.get('type')}) @ {order.get('stopPrice', 'market')}", telegram_bot, telegram_chat_id)
-                time.sleep(0.25)  # Be gentle with rate limits
-            except Exception as e:
-                log(f"Zombie {order['orderId']} refused to die: {e} – moving on", telegram_bot, telegram_chat_id)
-    except Exception as e:
-        log(f"Zombie apocalypse failed: {e}", telegram_bot, telegram_chat_id)
+        
 
 # === PRIVATE HELPERS (DRY + SAFE) ===
 def _calc_sl_price(entry, side, tick_size):
@@ -1422,6 +1460,12 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                             R_float
                         )
 
+                        # --- ENHANCED CONSOLE LOG (YOUR REQUEST) ---
+                        log(f"Position closed by {reason}", telegram_bot, telegram_chat_id)
+                        log(f"Entry: {entry_price_safe:.4f} → Exit: {exit_price_f:.4f} | "
+                            f"PNL: {pnl_row['pnl_usd']:.2f} USDT ({pnl_row['pnl_r']:.2f}R)", 
+                            telegram_bot, telegram_chat_id)
+
                         # --- Send Telegram ---
                         send_closure_telegram(
                             symbol, trade_state.side,
@@ -1432,10 +1476,8 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                         )
 
                         # --- Cancel remaining orders – ANGRY BOUNCER EDITION ---
-                        force_cancel_all_orders(client, symbol, telegram_bot, telegram_chat_id)
-                        
-                        # Log that we cleaned up (you wanted this saved)
-                        log(f"Cancelled all remaining open orders. Exit reason: {reason}", telegram_bot, telegram_chat_id)
+                        client.cancel_all_open_orders(symbol)
+                        log("[ZOMBIE KILLER] Nuclear strike executed — all ghosts eliminated", telegram_bot, telegram_chat_id)
                         
                         # Prevent double-cancellation spam
                         _orders_cancelled = True
@@ -1705,7 +1747,6 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 tp_price_f = float(tp_price_dec_quant)
                 trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, tick_size, ROUND_DOWN if buy_signal else ROUND_UP)
 
-                force_cancel_all_orders(client, symbol, telegram_bot, telegram_chat_id)
                 log(f"Sending MARKET {side_text} order: qty={qty_api}", telegram_bot, telegram_chat_id)
                 order_res = client.send_signed_request("POST", "/fapi/v1/order", {
                     "symbol": symbol, "side": side_text, "type": "MARKET", "quantity": str(qty_api)
@@ -1791,10 +1832,38 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 if not pending_entry:
                     log("No trade signal on candle close.", telegram_bot, telegram_chat_id)
 
-            next_close_ms = latest_close_ms + interval_ms(timeframe)
-            wait_sec = max(1.0, (next_close_ms - int(time.time()*1000)) / 1000.0 + 2)
-            next_dt = datetime.fromtimestamp(next_close_ms / 1000, tz=timezone.utc)
-            log(f"Waiting for next {timeframe} candle close in {wait_sec:.1f}s → {next_dt.strftime('%H:%M')} UTC", telegram_bot, telegram_chat_id)
+            # === PERFECT 45m WAIT — ALWAYS CORRECT GRID, ALWAYS ~2699s ===
+            if timeframe == "45m":
+                # Force standard 45m grid (:14, :59, :44)
+                boundaries = [14, 59, 44]
+                now_dt = datetime.now(timezone.utc)
+                hour = now_dt.hour
+                minute = now_dt.minute
+
+                next_minute = None
+                for m in boundaries:
+                    if minute < m:
+                        next_minute = m
+                        break
+                if next_minute is None:
+                    hour = (hour + 1) % 24
+                    next_minute = 14
+
+                next_dt = now_dt.replace(minute=next_minute, second=0, microsecond=0)
+                if next_dt <= now_dt:
+                    next_dt += timedelta(hours=1)
+                    next_dt = next_dt.replace(minute=14)
+
+                next_close_ms = int(next_dt.timestamp() * 1000)
+            else:
+                # Native Binance alignment for 5m, 30m, etc.
+                server_time = int(time.time() * 1000)
+                interval = interval_ms(timeframe)
+                next_close_ms = ((server_time // interval) * interval) + interval
+
+            wait_sec = max(2.0, (next_close_ms - int(time.time() * 1000)) / 1000.0 + 2.0)
+            next_dt_log = datetime.fromtimestamp(next_close_ms / 1000, tz=timezone.utc)
+            log(f"Waiting for next {timeframe} candle close in {wait_sec:.1f}s → {next_dt_log.strftime('%H:%M')} UTC", telegram_bot, telegram_chat_id)
             _safe_sleep(wait_sec)
 
 
