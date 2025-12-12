@@ -894,7 +894,7 @@ def aggregate_klines_to_45m(klines_15m):
                     ])
                 break
         # Stop once we have enough history (we only need ~100 candles)
-        if len(aggregated) >= 100:
+        if len(aggregated) >= 500:
             break
 
     aggregated.reverse()
@@ -1039,22 +1039,43 @@ def fetch_klines(client, symbol, interval, limit=max(500, VOL_SMA_PERIOD * 3)):
     
 def ensure_tv_quality_data(klines, timeframe):
     """
-    Quick check if we have TradingView-quality data
+    Enhanced check for TradingView-quality data, including sequential gap detection.
+    Returns (is_good: bool, message: str)
     """
     if not klines:
         return False, "No data"
-    
-    # TradingView shows ~500 candles minimum
-    if len(klines) < 100:
-        return False, f"Only {len(klines)} candles (TV shows 500+)"
-    
-    # Check recent candles are valid - FIXED INDEXING
-    for i in range(max(0, len(klines)-3), len(klines)):  # Fixed: direct indexing
-        candle = klines[i]
-        if float(candle[4]) <= 0:  # Close price
-            return False, f"Invalid price in candle {i}"
-    
-    return True, f"OK: {len(klines)} candles"
+
+    # Minimum candles (adjustable - TV loads hundreds, but 100-200 is plenty for reliable indicators)
+    min_candles = 200 if timeframe == "45m" else 300  # More for native shorter TFs
+    if len(klines) < min_candles:
+        return False, f"Only {len(klines)} candles (need {min_candles}+ for TV-like quality)"
+
+    interval = interval_ms(timeframe)
+
+    # --- GAP / SEQUENTIAL CHECK (focus on recent 50-100 candles to avoid old history noise) ---
+    check_recent = min(100, len(klines))
+    max_allowed_gap_ms = 300000  # 5 minutes - flag anything larger (covers extreme drift/rare issues)
+    for i in range(len(klines) - check_recent + 1, len(klines)):  # Only recent ones
+        if i == 0:
+            continue  # Skip first (no previous)
+        prev_close_ms = int(klines[i-1][6])
+        curr_open_ms = int(klines[i][0])
+        expected_open_ms = prev_close_ms + interval
+        diff_ms = curr_open_ms - expected_open_ms
+        if abs(diff_ms) > max_allowed_gap_ms:
+            diff_min = diff_ms / 1000 / 60
+            return False, f"Gap detected at candle {i}: {diff_min:.1f} min diff (expected sequential)"
+
+    # --- PRICE VALIDATION (recent candles) ---
+    recent = klines[-20:]  # Last 20 candles
+    for idx, candle in enumerate(recent):
+        close = float(candle[4])
+        open_p = float(candle[1])
+        if close <= 0 or open_p <= 0:
+            global_idx = len(klines) - len(recent) + idx
+            return False, f"Invalid price (zero/negative) in candle {global_idx}"
+
+    return True, f"OK: {len(klines)} sequential candles, no gaps"
 def fetch_balance(client: BinanceClient):
     try:
         data = client.send_signed_request("GET", "/fapi/v2/account")
@@ -1616,18 +1637,30 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             current_balance = fetch_balance(client)
             log(f"Risk allowed: {BASE_RISK_PCT:.3%}", telegram_bot, telegram_chat_id)
 
-            # === FETCH KLINES & ALIGN ===
+            # === FETCH KLINES & VALIDATE QUALITY ===
             klines = fetch_klines(client, symbol, timeframe)
-            if len(klines) < 50:
+
+            is_good, msg = ensure_tv_quality_data(klines, timeframe)
+            if not is_good:
+                log(f"Data quality failed: {msg}. Skipping this cycle.", telegram_bot, telegram_chat_id)
                 time.sleep(10)
                 continue
 
             latest_close_ms = int(klines[-1][6])
 
+            # Optional: Warn if data appears stale (non-blocking, just visibility)
+            now_ms = int(time.time() * 1000)
+            stale_minutes = (now_ms - latest_close_ms) / 60000
+            if stale_minutes > 90:  # More than 1.5 hours behind → likely connection issue
+                log(f"⚠️ Warning: Latest candle is {stale_minutes:.1f} minutes old — possible delay in data feed", 
+                    telegram_bot, telegram_chat_id)
+
+            # === ALIGN TO NEW CANDLE CLOSE ===
             if hasattr(trading_loop, "last_processed_close_ms") and latest_close_ms <= trading_loop.last_processed_close_ms:
-                wait_sec = max(1.0, (latest_close_ms + interval_ms(timeframe) - int(time.time()*1000)) / 1000.0 + 2)
+                wait_sec = max(1.0, (latest_close_ms + interval_ms(timeframe) - int(time.time() * 1000)) / 1000.0 + 2)
                 next_dt = datetime.fromtimestamp((latest_close_ms + interval_ms(timeframe)) / 1000, tz=timezone.utc)
-                log(f"Waiting for next {timeframe} candle close in {wait_sec:.1f}s → {next_dt.strftime('%H:%M')} UTC", telegram_bot, telegram_chat_id)
+                log(f"Waiting for next {timeframe} candle close in {wait_sec:.1f}s → {next_dt.strftime('%H:%M')} UTC", 
+                    telegram_bot, telegram_chat_id)
                 _safe_sleep(wait_sec)
                 continue
 
@@ -1635,7 +1668,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
 
             dt = datetime.fromtimestamp(latest_close_ms / 1000, tz=timezone.utc)
             log(f"Aligned to {timeframe} candle close: {dt.strftime('%H:%M')} UTC", telegram_bot, telegram_chat_id)
-
+            
             close_price = Decimal(str(klines[-1][4]))
             open_price  = Decimal(str(klines[-1][1]))
             curr_vol    = float(klines[-1][5])
@@ -1660,18 +1693,57 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 entry_price = close_price
                 entry_price_f = float(entry_price)
 
-                # === SLIPPAGE GUARD ===
-                MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")
+                                # === SLIPPAGE GUARD (IMPROVED) ===
+                MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")  # 0.2%
+                entry_price_dec = entry_price  # candle close price (Decimal)
+
+                slippage_pct = None
+                current_price = None
+                source = ""
+
                 try:
-                    mark_data = client.public_request("/fapi/v1/premiumIndex", {"symbol": symbol})
-                    mark_price = Decimal(str(mark_data["markPrice"]))
-                    slippage_pct = abs(mark_price - entry_price) / entry_price
-                    if slippage_pct > MAX_ENTRY_SLIPPAGE_PCT:
-                        log(f"ENTRY SKIPPED: Slippage {float(slippage_pct*100):.3f}% > 0.2%", telegram_bot, telegram_chat_id)
-                        pending_entry = False
-                        continue
-                except Exception as e:
-                    log(f"Slippage check failed: {e}. Proceeding.", telegram_bot, telegram_chat_id)
+                    # Primary: Real-time executable price from best bid/ask
+                    ticker = client.public_request("/fapi/v1/ticker/bookTicker", {"symbol": symbol})
+                    bid = Decimal(str(ticker.get("bidPrice") or "0"))
+                    ask = Decimal(str(ticker.get("askPrice") or "0"))
+
+                    if bid > 0 and ask > 0:
+                        current_price = (bid + ask) / 2
+                        slippage_pct = abs(current_price - entry_price_dec) / entry_price_dec
+                        source = "bookTicker midpoint"
+                    else:
+                        raise ValueError("Invalid bid/ask prices")
+
+                except Exception as e1:
+                    # Fallback: Use mark price
+                    log(f"bookTicker failed ({e1}), falling back to mark price.", telegram_bot, telegram_chat_id)
+                    try:
+                        mark_data = client.public_request("/fapi/v1/premiumIndex", {"symbol": symbol})
+                        current_price = Decimal(str(mark_data["markPrice"]))
+                        slippage_pct = abs(current_price - entry_price_dec) / entry_price_dec
+                        source = "mark price (fallback)"
+                    except Exception as e2:
+                        log(f"Mark price also failed ({e2}). Proceeding without slippage guard.", telegram_bot, telegram_chat_id)
+                        slippage_pct = Decimal("0")  # Allow entry if both endpoints fail
+                        source = "none (disabled)"
+
+                # Final decision
+                if slippage_pct > MAX_ENTRY_SLIPPAGE_PCT:
+                    log(
+                        f"ENTRY SKIPPED: Estimated slippage {float(slippage_pct*100):.3f}% > 0.2% "
+                        f"[{source}]\n"
+                        f"   Candle close: {float(entry_price_dec):.4f} → Current: {float(current_price):.4f}",
+                        telegram_bot, telegram_chat_id
+                    )
+                    pending_entry = False
+                    continue
+                else:
+                    log(
+                        f"Slippage check passed: {float(slippage_pct*100):.3f}% "
+                        f"[{source}]\n"
+                        f"   Close: {float(entry_price_dec):.4f} → Current: {float(current_price):.4f}",
+                        telegram_bot, telegram_chat_id
+                    )
 
                 # === CALCULATE RISK & LEVELS ===
                 if buy_signal:
@@ -1809,42 +1881,31 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
 
             # === PERFECT 45m WAIT — BINANCE SERVER TIME ALIGNED ===
             if timeframe == "45m":
-                # get Binance server time (ms) and convert to UTC datetime
-                server_time = client.public_request("/fapi/v1/time")["serverTime"]
-                now_dt = datetime.fromtimestamp(server_time / 1000, tz=timezone.utc)
+                try:
+                    # get Binance server time (ms)
+                    server_time = int(client.public_request("/fapi/v1/time")["serverTime"])
+                except Exception as e:
+                    log(f"Failed to fetch server time: {e}", telegram_bot, telegram_chat_id)
+                    # fallback to local time
+                    server_time = int(time.time() * 1000)
 
-                # 45m grid boundaries
-                boundaries = [14, 59, 44]
-
-                # pick the next boundary (minute mark)
-                next_minute = next((m for m in boundaries if now_dt.minute < m), None)
-
-                if next_minute is None:
-                    # passed all minutes: next hour at :14
-                    next_dt = (now_dt + timedelta(hours=1)).replace(
-                        minute=14, second=0, microsecond=0
-                    )
-                else:
-                    next_dt = now_dt.replace(
-                        minute=next_minute, second=0, microsecond=0
-                    )
-                    # safety: if equal/past, jump to next hour at :14
-                    if next_dt <= now_dt:
-                        next_dt = (now_dt + timedelta(hours=1)).replace(
-                            minute=14, second=0, microsecond=0
-                        )
-
-                # convert to ms
-                next_close_ms = int(next_dt.timestamp() * 1000)
+                # true 45-minute grid using server time
+                interval = interval_ms(timeframe)
+                next_close_ms = ((server_time // interval) * interval) + interval
 
             else:
-                # Native Binance alignment for real timeframes
-                server_time = client.public_request("/fapi/v1/time")["serverTime"]
+                # Native Binance alignment for other timeframes
+                try:
+                    server_time = int(client.public_request("/fapi/v1/time")["serverTime"])
+                except Exception as e:
+                    log(f"Failed to fetch server time: {e}", telegram_bot, telegram_chat_id)
+                    server_time = int(time.time() * 1000)
+
                 interval = interval_ms(timeframe)
                 next_close_ms = ((server_time // interval) * interval) + interval
 
             # === WAIT ===
-            now_ms = client.public_request("/fapi/v1/time")["serverTime"]
+            now_ms = int(time.time() * 1000)
             wait_sec = max(2.0, (next_close_ms - now_ms) / 1000.0 + 2.0)
 
             next_dt_log = datetime.fromtimestamp(next_close_ms / 1000, tz=timezone.utc)
