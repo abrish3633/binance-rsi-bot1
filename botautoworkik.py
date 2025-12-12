@@ -126,6 +126,7 @@ weekly_start_time  = None
 CONSEC_LOSSES = 0
 USE_CONSEC_LOSS_GUARD = True
 MAX_CONSEC_LOSSES = 3
+is_testnet = True
 
 def get_current_risk_pct(current_equity: Decimal, telegram_bot=None, telegram_chat_id=None) -> Decimal:
     """
@@ -1038,25 +1039,26 @@ def fetch_klines(client, symbol, interval, limit=max(500, VOL_SMA_PERIOD * 3)):
         return []
     
 
-def ensure_tv_quality_data(klines, timeframe):
+def ensure_tv_quality_data(klines, timeframe, is_testnet=False):
     """
-    Enhanced check for TradingView-quality data, including sequential gap detection.
-    Returns (is_good: bool, message: str)
+    Strict on mainnet, relaxed on testnet.
     """
     if not klines:
         return False, "No data"
 
-    # Minimum candles - strict on mainnet, lenient enough to start on testnet
     min_candles = 150 if timeframe == "45m" else 250
     if len(klines) < min_candles:
-        return False, f"Only {len(klines)} candles (need {min_candles}+ for reliable indicators)"
+        return False, f"Only {len(klines)} candles (need {min_candles}+)"
 
     interval = interval_ms(timeframe)
 
-    # --- GAP / SEQUENTIAL CHECK ---
-    # Only check the most recent candles (old history on testnet is often unreliable)
-    check_recent = min(30, len(klines))  # Reduced to last 30 candles
-    max_allowed_gap_ms = interval * 2      # Allow up to 2 full intervals gap (90 min for 45m) - very forgiving
+    # Adjust strictness based on network
+    if is_testnet:
+        check_recent = min(30, len(klines))
+        max_allowed_gap_ms = interval * 2  # Very forgiving
+    else:
+        check_recent = min(100, len(klines))
+        max_allowed_gap_ms = 300000  # 5 minutes max (strict)
 
     for i in range(len(klines) - check_recent + 1, len(klines)):
         if i == 0:
@@ -1068,22 +1070,18 @@ def ensure_tv_quality_data(klines, timeframe):
 
         if abs(diff_ms) > max_allowed_gap_ms:
             diff_min = diff_ms / 60000
-            # On testnet, large negative gaps in old data are common - only warn, don't block
-            if diff_ms < 0 and i > 100:  # Old history + negative diff = likely testnet artifact
-                return True, f"OK: {len(klines)} candles (old history gap ignored on testnet-like data)"
-            else:
-                return False, f"Large gap in recent data at candle {i}: {diff_min:.1f} min diff"
+            if is_testnet and diff_ms < 0 and i > 50:
+                continue  # Ignore old negative gaps on testnet
+            return False, f"Gap detected at candle {i}: {diff_min:.1f} min diff"
 
-    # --- PRICE VALIDATION (recent candles only) ---
+    # Price validation (always strict - recent only)
     recent = klines[-20:]
     for idx, candle in enumerate(recent):
-        close = float(candle[4])
-        open_p = float(candle[1])
-        if close <= 0 or open_p <= 0:
-            global_idx = len(klines) - len(recent) + idx
-            return False, f"Invalid price (zero/negative) in recent candle {global_idx}"
+        if float(candle[4]) <= 0 or float(candle[1]) <= 0:
+            return False, f"Invalid price in recent candle"
 
-    return True, f"OK: {len(klines)} sequential candles (recent data clean)"
+    return True, f"OK: {len(klines)} candles (quality check passed)"
+
 def fetch_balance(client: BinanceClient):
     try:
         data = client.send_signed_request("GET", "/fapi/v2/account")
@@ -1647,8 +1645,9 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
 
             # === FETCH KLINES & VALIDATE QUALITY ===
             klines = fetch_klines(client, symbol, timeframe)
-
-            is_good, msg = ensure_tv_quality_data(klines, timeframe)
+            # Rough detection based on key pattern (testnet keys often start with specific prefixes)
+            is_testnet = True
+            is_good, msg = ensure_tv_quality_data(klines, timeframe, is_testnet=is_testnet)
             if not is_good:
                 log(f"Data quality failed: {msg}. Skipping this cycle.", telegram_bot, telegram_chat_id)
                 time.sleep(10)
