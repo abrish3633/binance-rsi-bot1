@@ -379,31 +379,6 @@ def check_volatility_abort(klines: list, period: int = 14) -> bool:
     mean20 = np.mean(tr[-20:])
     return atr > mean20 * 3.0
 
-def get_next_45m_close_ms(current_ms: int) -> int:
-    """Return the next standard 45m candle close time (xx:14, xx:59, xx:44 UTC)."""
-    dt = datetime.fromtimestamp(current_ms / 1000, tz=timezone.utc)
-    
-    boundaries = [14, 59, 44]  # standard 45m grid
-    
-    hour = dt.hour
-    minute = dt.minute
-    
-    next_minute = None
-    for m in boundaries:
-        if minute < m:
-            next_minute = m
-            break
-    
-    if next_minute is None:
-        hour = (hour + 1) % 24
-        next_minute = 14
-    
-    next_dt = dt.replace(hour=hour, minute=next_minute, second=0, microsecond=0)
-    if next_dt <= dt:
-        next_dt += timedelta(hours=1)
-        next_dt = next_dt.replace(minute=14)
-    
-    return int(next_dt.timestamp() * 1000)
 # ------------------- PNL LOGGING -------------------
 def init_pnl_log():
     if not os.path.exists(PNL_LOG_FILE):
@@ -1832,39 +1807,55 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 if not pending_entry:
                     log("No trade signal on candle close.", telegram_bot, telegram_chat_id)
 
-            # === PERFECT 45m WAIT — ALWAYS CORRECT GRID, ALWAYS ~2699s ===
+            # === PERFECT 45m WAIT — BINANCE SERVER TIME ALIGNED ===
             if timeframe == "45m":
-                # Force standard 45m grid (:14, :59, :44)
+                # get Binance server time (ms) and convert to UTC datetime
+                server_time = client.public_request("/fapi/v1/time")["serverTime"]
+                now_dt = datetime.fromtimestamp(server_time / 1000, tz=timezone.utc)
+
+                # 45m grid boundaries
                 boundaries = [14, 59, 44]
-                now_dt = datetime.now(timezone.utc)
-                hour = now_dt.hour
-                minute = now_dt.minute
 
-                next_minute = None
-                for m in boundaries:
-                    if minute < m:
-                        next_minute = m
-                        break
+                # pick the next boundary (minute mark)
+                next_minute = next((m for m in boundaries if now_dt.minute < m), None)
+
                 if next_minute is None:
-                    hour = (hour + 1) % 24
-                    next_minute = 14
+                    # passed all minutes: next hour at :14
+                    next_dt = (now_dt + timedelta(hours=1)).replace(
+                        minute=14, second=0, microsecond=0
+                    )
+                else:
+                    next_dt = now_dt.replace(
+                        minute=next_minute, second=0, microsecond=0
+                    )
+                    # safety: if equal/past, jump to next hour at :14
+                    if next_dt <= now_dt:
+                        next_dt = (now_dt + timedelta(hours=1)).replace(
+                            minute=14, second=0, microsecond=0
+                        )
 
-                next_dt = now_dt.replace(minute=next_minute, second=0, microsecond=0)
-                if next_dt <= now_dt:
-                    next_dt += timedelta(hours=1)
-                    next_dt = next_dt.replace(minute=14)
-
+                # convert to ms
                 next_close_ms = int(next_dt.timestamp() * 1000)
+
             else:
-                # Native Binance alignment for 5m, 30m, etc.
-                server_time = int(time.time() * 1000)
+                # Native Binance alignment for real timeframes
+                server_time = client.public_request("/fapi/v1/time")["serverTime"]
                 interval = interval_ms(timeframe)
                 next_close_ms = ((server_time // interval) * interval) + interval
 
-            wait_sec = max(2.0, (next_close_ms - int(time.time() * 1000)) / 1000.0 + 2.0)
+            # === WAIT ===
+            now_ms = client.public_request("/fapi/v1/time")["serverTime"]
+            wait_sec = max(2.0, (next_close_ms - now_ms) / 1000.0 + 2.0)
+
             next_dt_log = datetime.fromtimestamp(next_close_ms / 1000, tz=timezone.utc)
-            log(f"Waiting for next {timeframe} candle close in {wait_sec:.1f}s → {next_dt_log.strftime('%H:%M')} UTC", telegram_bot, telegram_chat_id)
+            log(
+                f"Waiting for next {timeframe} candle close in {wait_sec:.1f}s → "
+                f"{next_dt_log.strftime('%H:%M')} UTC",
+                telegram_bot,
+                telegram_chat_id
+            )
             _safe_sleep(wait_sec)
+
 
 
         except Exception as e:
