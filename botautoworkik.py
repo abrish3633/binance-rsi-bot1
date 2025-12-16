@@ -804,7 +804,7 @@ class BinanceClient:
             params["triggerPrice"] = str(trigger_price)     # ← Docs confirm: triggerPrice for SL/TP
             params["workingType"] = "CONTRACT_PRICE"
         if activation_price is not None:
-            params["activationPrice"] = str(activation_price)
+            params["activatePrice"] = str(activation_price)
         if callback_rate is not None:
             params["callbackRate"] = str(callback_rate)
 
@@ -922,6 +922,7 @@ def get_symbol_filters(client: BinanceClient, symbol: str):
 
 # ------------------- ORDERS (REUSABLE) -------------------
 def place_orders(client, symbol, trade_state, tick_size, telegram_bot=None, telegram_chat_id=None):
+    log(f"DEBUG: place_orders received trail_activation_price = {trade_state.trail_activation_price}", telegram_bot, telegram_chat_id)
     """
     Places SL, TP, and Trailing Stop orders.
     Relies on trade_state having:
@@ -958,6 +959,7 @@ def place_orders(client, symbol, trade_state, tick_size, telegram_bot=None, tele
 
     # === USE PRE-CALCULATED TRAIL ACTIVATION (set in trading_loop with actual fill + buffer + correct rounding) ===
     trail_activation_price_quant = Decimal(str(trade_state.trail_activation_price))
+    log(f"DEBUG: Sending activation_price to Binance = {float(trail_activation_price_quant):.4f}", telegram_bot, telegram_chat_id)
 
     # === OPTIONAL: FINAL VALIDATION AGAINST CURRENT MARKET PRICE ===
     try:
@@ -1920,7 +1922,6 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 telegram_post(telegram_bot, telegram_chat_id, tg_msg)
 
                 # === PLACE PROTECTIVE ORDERS (now uses correct trail_activation_price from trade_state) ===
-                log(f"DEBUG: Sending activation_price to Binance = {float(trail_activation_price_quant):.4f}", telegram_bot, telegram_chat_id)
                 log(f"DEBUG: place_orders received trail_activation_price = {trade_state.trail_activation_price}", telegram_bot, telegram_chat_id)
                 place_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
 
