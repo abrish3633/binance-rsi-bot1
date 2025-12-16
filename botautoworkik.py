@@ -1700,7 +1700,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 entry_price = close_price
                 entry_price_f = float(entry_price)
 
-                                # === SLIPPAGE GUARD (IMPROVED) ===
+                # === SLIPPAGE GUARD (IMPROVED) ===
                 MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")  # 0.2%
                 entry_price_dec = entry_price  # candle close price (Decimal)
 
@@ -1752,23 +1752,19 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                         telegram_bot, telegram_chat_id
                     )
 
-                # === CALCULATE RISK & LEVELS ===
+                # === CALCULATE RISK & LEVELS (based on candle close price — for qty and initial checks only) ===
                 if buy_signal:
                     sl_price_dec = entry_price * (Decimal("1") - SL_PCT)
                     R = entry_price * SL_PCT
                     tp_price_dec = entry_price + (TP_MULT * R)
-                    trail_activation_price_dec = entry_price + (TRAIL_TRIGGER_MULT * R)
                     sl_rounding = ROUND_DOWN
                     tp_rounding = ROUND_UP
-                    trail_rounding = ROUND_DOWN
                 else:
                     sl_price_dec = entry_price * (Decimal("1") + SL_PCT)
                     R = entry_price * SL_PCT
                     tp_price_dec = entry_price - (TP_MULT * R)
-                    trail_activation_price_dec = entry_price - (TRAIL_TRIGGER_MULT * R)
                     sl_rounding = ROUND_UP
                     tp_rounding = ROUND_DOWN
-                    trail_rounding = ROUND_UP
 
                 if R <= Decimal('0'):
                     log("Invalid R. Skipping.", telegram_bot, telegram_chat_id)
@@ -1795,18 +1791,17 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 log(f"Balance: ${float(current_balance):.2f}", telegram_bot, telegram_chat_id)
                 log(f"===== END ENTRY DETAILS =====", telegram_bot, telegram_chat_id)
 
-                sl_price_dec_quant = quantize_price(sl_price_dec, tick_size, sl_rounding)
-                sl_price_f = float(sl_price_dec_quant)
-                tp_price_dec_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
-                tp_price_f = float(tp_price_dec_quant)
-                trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, tick_size, ROUND_DOWN if buy_signal else ROUND_UP)
-
+                # === PLACE MARKET ORDER ===
                 log(f"Sending MARKET {side_text} order: qty={qty_api}", telegram_bot, telegram_chat_id)
                 order_res = client.send_signed_request("POST", "/fapi/v1/order", {
-                    "symbol": symbol, "side": side_text, "type": "MARKET", "quantity": str(qty_api)
+                    "symbol": symbol,
+                    "side": side_text,
+                    "type": "MARKET",
+                    "quantity": str(qty_api)
                 })
                 log(f"Market order placed: {order_res}", telegram_bot, telegram_chat_id)
 
+                # === WAIT FOR POSITION TO APPEAR ===
                 start_time = time.time()
                 actual_qty = None
                 while not STOP_REQUESTED:
@@ -1825,32 +1820,42 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     pending_entry = False
                     continue
 
+                # === GET ACTUAL FILL PRICE ===
                 actual_fill_price = client.get_latest_fill_price(symbol, order_res.get("orderId"))
                 if actual_fill_price is None:
                     actual_fill_price = entry_price
                 actual_fill_price_f = float(actual_fill_price)
-                actual_fill_price = Decimal(str(actual_fill_price_f))
+                actual_fill_price_dec = Decimal(str(actual_fill_price_f))
+                actual_R = actual_fill_price_dec * SL_PCT  # Real 1R distance
 
-                # Recalc levels with real fill
-                if buy_signal:
-                    sl_price_dec = actual_fill_price * (Decimal("1") - SL_PCT)
-                    R = actual_fill_price * SL_PCT
-                    tp_price_dec = actual_fill_price + (TP_MULT * R)
-                    trail_activation_price_dec = actual_fill_price + (TRAIL_TRIGGER_MULT * R)
-                else:
-                    sl_price_dec = actual_fill_price * (Decimal("1") + SL_PCT)
-                    R = actual_fill_price * SL_PCT
-                    tp_price_dec = actual_fill_price - (TP_MULT * R)
-                    trail_activation_price_dec = actual_fill_price - (TRAIL_TRIGGER_MULT * R)
+                # === RECALCULATE SL, TP, AND TRAILING ACTIVATION USING ACTUAL FILL PRICE ===
+                if buy_signal:  # LONG
+                    sl_price_raw = actual_fill_price_dec * (Decimal("1") - SL_PCT)
+                    tp_price_raw = actual_fill_price_dec + (TP_MULT * actual_R)
 
-                sl_price_f = float(quantize_price(sl_price_dec, tick_size, sl_rounding))
-                tp_price_f = float(quantize_price(tp_price_dec, tick_size, tp_rounding))
-                trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, tick_size, ROUND_DOWN if buy_signal else ROUND_UP)
+                    # Trailing activation: 1.25R ABOVE entry → safe distance
+                    trail_activation_raw = actual_fill_price_dec + (TRAIL_TRIGGER_MULT * actual_R)
+                    trail_activation_quant = quantize_price(trail_activation_raw, tick_size, ROUND_UP)
+                else:  # SHORT
+                    sl_price_raw = actual_fill_price_dec * (Decimal("1") + SL_PCT)
+                    tp_price_raw = actual_fill_price_dec - (TP_MULT * actual_R)
 
-                # === ACTIVATE TRADE ===
+                    # Trailing activation: 1.25R BELOW entry → safe distance
+                    trail_activation_raw = actual_fill_price_dec - (TRAIL_TRIGGER_MULT * actual_R)
+                    trail_activation_quant = quantize_price(trail_activation_raw, tick_size, ROUND_DOWN)
+
+                # Quantize SL and TP
+                sl_price_quant = quantize_price(sl_price_raw, tick_size, ROUND_DOWN if buy_signal else ROUND_UP)
+                tp_price_quant = quantize_price(tp_price_raw, tick_size, ROUND_UP if buy_signal else ROUND_DOWN)
+
+                sl_price_f = float(sl_price_quant)
+                tp_price_f = float(tp_price_quant)
+                trail_activation_f = float(trail_activation_quant)
+
+                # === ACTIVATE TRADE STATE ===
                 trade_state.active = True
                 trade_state.entry_price = actual_fill_price_f
-                trade_state.risk = float(R)
+                trade_state.risk = float(actual_R)
                 trade_state.qty = float(actual_qty)
                 trade_state.side = "LONG" if buy_signal else "SHORT"
                 trade_state.entry_close_time = latest_close_ms
@@ -1858,10 +1863,13 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 trade_state.sl = sl_price_f
                 trade_state.tp = tp_price_f
                 trade_state.trail_activated = False
-                trade_state.trail_activation_price = float(trail_activation_price_dec_quant)
+                trade_state.trail_activation_price = trail_activation_f
 
-                log(f"Position opened: {trade_state.side}, qty={actual_qty}, entry={actual_fill_price_f:.4f}, sl={sl_price_f:.4f}, tp={tp_price_f:.4f}", telegram_bot, telegram_chat_id)
+                log(f"Position opened: {trade_state.side}, qty={actual_qty}, entry={actual_fill_price_f:.4f}, "
+                    f"sl={sl_price_f:.4f}, tp={tp_price_f:.4f}, trail_activation={trail_activation_f:.4f}", 
+                    telegram_bot, telegram_chat_id)
 
+                # === TELEGRAM NOTIFICATION (now shows CORRECT trailing activation) ===
                 tg_msg = (
                     f"NEW TRADE\n"
                     f"━━━━━━━━━━━━━━━━\n"
@@ -1870,22 +1878,20 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     f"Qty: {float(actual_qty):.5f} SOL\n"
                     f"SL: {sl_price_f:.4f}\n"
                     f"TP: {tp_price_f:.4f} ({TP_MULT}xR)\n"
-                    f"Trail Activation: {float(trail_activation_price_dec_quant):.4f}\n"
+                    f"Trail Activation: {trail_activation_f:.4f}\n"
                     f"Risk: {BASE_RISK_PCT:.1%} of equity\n"
                     f"━━━━━━━━━━━━━━━━"
                 )
                 telegram_post(telegram_bot, telegram_chat_id, tg_msg)
 
+                # === PLACE PROTECTIVE ORDERS (SL, TP, Trailing) ===
                 place_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
+
                 trades_today += 1
                 pending_entry = False
 
+                # === START MONITORING ===
                 monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, latest_close_ms)
-
-            else:
-                if not pending_entry:
-                    log("No trade signal on candle close.", telegram_bot, telegram_chat_id)
-
             # === PERFECT 45m WAIT — BINANCE SERVER TIME ALIGNED ===
             if timeframe == "45m":
                 try:
