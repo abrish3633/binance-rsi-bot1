@@ -922,86 +922,123 @@ def get_symbol_filters(client: BinanceClient, symbol: str):
 
 # ------------------- ORDERS (REUSABLE) -------------------
 def place_orders(client, symbol, trade_state, tick_size, telegram_bot=None, telegram_chat_id=None):
-    entry_price = Decimal(str(trade_state.entry_price or '0'))
+    """
+    Places SL, TP, and Trailing Stop orders.
+    Relies on trade_state having:
+      - entry_price (actual fill price)
+      - qty
+      - side ("LONG" or "SHORT")
+      - trail_activation_price (pre-calculated, quantized, buffered, correct direction)
+      - sl, tp (will be set here)
+    """
+    if not trade_state.active or not trade_state.entry_price or trade_state.trail_activation_price is None:
+        log("ERROR: place_orders called with incomplete trade_state (missing entry or trail activation)", telegram_bot, telegram_chat_id)
+        return
+
+    entry_price = Decimal(str(trade_state.entry_price))
     qty_dec = Decimal(str(trade_state.qty))
     close_side = "SELL" if trade_state.side == "LONG" else "BUY"
-    pos_side = trade_state.side
     R = entry_price * SL_PCT
+    callback_rate = TRAIL_DISTANCE_MULT * SL_PCT * Decimal('100')
+
+    # === RECALCULATE SL and TP with actual entry (safe, already correct in your code) ===
     if trade_state.side == "LONG":
         sl_price_dec = entry_price * (Decimal("1") - SL_PCT)
         sl_rounding = ROUND_DOWN
         tp_price_dec = entry_price + (TP_MULT * R)
         tp_rounding = ROUND_UP
-        trail_activation_price_dec = entry_price + (TRAIL_TRIGGER_MULT * R)
-    else:
+    else:  # SHORT
         sl_price_dec = entry_price * (Decimal("1") + SL_PCT)
         sl_rounding = ROUND_UP
         tp_price_dec = entry_price - (TP_MULT * R)
         tp_rounding = ROUND_DOWN
-        trail_activation_price_dec = entry_price - (TRAIL_TRIGGER_MULT * R)
-    sl_price_dec_quant = quantize_price(sl_price_dec, tick_size, sl_rounding)
-    tp_price_dec_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
-    trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, tick_size, ROUND_DOWN if trade_state.side == "LONG" else ROUND_UP)
-    callback_rate = TRAIL_DISTANCE_MULT * SL_PCT * Decimal('100')
-    
-    # === EMERGENCY SAFETY COUNTER ===
-    failures = 0
-    
-    # SL
+
+    sl_price_quant = quantize_price(sl_price_dec, tick_size, sl_rounding)
+    tp_price_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
+
+    # === USE PRE-CALCULATED TRAIL ACTIVATION (set in trading_loop with actual fill + buffer + correct rounding) ===
+    trail_activation_price_quant = Decimal(str(trade_state.trail_activation_price))
+
+    # === OPTIONAL: FINAL VALIDATION AGAINST CURRENT MARKET PRICE ===
     try:
-        sl_order = client.place_stop_market(symbol, close_side, qty_dec, sl_price_dec_quant, reduce_only=True, position_side=pos_side)
+        ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+        current_price = Decimal(str(ticker["price"]))
+        
+        if trade_state.side == "LONG" and trail_activation_price_quant <= current_price:
+            log(f"WARNING: Trailing activation {trail_activation_price_quant} <= current {current_price} for LONG — may trigger immediately!", telegram_bot, telegram_chat_id)
+            # You can choose to skip trailing or adjust, but proceed with warning
+        elif trade_state.side == "SHORT" and trail_activation_price_quant >= current_price:
+            log(f"WARNING: Trailing activation {trail_activation_price_quant} >= current {current_price} for SHORT — may trigger immediately!", telegram_bot, telegram_chat_id)
+    except Exception as e:
+        log(f"Could not fetch current price for trailing validation: {e}", telegram_bot, telegram_chat_id)
+
+    # === PLACE ORDERS ===
+    failures = 0
+
+    # Stop Loss
+    try:
+        sl_order = client.place_stop_market(
+            symbol, close_side, qty_dec, sl_price_quant,
+            reduce_only=True
+        )
         trade_state.sl_order_id = sl_order.get("orderId")
-        trade_state.sl_algo_id = sl_order.get("algoId")  # ← ADD THESE 3 LINES
-        trade_state.sl = float(sl_price_dec_quant)
-        log(f"Placed STOP_MARKET SL: {sl_order}", telegram_bot, telegram_chat_id)
+        trade_state.sl_algo_id = sl_order.get("algoId")
+        trade_state.sl = float(sl_price_quant)
+        log(f"Placed STOP_MARKET SL at {float(sl_price_quant):.4f}: {sl_order}", telegram_bot, telegram_chat_id)
     except Exception as e:
         failures += 1
         log(f"Failed to place SL: {str(e)}", telegram_bot, telegram_chat_id)
-    
-    # TP
+
+    # Take Profit
     try:
-        tp_order = client.place_take_profit_market(symbol, close_side, qty_dec, tp_price_dec_quant, reduce_only=True, position_side=pos_side)
+        tp_order = client.place_take_profit_market(
+            symbol, close_side, qty_dec, tp_price_quant,
+            reduce_only=True
+        )
         trade_state.tp_order_id = tp_order.get("orderId")
-        trade_state.tp_algo_id = tp_order.get("algoId")  # ← ADD THESE 3 LINES
-        trade_state.tp = float(tp_price_dec_quant)
-        log(f"Placed TAKE_PROFIT_MARKET TP: {tp_order}", telegram_bot, telegram_chat_id)
+        trade_state.tp_algo_id = tp_order.get("algoId")
+        trade_state.tp = float(tp_price_quant)
+        log(f"Placed TAKE_PROFIT_MARKET TP at {float(tp_price_quant):.4f}: {tp_order}", telegram_bot, telegram_chat_id)
     except Exception as e:
         failures += 1
         log(f"Failed to place TP: {str(e)}", telegram_bot, telegram_chat_id)
-    
-    # Trailing
+
+    # Trailing Stop — uses correct pre-calculated activation price
     try:
-        trail_order = client.place_trailing_stop_market(symbol, close_side, qty_dec, callback_rate, trail_activation_price_dec_quant, reduce_only=True, position_side=pos_side)
+        trail_order = client.place_trailing_stop_market(
+            symbol, close_side, qty_dec,
+            callback_rate=callback_rate,
+            activation_price=trail_activation_price_quant,
+            reduce_only=True
+        )
         trade_state.trail_order_id = trail_order.get("orderId")
         trade_state.trail_algo_id = trail_order.get("algoId")
-        trade_state.trail_activation_price = float(trail_activation_price_dec_quant)
-        log(f"Placed TRAILING_STOP_MARKET: {trail_order}", telegram_bot, telegram_chat_id)
+        # trail_activation_price already stored upstream, but confirm
+        trade_state.trail_activation_price = float(trail_activation_price_quant)
+        log(f"Placed TRAILING_STOP_MARKET (activation: {float(trail_activation_price_quant):.4f}, callback: {float(callback_rate):.2f}%): {trail_order}",
+            telegram_bot, telegram_chat_id)
     except Exception as e:
         failures += 1
         log(f"Failed to place trailing stop: {str(e)}", telegram_bot, telegram_chat_id)
-    
-    # === CRITICAL SAFETY: CLOSE IF ALL 3 FAIL ===
+
+    # === EMERGENCY: All protective orders failed ===
     if failures >= 3:
         emergency_msg = (
             f"🚨 EMERGENCY CLOSE: ALL PROTECTIVE ORDERS FAILED 🚨\n"
             f"Symbol: {symbol} | Side: {trade_state.side}\n"
             f"Entry: {trade_state.entry_price:.4f} | Qty: {trade_state.qty}\n"
-            f"Closing naked position IMMEDIATELY to prevent risk!"
+            f"Closing naked position IMMEDIATELY!"
         )
         log(emergency_msg, telegram_bot, telegram_chat_id)
-        if telegram_bot and telegram_chat_id:
-            telegram_post(telegram_bot, telegram_chat_id, emergency_msg)
-        
-        # Force close position
+        telegram_post(telegram_bot, telegram_chat_id, emergency_msg)
+
         try:
             _request_stop(symbol=symbol, telegram_bot=telegram_bot, telegram_chat_id=telegram_chat_id)
-            log(f"EMERGENCY: Position closed due to {failures} order failures.", telegram_bot, telegram_chat_id)
+            log("EMERGENCY: Position closed due to protective order failures.", telegram_bot, telegram_chat_id)
         except Exception as close_e:
             log(f"EMERGENCY CLOSE FAILED: {close_e} — MANUAL INTERVENTION REQUIRED!", telegram_bot, telegram_chat_id)
-        
-        # Reset trade state
+
         trade_state.active = False
-        return  # Exit early
 # ------------------- HELPER: KLINE DATA EXTRACTION -------------------
 def closes_and_volumes_from_klines(klines):
     closes = [float(k[4]) for k in klines]
@@ -1752,19 +1789,18 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                         telegram_bot, telegram_chat_id
                     )
 
-                # === CALCULATE RISK & LEVELS (based on candle close price — for qty and initial checks only) ===
+                # === CALCULATE RISK & LEVELS ===
+                                # === CALCULATE RISK & LEVELS (initial, based on candle close - only for qty/risk calc) ===
                 if buy_signal:
                     sl_price_dec = entry_price * (Decimal("1") - SL_PCT)
                     R = entry_price * SL_PCT
                     tp_price_dec = entry_price + (TP_MULT * R)
-                    sl_rounding = ROUND_DOWN
-                    tp_rounding = ROUND_UP
+                    trail_activation_price_dec = entry_price + (TRAIL_TRIGGER_MULT * R)
                 else:
                     sl_price_dec = entry_price * (Decimal("1") + SL_PCT)
                     R = entry_price * SL_PCT
                     tp_price_dec = entry_price - (TP_MULT * R)
-                    sl_rounding = ROUND_UP
-                    tp_rounding = ROUND_DOWN
+                    trail_activation_price_dec = entry_price - (TRAIL_TRIGGER_MULT * R)
 
                 if R <= Decimal('0'):
                     log("Invalid R. Skipping.", telegram_bot, telegram_chat_id)
@@ -1791,17 +1827,12 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 log(f"Balance: ${float(current_balance):.2f}", telegram_bot, telegram_chat_id)
                 log(f"===== END ENTRY DETAILS =====", telegram_bot, telegram_chat_id)
 
-                # === PLACE MARKET ORDER ===
                 log(f"Sending MARKET {side_text} order: qty={qty_api}", telegram_bot, telegram_chat_id)
                 order_res = client.send_signed_request("POST", "/fapi/v1/order", {
-                    "symbol": symbol,
-                    "side": side_text,
-                    "type": "MARKET",
-                    "quantity": str(qty_api)
+                    "symbol": symbol, "side": side_text, "type": "MARKET", "quantity": str(qty_api)
                 })
                 log(f"Market order placed: {order_res}", telegram_bot, telegram_chat_id)
 
-                # === WAIT FOR POSITION TO APPEAR ===
                 start_time = time.time()
                 actual_qty = None
                 while not STOP_REQUESTED:
@@ -1820,42 +1851,45 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     pending_entry = False
                     continue
 
-                # === GET ACTUAL FILL PRICE ===
                 actual_fill_price = client.get_latest_fill_price(symbol, order_res.get("orderId"))
                 if actual_fill_price is None:
                     actual_fill_price = entry_price
                 actual_fill_price_f = float(actual_fill_price)
-                actual_fill_price_dec = Decimal(str(actual_fill_price_f))
-                actual_R = actual_fill_price_dec * SL_PCT  # Real 1R distance
+                actual_fill_price_dec = actual_fill_price  # Keep as Decimal
 
-                # === RECALCULATE SL, TP, AND TRAILING ACTIVATION USING ACTUAL FILL PRICE ===
+                # === RECALCULATE ALL LEVELS WITH ACTUAL FILL PRICE ===
+                R = actual_fill_price_dec * SL_PCT
+
                 if buy_signal:  # LONG
-                    sl_price_raw = actual_fill_price_dec * (Decimal("1") - SL_PCT)
-                    tp_price_raw = actual_fill_price_dec + (TP_MULT * actual_R)
+                    sl_price_dec = actual_fill_price_dec * (Decimal("1") - SL_PCT)
+                    sl_rounding = ROUND_DOWN
+                    tp_price_dec = actual_fill_price_dec + (TP_MULT * R)
+                    tp_rounding = ROUND_UP
 
-                    # Trailing activation: 1.25R ABOVE entry → safe distance
-                    trail_activation_raw = actual_fill_price_dec + (TRAIL_TRIGGER_MULT * actual_R)
-                    trail_activation_quant = quantize_price(trail_activation_raw, tick_size, ROUND_UP)
+                    # Trail activation: higher than entry + buffer + round UP
+                    trail_raw = actual_fill_price_dec + (TRAIL_TRIGGER_MULT * R)
+                    trail_buffered = trail_raw + TRAIL_PRICE_BUFFER
+                    trail_activation_quant = quantize_price(trail_buffered, tick_size, ROUND_UP)
+
                 else:  # SHORT
-                    sl_price_raw = actual_fill_price_dec * (Decimal("1") + SL_PCT)
-                    tp_price_raw = actual_fill_price_dec - (TP_MULT * actual_R)
+                    sl_price_dec = actual_fill_price_dec * (Decimal("1") + SL_PCT)
+                    sl_rounding = ROUND_UP
+                    tp_price_dec = actual_fill_price_dec - (TP_MULT * R)
+                    tp_rounding = ROUND_DOWN
 
-                    # Trailing activation: 1.25R BELOW entry → safe distance
-                    trail_activation_raw = actual_fill_price_dec - (TRAIL_TRIGGER_MULT * actual_R)
-                    trail_activation_quant = quantize_price(trail_activation_raw, tick_size, ROUND_DOWN)
+                    # Trail activation: lower than entry - buffer + round DOWN
+                    trail_raw = actual_fill_price_dec - (TRAIL_TRIGGER_MULT * R)
+                    trail_buffered = trail_raw - TRAIL_PRICE_BUFFER
+                    trail_activation_quant = quantize_price(trail_buffered, tick_size, ROUND_DOWN)
 
-                # Quantize SL and TP
-                sl_price_quant = quantize_price(sl_price_raw, tick_size, ROUND_DOWN if buy_signal else ROUND_UP)
-                tp_price_quant = quantize_price(tp_price_raw, tick_size, ROUND_UP if buy_signal else ROUND_DOWN)
-
-                sl_price_f = float(sl_price_quant)
-                tp_price_f = float(tp_price_quant)
-                trail_activation_f = float(trail_activation_quant)
+                sl_price_f = float(quantize_price(sl_price_dec, tick_size, sl_rounding))
+                tp_price_f = float(quantize_price(tp_price_dec, tick_size, tp_rounding))
+                final_trail_activation_f = float(trail_activation_quant)
 
                 # === ACTIVATE TRADE STATE ===
                 trade_state.active = True
                 trade_state.entry_price = actual_fill_price_f
-                trade_state.risk = float(actual_R)
+                trade_state.risk = float(R)
                 trade_state.qty = float(actual_qty)
                 trade_state.side = "LONG" if buy_signal else "SHORT"
                 trade_state.entry_close_time = latest_close_ms
@@ -1863,13 +1897,14 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 trade_state.sl = sl_price_f
                 trade_state.tp = tp_price_f
                 trade_state.trail_activated = False
-                trade_state.trail_activation_price = trail_activation_f
+                trade_state.trail_activation_price = final_trail_activation_f  # ← Critical: correct final value
+                log(f"DEBUG: Stored trail_activation_price = {final_trail_activation_f:.4f} in trade_state", telegram_bot, telegram_chat_id)
 
                 log(f"Position opened: {trade_state.side}, qty={actual_qty}, entry={actual_fill_price_f:.4f}, "
-                    f"sl={sl_price_f:.4f}, tp={tp_price_f:.4f}, trail_activation={trail_activation_f:.4f}", 
+                    f"sl={sl_price_f:.4f}, tp={tp_price_f:.4f}, trail_activation={final_trail_activation_f:.4f}",
                     telegram_bot, telegram_chat_id)
 
-                # === TELEGRAM NOTIFICATION (now shows CORRECT trailing activation) ===
+                # === TELEGRAM MESSAGE USES FINAL CORRECT VALUES ===
                 tg_msg = (
                     f"NEW TRADE\n"
                     f"━━━━━━━━━━━━━━━━\n"
@@ -1878,20 +1913,26 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     f"Qty: {float(actual_qty):.5f} SOL\n"
                     f"SL: {sl_price_f:.4f}\n"
                     f"TP: {tp_price_f:.4f} ({TP_MULT}xR)\n"
-                    f"Trail Activation: {trail_activation_f:.4f}\n"
+                    f"Trail Activation: {final_trail_activation_f:.4f}\n"
                     f"Risk: {BASE_RISK_PCT:.1%} of equity\n"
                     f"━━━━━━━━━━━━━━━━"
                 )
                 telegram_post(telegram_bot, telegram_chat_id, tg_msg)
 
-                # === PLACE PROTECTIVE ORDERS (SL, TP, Trailing) ===
+                # === PLACE PROTECTIVE ORDERS (now uses correct trail_activation_price from trade_state) ===
+                log(f"DEBUG: Sending activation_price to Binance = {float(trail_activation_price_quant):.4f}", telegram_bot, telegram_chat_id)
+                log(f"DEBUG: place_orders received trail_activation_price = {trade_state.trail_activation_price}", telegram_bot, telegram_chat_id)
                 place_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
 
                 trades_today += 1
                 pending_entry = False
 
-                # === START MONITORING ===
                 monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, latest_close_ms)
+
+            else:
+                if not pending_entry:
+                    log("No trade signal on candle close.", telegram_bot, telegram_chat_id)
+
             # === PERFECT 45m WAIT — BINANCE SERVER TIME ALIGNED ===
             if timeframe == "45m":
                 try:
