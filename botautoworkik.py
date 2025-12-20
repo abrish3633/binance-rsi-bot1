@@ -127,14 +127,17 @@ CONSEC_LOSSES = 0
 USE_CONSEC_LOSS_GUARD = True
 MAX_CONSEC_LOSSES = 3
 is_testnet = True
+weekly_dd_alert_triggered = False
 
 def get_current_risk_pct(current_equity: Decimal, telegram_bot=None, telegram_chat_id=None) -> Decimal:
     """
     SIMPLE FIXED 20% WEEKLY DD STOP (Pine Script style)
-    Returns BASE_RISK_PCT if under 20% DD, returns 0 if at/over 20% DD
+    Blocks new trades if DD >= 20%
+    Emergency closes open positions if DD >= 20%
     """
     global weekly_peak_equity, weekly_start_time, CONSEC_LOSSES
-    
+    global weekly_dd_alert_triggered  # For one-time alert
+
     now = datetime.now(timezone.utc)
     current_monday = now - timedelta(days=now.weekday())
     current_monday = current_monday.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -143,7 +146,8 @@ def get_current_risk_pct(current_equity: Decimal, telegram_bot=None, telegram_ch
     if weekly_start_time is None or now >= current_monday + timedelta(weeks=1):
         weekly_start_time = current_monday
         weekly_peak_equity = current_equity
-        CONSEC_LOSSES = 0  # Reset loss streak weekly
+        CONSEC_LOSSES = 0
+        weekly_dd_alert_triggered = False
         if telegram_bot and telegram_chat_id:
             log(f"NEW WEEK -> Weekly peak reset to ${float(current_equity):,.2f}", telegram_bot, telegram_chat_id)
     
@@ -157,12 +161,42 @@ def get_current_risk_pct(current_equity: Decimal, telegram_bot=None, telegram_ch
     
     weekly_dd = (weekly_peak_equity - current_equity) / weekly_peak_equity
     
-    if weekly_dd >= Decimal("0.20"):  # HARD 20% STOP
-        msg = f"WEEKLY 20% DD STOP -> NO NEW TRADES (DD: {weekly_dd:.2%})"
-        log(msg, telegram_bot, telegram_chat_id)
+    if weekly_dd >= Decimal("0.20"):
+        # One-time alert
+        if not weekly_dd_alert_triggered:
+            msg = f"🚨 WEEKLY 20% DD REACHED! Closing ALL positions (DD: {weekly_dd:.2%})"
+            log(msg, telegram_bot, telegram_chat_id)
+            weekly_dd_alert_triggered = True
+        
+        # Emergency close any open position
+        try:
+            pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": "SOLUSDT"})
+            positions = pos_resp['data'] if isinstance(pos_resp, dict) and 'data' in pos_resp else pos_resp if isinstance(pos_resp, list) else []
+            pos_item = next((p for p in positions if p.get("symbol") == "SOLUSDT"), None)
+            pos_amt = Decimal(str(pos_item.get("positionAmt", "0"))) if pos_item else Decimal('0')
+            
+            if pos_amt != 0:
+                side = "SELL" if pos_amt > 0 else "BUY"
+                qty = abs(pos_amt)
+                client.send_signed_request("POST", "/fapi/v1/order", {
+                    "symbol": "SOLUSDT",
+                    "side": side,
+                    "type": "MARKET",
+                    "quantity": str(qty)
+                })
+                log(f"EMERGENCY CLOSE: Position closed (qty={qty} {side}) due to weekly DD {weekly_dd:.2%}", telegram_bot, telegram_chat_id)
+        except Exception as e:
+            log(f"Emergency close failed: {str(e)}", telegram_bot, telegram_chat_id)
+        
         return Decimal("0")
     
-    return Decimal("1")  # Return 1 to indicate trading is allowed
+    else:
+        # Reset alert when recovered
+        if weekly_dd_alert_triggered:
+            weekly_dd_alert_triggered = False
+            log("Weekly DD recovered – trading resumed.", telegram_bot, telegram_chat_id)
+    
+    return Decimal("1")
 # ==================== SINGLE INSTANCE LOCK (Windows + Linux) ====================
 LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'sol_rsi_bot.lock')
 
@@ -572,44 +606,99 @@ def _request_stop(signum=None, frame=None, symbol=None, telegram_bot=None, teleg
             logger.info("Stop already requested; skipping duplicate cleanup.")
             return
         STOP_REQUESTED = True
-    log("Stop requested. Closing positions and cancelling orders...")
+
+    log("Stop requested. Closing positions and cancelling orders...", telegram_bot, telegram_chat_id)
     if not client or not symbol:
-        log("Client or symbol not defined; skipping position closure and order cancellation.")
+        log("Client or symbol not defined; skipping position closure and order cancellation.", telegram_bot, telegram_chat_id)
         return
+
     try:
         pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
         positions = pos_resp['data'] if isinstance(pos_resp, dict) and 'data' in pos_resp else pos_resp if isinstance(pos_resp, list) else []
         pos_item = next((p for p in positions if p.get("symbol") == symbol), None)
         pos_amt = Decimal(str(pos_item.get("positionAmt", "0"))) if pos_item else Decimal('0')
+
         if pos_amt != 0:
             side = "SELL" if pos_amt > 0 else "BUY"
             qty = abs(pos_amt)
-            entry_price = Decimal(str(pos_item.get("entryPrice", "0"))) if pos_item else Decimal('0')
+            entry_price_dec = Decimal(str(pos_item.get("entryPrice", "0"))) if pos_item else Decimal('0')
+            entry_price_f = float(entry_price_dec)
+
+            # Place market close
             response = client.send_signed_request("POST", "/fapi/v1/order", {
                 "symbol": symbol,
                 "side": side,
                 "type": "MARKET",
                 "quantity": str(qty)
             })
-            log(f"Closed position: qty={qty} {side}")
-            exit_price = client.get_latest_fill_price(symbol, response.get("orderId"))
-            if exit_price is None:
-                ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
-                exit_price = Decimal(str(ticker.get("price")))
-            exit_price_f = float(exit_price)
-            R = entry_price * SL_PCT if entry_price else Decimal('0')
-            pnl_row = log_pnl(len(pnl_data) + 1, "LONG" if pos_amt > 0 else "SHORT", float(entry_price), exit_price_f, float(qty), float(R))
+            market_order_id = response.get("orderId")
+            log(f"Closed position: qty={qty} {side} (orderId: {market_order_id})", telegram_bot, telegram_chat_id)
+
+            # === Get EXACT fill price from userTrades (not ticker fallback) ===
+            exit_price_dec = None
+            if market_order_id:
+                time.sleep(0.8)  # Allow fill propagation
+                try:
+                    trades = client.send_signed_request("GET", "/fapi/v1/userTrades", {
+                        "symbol": symbol,
+                        "orderId": market_order_id,
+                        "limit": 10
+                    })
+                    filled_trades = [t for t in trades if float(t.get("qty", "0")) > 0]
+                    if filled_trades:
+                        # Use last fill (most accurate)
+                        exit_price_dec = Decimal(str(filled_trades[-1]["price"]))
+                except Exception as e:
+                    log(f"Failed to fetch exact fill from userTrades: {e}", telegram_bot, telegram_chat_id)
+
+            if exit_price_dec is None:
+                log("⚠️ Exact fill price unavailable. Using ticker as last resort.", telegram_bot, telegram_chat_id)
+                try:
+                    ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+                    exit_price_dec = Decimal(str(ticker.get("price", "0")))
+                except Exception as e:
+                    log(f"Ticker fallback failed: {e}", telegram_bot, telegram_chat_id)
+                    exit_price_dec = Decimal("0")
+
+            exit_price_f = float(exit_price_dec)
+            R_float = float(entry_price_dec * SL_PCT)
+
+            # Log PNL
+            pnl_row = log_pnl(
+                len(pnl_data) + 1,
+                "LONG" if pos_amt > 0 else "SHORT",
+                entry_price_f,
+                exit_price_f,
+                float(qty),
+                R_float
+            )
+
+            # Telegram
             if telegram_bot and telegram_chat_id:
-                send_closure_telegram(symbol, "LONG" if pos_amt > 0 else "SHORT", float(entry_price), exit_price_f, float(qty), pnl_row['pnl_usd'], pnl_row['pnl_r'], "Stop Requested", telegram_bot, telegram_chat_id)
+                send_closure_telegram(
+                    symbol=symbol,
+                    side="LONG" if pos_amt > 0 else "SHORT",
+                    entry_price=entry_price_f,
+                    exit_price=exit_price_f,
+                    qty=float(qty),
+                    pnl_usd=pnl_row['pnl_usd'],
+                    pnl_r=pnl_row['pnl_r'],
+                    reason="Stop Requested",
+                    bot=telegram_bot,
+                    chat_id=telegram_chat_id
+                )
+
     except Exception as e:
-        log(f"Stop handler error while closing position: {str(e)}")
+        log(f"Stop handler error while closing position: {str(e)}", telegram_bot, telegram_chat_id)
+
+    # Final cleanup
     with _stop_lock:
         if not _orders_cancelled:
             try:
                 client.cancel_all_open_orders(symbol)
-                log(f"All open orders cancelled for {symbol}.")
+                log(f"All open orders cancelled for {symbol}.", telegram_bot, telegram_chat_id)
             except Exception as e:
-                log(f"Failed to cancel open orders: {e}")
+                log(f"Failed to cancel open orders: {e}", telegram_bot, telegram_chat_id)
             _orders_cancelled = True
 
 # ------------------- TIME SYNC -------------------
@@ -650,6 +739,36 @@ class BinanceClient:
             "leverage": leverage
         }
         return self.send_signed_request("POST", "/fapi/v1/leverage", params)
+    
+    def get_algo_fill_details(self, symbol: str, algo_id: int) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        """
+        Query a specific algo order by algoId and return avgPrice and executed qty if filled.
+        Returns (avg_price: Decimal or None, executed_qty: Decimal or None)
+        """
+        if not algo_id:
+            return None, None
+        
+        params = {
+            "symbol": symbol,
+            "algoId": algo_id
+        }
+        
+        try:
+            res = self.send_signed_request("GET", "/fapi/v1/allAlgoOrders", params)
+            if isinstance(res, list) and len(res) > 0:
+                order = res[0]  # Most recent / only match
+                status = order.get("orderStatus")
+                if status in ["FILLED", "PARTIALLY_FILLED"]:
+                    avg_price_str = order.get("avgPrice", "0")
+                    qty_str = order.get("executedQty", "0")  # or cumQty depending on response
+                    return (
+                        Decimal(avg_price_str) if avg_price_str != "0" else None,
+                        Decimal(qty_str) if qty_str != "0" else None
+                    )
+        except Exception as e:
+            log(f"Error querying algo fill details for algoId {algo_id}: {e}")
+        
+        return None, None
     
     def _check_position_mode(self):
         try:
@@ -1427,104 +1546,89 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                 pos_item = next((p for p in positions if p.get("symbol") == symbol), None)
                 pos_amt = Decimal(str(pos_item.get("positionAmt", "0"))) if pos_item else Decimal('0')
 
-                if pos_amt == 0:
-                        # === POSITION REALLY CLOSED – VERIFY & DETERMINE TRUE REASON ===
-                        log("Position closed (verified via positionAmt == 0). Determining exit reason...", telegram_bot, telegram_chat_id)
-                        trade_state.active = False
+                if pos_amt == 0 and trade_state.active:
+                    # === POSITION CLOSED – DETERMINE EXACT REASON & FILL PRICE ===
+                    log("Position closed (verified via positionAmt == 0). Determining exit reason and exact fill price...", telegram_bot, telegram_chat_id)
+                    trade_state.active = False
 
-                        # Critical: give Binance ~1.2 seconds for any in-flight recovery orders to appear
-                        # Prevents false "Stop Loss / Take Profit" detection due to latency
-                        time.sleep(1.2)
+                    # Give Binance time to finalize internal state
+                    time.sleep(1.2)
 
-                        # ---- 1. Fetch open orders once (fresh state after possible recovery + latency) ----
-                        try:
-                            open_orders = client.get_open_orders(symbol)
-                        except Exception as e:
-                            log(f"Failed to fetch open orders during closure detection: {e}. Proceeding with best-effort reason.", telegram_bot, telegram_chat_id)
-                            open_orders = []
-                        open_order_ids = {o["orderId"] for o in open_orders}
+                    # Use the new precise method: checks each algoId for fill + avgPrice
+                    reason, exit_price_dec = client.get_filled_order_reason_and_price(
+                        symbol=symbol,
+                        sl_id=trade_state.sl_algo_id,
+                        tp_id=trade_state.tp_algo_id,
+                        trail_id=trade_state.trail_algo_id
+                    )
 
-                        # === NEW 2025+ FIX: Binance now returns algoId instead of orderId ===
-                        current_sl_id     = trade_state.sl_order_id or trade_state.sl_algo_id
-                        current_tp_id     = trade_state.tp_order_id or trade_state.tp_algo_id
-                        current_trail_id  = trade_state.trail_order_id or trade_state.trail_algo_id
-
-                        reason = "Unknown"
-                        exit_price = None
-
-                        # ---- 2. TRAILING STOP HIT? (only if activated and current ID missing) ----
-                        if (trade_state.trail_activated and current_trail_id and
-                            current_trail_id not in open_order_ids):
-                            reason = "Trailing Stop"
-                            exit_price = client.get_latest_fill_price(symbol, current_trail_id)
-
-                        # ---- 3. STOP-LOSS HIT? (current ID missing) ----
-                        elif current_sl_id and current_sl_id not in open_order_ids:
-                            reason = "Stop Loss"
-                            exit_price = client.get_latest_fill_price(symbol, current_sl_id)
-
-                        # ---- 4. TAKE-PROFIT HIT? ----
-                        elif current_tp_id and current_tp_id not in open_order_ids:
-                            reason = "Take Profit"
-                            exit_price = client.get_latest_fill_price(symbol, current_tp_id)
-
-                        # ---- 5. MANUAL / UNKNOWN ----
+                    if exit_price_dec is None:
+                        log("⚠️ No exact fill price from algo orders. Falling back to recent trade history.", telegram_bot, telegram_chat_id)
+                        latest = client.get_latest_trade_details(symbol)
+                        if latest and latest.get("price"):
+                            exit_price_dec = Decimal(str(latest["price"]))
+                            reason = reason if reason != "Unknown" else "Recent Trade (Likely Protective Order)"
                         else:
-                            reason = "Manual Close" if not STOP_REQUESTED else "Stop Requested"
+                            # Absolute last resort
+                            try:
+                                ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+                                exit_price_dec = Decimal(str(ticker.get("price", "0")))
+                                reason = reason if reason != "Unknown" else "Market Close (No Fill Data)"
+                            except Exception as e:
+                                log(f"Ticker fallback failed during closure: {e}", telegram_bot, telegram_chat_id)
+                                exit_price_dec = Decimal("0")
+                                reason = "Unknown (Data Unavailable)"
 
-                        # ---- 6. Fallback: get actual exit price if not found above ----
-                        if exit_price is None:
-                            latest = client.get_latest_trade_details(symbol)
-                            if latest and latest.get("price"):
-                                exit_price = latest["price"]
-                                reason = reason if reason != "Unknown" else "Executed Order"
-                            else:
-                                try:
-                                    ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
-                                    exit_price = Decimal(str(ticker.get("price", "0")))
-                                    reason = reason if reason != "Unknown" else "Market Close (No Trade History)"
-                                except:
-                                    exit_price = Decimal("0")
+                    exit_price_f = float(exit_price_dec)
 
-                        exit_price_f = float(exit_price)
+                    # --- Log PNL ---
+                    entry_price_safe = float(trade_state.entry_price or 0.0)
+                    R = Decimal(str(entry_price_safe)) * SL_PCT
+                    R_float = float(R)
 
-                        # --- Log PNL ---
-                        entry_price_safe = float(trade_state.entry_price or 0.0)
-                        R = Decimal(str(entry_price_safe)) * SL_PCT
-                        R_float = float(R)
-                        pnl_row = log_pnl(
-                            len(pnl_data) + 1,
-                            trade_state.side,
-                            entry_price_safe,
-                            exit_price_f,
-                            float(trade_state.qty or 0),
-                            R_float
-                        )
+                    pnl_row = log_pnl(
+                        len(pnl_data) + 1,
+                        trade_state.side,
+                        entry_price_safe,
+                        exit_price_f,
+                        float(trade_state.qty or 0),
+                        R_float
+                    )
 
-                        # --- ENHANCED CONSOLE LOG (YOUR REQUEST) ---
-                        log(f"Position closed by {reason}", telegram_bot, telegram_chat_id)
-                        log(f"Entry: {entry_price_safe:.4f} → Exit: {exit_price_f:.4f} | "
-                            f"PNL: {pnl_row['pnl_usd']:.2f} USDT ({pnl_row['pnl_r']:.2f}R)", 
-                            telegram_bot, telegram_chat_id)
+                    # --- Enhanced Logging ---
+                    log(f"Position closed by {reason}", telegram_bot, telegram_chat_id)
+                    log(
+                        f"Entry: {entry_price_safe:.4f} → Exit: {exit_price_f:.4f} | "
+                        f"PNL: {pnl_row['pnl_usd']:.2f} USDT ({pnl_row['pnl_r']:.2f}R)",
+                        telegram_bot, telegram_chat_id
+                    )
 
-                        # --- Send Telegram ---
-                        send_closure_telegram(
-                            symbol, trade_state.side,
-                            entry_price_safe, exit_price_f,
-                            float(trade_state.qty or 0),
-                            float(pnl_row['pnl_usd']), float(pnl_row['pnl_r']),
-                            reason, telegram_bot, telegram_chat_id
-                        )
+                    # --- Telegram Notification ---
+                    send_closure_telegram(
+                        symbol=symbol,
+                        side=trade_state.side,
+                        entry_price=entry_price_safe,
+                        exit_price=exit_price_f,
+                        qty=float(trade_state.qty or 0),
+                        pnl_usd=float(pnl_row['pnl_usd']),
+                        pnl_r=float(pnl_row['pnl_r']),
+                        reason=reason,
+                        bot=telegram_bot,
+                        chat_id=telegram_chat_id
+                    )
 
-                        # --- Cancel remaining orders – ANGRY BOUNCER EDITION ---
+                    # --- Final Cleanup: Eliminate any lingering orders ---
+                    try:
                         client.cancel_all_open_orders(symbol)
                         log("[ZOMBIE KILLER] Nuclear strike executed — all ghosts eliminated", telegram_bot, telegram_chat_id)
-                        
-                        # Prevent double-cancellation spam
-                        _orders_cancelled = True
+                    except Exception as e:
+                        log(f"Cleanup cancel failed: {e}", telegram_bot, telegram_chat_id)
 
-                        return  # Exit monitor cleanly
+                    # Prevent duplicate processing
+                    _orders_cancelled = True
 
+                    return  # Exit monitor_trade cleanly
+                
                 # --- Update High/Low ---
                 if current_price is not None:
                     if trade_state.side == "LONG":
@@ -1791,8 +1895,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                         telegram_bot, telegram_chat_id
                     )
 
-                # === CALCULATE RISK & LEVELS ===
-                                # === CALCULATE RISK & LEVELS (initial, based on candle close - only for qty/risk calc) ===
+                # === CALCULATE RISK & LEVELS (initial, based on candle close - only for qty/risk calc) ===
                 if buy_signal:
                     sl_price_dec = entry_price * (Decimal("1") - SL_PCT)
                     R = entry_price * SL_PCT
