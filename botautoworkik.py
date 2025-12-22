@@ -1832,44 +1832,46 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
 def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, telegram_bot, telegram_chat_id):
     global last_news_guard_msg, news_guard_was_active   
     global last_no_klines_log
-    interval_seconds = interval_ms(timeframe) / 1000.0  # tf in seconds
+    
+    interval_seconds = interval_ms(timeframe) / 1000.0
     trades_today = 0
     last_processed_time = 0
     trade_state = TradeState()
-    qty_api = None  # ← ADD THIS
+    qty_api = None
     pending_entry = False
+    
+    # Get filters once
     filters = get_symbol_filters(client, symbol)
     step_size = filters['stepSize']
     min_qty = filters['minQty']
-    tick_size = filters['tickSize']
+    tick_size = filters['tickSize']  # ← Now defined before use
     min_notional = filters['minNotional']
     max_trades_alert_sent = False
     
-    # === FIX: Initialize last_trade_date ONCE, before the loop ===
     last_trade_date = datetime.now(timezone.utc).date()
     log(f"Bot started on {last_trade_date}. Trades today: {trades_today}", telegram_bot, telegram_chat_id)
 
     signal.signal(signal.SIGINT, lambda s, f: _request_stop(s, f, symbol, telegram_bot, telegram_chat_id))
     signal.signal(signal.SIGTERM, lambda s, f: _request_stop(s, f, symbol, telegram_bot, telegram_chat_id))
-    log(f"Starting bot with symbol={symbol}, timeframe={timeframe}, risk_pct={risk_pct*100}%")
+    log(f"Starting bot with symbol={symbol}, timeframe={timeframe}, risk_pct={float(risk_pct*100):.1f}%")
 
     # === RECOVER EXISTING POSITION ON STARTUP ===
     if has_active_position(client, symbol):
-    pos = fetch_open_positions_details(client, symbol, telegram_bot, telegram_chat_id)
-    if pos:
-        pos_amt = Decimal(str(pos.get("positionAmt", "0")))
-        if pos_amt != 0:
-            trade_state.active = True
-            trade_state.side = "LONG" if pos_amt > 0 else "SHORT"
-            trade_state.qty = float(abs(pos_amt))
-            trade_state.entry_price = float(Decimal(str(pos.get("entryPrice", "0"))))
-            trade_state.risk = Decimal(str(trade_state.entry_price)) * SL_PCT
-            trade_state.sl_order_id = None
-            trade_state.tp_order_id = None
-            trade_state.trail_order_id = None
-            log("Existing position detected on startup. Recovering orders...", telegram_bot, telegram_chat_id)
-            debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
-            monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, int(time.time() * 1000))
+        pos = fetch_open_positions_details(client, symbol, telegram_bot, telegram_chat_id)
+        if pos:
+            pos_amt = Decimal(str(pos.get("positionAmt", "0")))
+            if pos_amt != 0:
+                trade_state.active = True
+                trade_state.side = "LONG" if pos_amt > 0 else "SHORT"
+                trade_state.qty = float(abs(pos_amt))
+                trade_state.entry_price = float(Decimal(str(pos.get("entryPrice", "0"))))
+                trade_state.risk = Decimal(str(trade_state.entry_price)) * SL_PCT
+                trade_state.sl_order_id = None
+                trade_state.tp_order_id = None
+                trade_state.trail_order_id = None
+                log("Existing position detected on startup. Recovering orders...", telegram_bot, telegram_chat_id)
+                debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
+                monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, int(time.time() * 1000))
 
     # === MAIN LOOP ===
     # === MAIN TRADING LOOP — FINAL VERSION (NO PLACEHOLDERS) ===
