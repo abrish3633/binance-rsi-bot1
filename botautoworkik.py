@@ -1548,6 +1548,7 @@ def start_polling_mode(symbol, telegram_bot, telegram_chat_id):
 def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, current_candle_close_time):
     global _orders_cancelled, _polling_active, _ws_failed
     log("Monitoring active trade...", telegram_bot, telegram_chat_id)
+    trade_start_time = time.time()  # ← This fixes the error
     last_recovery_check = 0
     current_price = None
     ws = None
