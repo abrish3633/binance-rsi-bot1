@@ -1635,12 +1635,12 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                 return
             # --- Recovery Check ---
             if time.time() - last_recovery_check >= RECOVERY_CHECK_INTERVAL:
-                # Only log pause if something might happen (e.g., first few checks or after change)
-                if recovered_something_last_time or time.time() - trade_start_time < 300:  # e.g., first 5 min
+                # Pause only in first 5 minutes (safe default)
+                if time.time() - trade_start_time < 300:
                     log("Recovery check: Pausing 2.5s to let dust settle...", telegram_bot, telegram_chat_id)
+                
                 debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
                 last_recovery_check = time.time()
-                recovered_something_last_time = recovered_something  # Track if action taken
 
             # --- Get Latest Price (WITH SANITY CHECK) ---
             try:
