@@ -1372,10 +1372,6 @@ def debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, tel
     if not trade_state.active:
         return
     
-    # STEP 0: PAUSE 2-3 seconds to let any in-flight executions settle
-    log("Recovery check: Pausing 2.5s to let dust settle...", telegram_bot, telegram_chat_id)
-    time.sleep(2.5)
-    
     try:
                 # STEP 1: VERIFY position still exists
         try:
@@ -1634,14 +1630,20 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                 _request_stop(symbol=symbol, telegram_bot=telegram_bot, telegram_chat_id=telegram_chat_id)
                 telegram_post(telegram_bot, telegram_chat_id, "EMERGENCY CLOSE – ATR SPIKE >3x")
                 return
-            # --- Recovery Check ---
+                        # --- Recovery Check ---
             if time.time() - last_recovery_check >= RECOVERY_CHECK_INTERVAL:
                 # Pause only in first 5 minutes (safe default)
                 if time.time() - trade_start_time < 300:
                     log("Recovery check: Pausing 2.5s to let dust settle...", telegram_bot, telegram_chat_id)
                 
-                debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
+                # Run recovery (it now returns True if anything was recovered)
+                recovered = debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
+                
                 last_recovery_check = time.time()
+                
+                # Optional: quiet confirmation only if something was recovered
+                if recovered:
+                    log("Recovery action taken — protective orders restored.", telegram_bot, telegram_chat_id)
 
             # --- Get Latest Price (WITH SANITY CHECK) ---
             try:
