@@ -1315,23 +1315,28 @@ def trading_allowed(client, symbol, telegram_bot, telegram_chat_id) -> bool:
         return False
     
     return True
-def has_active_position(client: BinanceClient, symbol: str):
+def has_active_position(client: BinanceClient, symbol: str, telegram_bot=None, telegram_chat_id=None):
     try:
-        positions = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+        pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+        positions = pos_resp['data'] if isinstance(pos_resp, dict) and 'data' in pos_resp else pos_resp if isinstance(pos_resp, list) else []
         for p in positions:
-            if p.get("symbol") == symbol and Decimal(str(p.get("positionAmt", "0"))) != 0:
+            if isinstance(p, dict) and p.get("symbol") == symbol and Decimal(str(p.get("positionAmt", "0"))) != 0:
                 return True
         return False
     except Exception as e:
-        log(f"Position check failed: {str(e)}")
+        log(f"Position check failed: {str(e)}", telegram_bot, telegram_chat_id)
         return False
 
-def fetch_open_positions_details(client: BinanceClient, symbol: str):
+def fetch_open_positions_details(client: BinanceClient, symbol: str, telegram_bot=None, telegram_chat_id=None):
     try:
-        positions = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-        return next((p for p in positions if p.get("symbol") == symbol), None)
+        pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+        positions = pos_resp['data'] if isinstance(pos_resp, dict) and 'data' in pos_resp else pos_resp if isinstance(pos_resp, list) else []
+        for p in positions:
+            if isinstance(p, dict) and p.get("symbol") == symbol:
+                return p
+        return None
     except Exception as e:
-        log(f"Position details fetch failed: {str(e)}")
+        log(f"Position details fetch failed: {str(e)}", telegram_bot, telegram_chat_id)
         raise
 
 # ------------------- TRADE STATE -------------------
@@ -1414,8 +1419,8 @@ def debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, tel
         log("Position still open and price safe — proceeding with recovery checks...", telegram_bot, telegram_chat_id)
         
         # === STEP 3: Fetch orders and check for missing ===
-        regular_open_orders = {o["orderId"]: o for o in client.get_open_orders(symbol)}
-        algo_open_orders_resp = client.send_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
+        regular_open_orders = {o["orderId"]: o for o in client.get_open_orders(symbol) if isinstance(o, dict) and "orderId" in o}
+        algo_open_ids = {o.get("algoId") for o in algo_open_orders if isinstance(o, dict) and o.get("algoId") is not None}
         algo_open_orders = algo_open_orders_resp if isinstance(algo_open_orders_resp, list) else []
         algo_open_ids = {o.get("algoId") for o in algo_open_orders}
         all_open_ids = set(regular_open_orders.keys()) | algo_open_ids
@@ -1850,7 +1855,8 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
 
     # === RECOVER EXISTING POSITION ON STARTUP ===
     if has_active_position(client, symbol):
-        pos = fetch_open_positions_details(client, symbol)
+    pos = fetch_open_positions_details(client, symbol, telegram_bot, telegram_chat_id)
+    if pos:
         pos_amt = Decimal(str(pos.get("positionAmt", "0")))
         if pos_amt != 0:
             trade_state.active = True
