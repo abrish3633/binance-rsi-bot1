@@ -128,7 +128,14 @@ USE_CONSEC_LOSS_GUARD = True
 MAX_CONSEC_LOSSES = 3
 is_testnet = True
 weekly_dd_alert_triggered = False
+class BotState:
+    def __init__(self):
+        self.consec_loss_guard_alert_sent = False
+        self.last_processed_close_ms = None
+        self.last_candle_state = None
+        # Add future flags here
 
+bot_state = BotState()
 def get_current_risk_pct(
     current_equity: Decimal,
     client,              # BinanceClient instance
@@ -155,11 +162,7 @@ def get_current_risk_pct(
         weekly_peak_equity = current_equity
         CONSEC_LOSSES = 0
         weekly_dd_alert_triggered = False
-        
-        # Reset one-time alert flag for consecutive loss guard
-        if hasattr(trading_loop, 'consec_loss_guard_alert_sent'):
-            trading_loop.consec_loss_guard_alert_sent = False
-        
+        bot_state.consec_loss_guard_alert_sent = False      
         if telegram_bot and telegram_chat_id:
             log(f"NEW WEEK -> Weekly peak reset to ${float(current_equity):,.2f}", telegram_bot, telegram_chat_id)
 
@@ -1308,13 +1311,14 @@ def trading_allowed(client, symbol, telegram_bot, telegram_chat_id) -> bool:
     risk_allowed = get_current_risk_pct(current_balance, telegram_bot, telegram_chat_id)
     if risk_allowed <= Decimal("0"):
         return False  # Weekly DD stop triggered
-    
-    # 2. Consecutive Loss Guard (3 losses)
+    # ...
     if USE_CONSEC_LOSS_GUARD and CONSEC_LOSSES >= MAX_CONSEC_LOSSES:
-        log(f"3 CONSECUTIVE LOSS STOP - NO NEW TRADES", telegram_bot, telegram_chat_id)
+        if not bot_state.consec_loss_guard_alert_sent:
+            log(f"🚫 3 CONSECUTIVE FULL LOSSES REACHED ({CONSEC_LOSSES}) — TRADING PAUSED UNTIL NEXT WEEK OR WIN", telegram_bot, telegram_chat_id)
+            bot_state.consec_loss_guard_alert_sent = True
         return False
-    
     return True
+
 def has_active_position(client: BinanceClient, symbol: str, telegram_bot=None, telegram_chat_id=None):
     try:
         pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
@@ -1631,10 +1635,14 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                 return
             # --- Recovery Check ---
             if time.time() - last_recovery_check >= RECOVERY_CHECK_INTERVAL:
+                # Only log pause if something might happen (e.g., first few checks or after change)
+                if recovered_something_last_time or time.time() - trade_start_time < 300:  # e.g., first 5 min
+                    log("Recovery check: Pausing 2.5s to let dust settle...", telegram_bot, telegram_chat_id)
                 debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
                 last_recovery_check = time.time()
+                recovered_something_last_time = recovered_something  # Track if action taken
 
-                        # --- Get Latest Price (WITH SANITY CHECK) ---
+            # --- Get Latest Price (WITH SANITY CHECK) ---
             try:
                 price_candidate = _price_queue.get_nowait()
                 # CRITICAL: Reject insane prices (0, negative, or absurdly high)
@@ -1912,14 +1920,6 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 time.sleep(1)
                 continue
             
-            # === 3 CONSECUTIVE FULL LOSS GUARD ===
-            if USE_CONSEC_LOSS_GUARD and CONSEC_LOSSES >= MAX_CONSEC_LOSSES:
-                if not hasattr(trading_loop, 'consec_loss_guard_alert_sent') or not trading_loop.consec_loss_guard_alert_sent:
-                    log(f"🚫 3 CONSECUTIVE FULL LOSSES REACHED ({CONSEC_LOSSES}) — TRADING PAUSED UNTIL NEXT WEEK OR WIN", telegram_bot, telegram_chat_id)
-                    trading_loop.consec_loss_guard_alert_sent = True
-                time.sleep(60)
-                continue
-
             current_balance = fetch_balance(client)
             log(f"Risk allowed: {BASE_RISK_PCT:.3%}", telegram_bot, telegram_chat_id)
 
@@ -1943,7 +1943,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     telegram_bot, telegram_chat_id)
 
             # === ALIGN TO NEW CANDLE CLOSE ===
-            if hasattr(trading_loop, "last_processed_close_ms") and latest_close_ms <= trading_loop.last_processed_close_ms:
+            if bot_state.last_processed_close_ms is not None and latest_close_ms <= bot_state.last_processed_close_ms:
                 wait_sec = max(1.0, (latest_close_ms + interval_ms(timeframe) - int(time.time() * 1000)) / 1000.0 + 2)
                 next_dt = datetime.fromtimestamp((latest_close_ms + interval_ms(timeframe)) / 1000, tz=timezone.utc)
                 log(f"Waiting for next {timeframe} candle close in {wait_sec:.1f}s → {next_dt.strftime('%H:%M')} UTC", 
@@ -1951,24 +1951,17 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 _safe_sleep(wait_sec)
                 continue
 
-            trading_loop.last_processed_close_ms = latest_close_ms
+            bot_state.last_processed_close_ms = latest_close_ms
 
             dt = datetime.fromtimestamp(latest_close_ms / 1000, tz=timezone.utc)
             log(f"Aligned to {timeframe} candle close: {dt.strftime('%H:%M')} UTC", telegram_bot, telegram_chat_id)
             
-            close_price = Decimal(str(klines[-1][4]))
-            open_price  = Decimal(str(klines[-1][1]))
-            curr_vol    = float(klines[-1][5])
-            is_green_candle = close_price > open_price
-
-            closes, volumes, _, _ = closes_and_volumes_from_klines(klines)
-            rsi = compute_rsi(closes)
-            vol_sma15 = sma(volumes, VOL_SMA_PERIOD) if len(volumes) >= VOL_SMA_PERIOD else None
+            # ... candle processing (close_price, rsi, etc.) ...
 
             state = f"{close_price:.4f}|{rsi:.2f}|{curr_vol:.0f}|{vol_sma15:.2f}|{'G' if is_green_candle else 'R'}"
-            if not hasattr(trading_loop, "last_candle_state") or state != trading_loop.last_candle_state:
+            if bot_state.last_candle_state is None or state != bot_state.last_candle_state:
                 log(f"Candle: {close_price:.4f} RSI={rsi:.2f} Vol={curr_vol:.0f} SMA15={vol_sma15:.2f} {'Green' if is_green_candle else 'Red'}", telegram_bot, telegram_chat_id)
-                trading_loop.last_candle_state = state
+                bot_state.last_candle_state = state
 
             buy_signal  = (rsi and BUY_RSI_MIN  <= rsi <= BUY_RSI_MAX  and is_green_candle and (not use_volume_filter or curr_vol > vol_sma15))
             sell_signal = (rsi and SELL_RSI_MIN <= rsi <= SELL_RSI_MAX and not is_green_candle and (not use_volume_filter or curr_vol > vol_sma15))
