@@ -129,57 +129,69 @@ MAX_CONSEC_LOSSES = 3
 is_testnet = True
 weekly_dd_alert_triggered = False
 
-def get_current_risk_pct(current_equity: Decimal, telegram_bot=None, telegram_chat_id=None) -> Decimal:
+def get_current_risk_pct(
+    current_equity: Decimal,
+    client,              # BinanceClient instance
+    symbol: str = "SOLUSDT",  # Made parameter with default for flexibility
+    telegram_bot=None,
+    telegram_chat_id=None
+) -> Decimal:
     """
     SIMPLE FIXED 20% WEEKLY DD STOP (Pine Script style)
-    Blocks new trades if DD >= 20%
-    Emergency closes open positions if DD >= 20%
+    - Blocks new trades if weekly DD >= 20%
+    - Emergency closes open positions if DD >= 20%
+    - Resets consecutive loss streak and alert flag on new week
     """
     global weekly_peak_equity, weekly_start_time, CONSEC_LOSSES
-    global weekly_dd_alert_triggered  # For one-time alert
+    global weekly_dd_alert_triggered
 
     now = datetime.now(timezone.utc)
     current_monday = now - timedelta(days=now.weekday())
     current_monday = current_monday.replace(hour=0, minute=0, second=0, microsecond=0)
-    
+
     # === NEW WEEK DETECTED → RESET ===
     if weekly_start_time is None or now >= current_monday + timedelta(weeks=1):
         weekly_start_time = current_monday
         weekly_peak_equity = current_equity
         CONSEC_LOSSES = 0
         weekly_dd_alert_triggered = False
+        
+        # Reset one-time alert flag for consecutive loss guard
+        if hasattr(trading_loop, 'consec_loss_guard_alert_sent'):
+            trading_loop.consec_loss_guard_alert_sent = False
+        
         if telegram_bot and telegram_chat_id:
             log(f"NEW WEEK -> Weekly peak reset to ${float(current_equity):,.2f}", telegram_bot, telegram_chat_id)
-    
+
     # === UPDATE PEAK IF HIGHER ===
     if weekly_peak_equity is None or current_equity > weekly_peak_equity:
         weekly_peak_equity = current_equity
-    
+
     # === CHECK 20% DD LIMIT ===
     if weekly_peak_equity <= 0:
         return Decimal("0")
-    
+
     weekly_dd = (weekly_peak_equity - current_equity) / weekly_peak_equity
-    
+
     if weekly_dd >= Decimal("0.20"):
         # One-time alert
         if not weekly_dd_alert_triggered:
             msg = f"🚨 WEEKLY 20% DD REACHED! Closing ALL positions (DD: {weekly_dd:.2%})"
             log(msg, telegram_bot, telegram_chat_id)
             weekly_dd_alert_triggered = True
-        
+
         # Emergency close any open position
         try:
-            pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": "SOLUSDT"})
+            pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
             positions = pos_resp['data'] if isinstance(pos_resp, dict) and 'data' in pos_resp else pos_resp if isinstance(pos_resp, list) else []
-            pos_item = next((p for p in positions if p.get("symbol") == "SOLUSDT"), None)
+            pos_item = next((p for p in positions if p.get("symbol") == symbol), None)
             pos_amt = Decimal(str(pos_item.get("positionAmt", "0"))) if pos_item else Decimal('0')
-            
+
             if pos_amt != 0:
                 side = "SELL" if pos_amt > 0 else "BUY"
                 qty = abs(pos_amt)
                 client.send_signed_request("POST", "/fapi/v1/order", {
-                    "symbol": "SOLUSDT",
+                    "symbol": symbol,
                     "side": side,
                     "type": "MARKET",
                     "quantity": str(qty)
@@ -187,15 +199,15 @@ def get_current_risk_pct(current_equity: Decimal, telegram_bot=None, telegram_ch
                 log(f"EMERGENCY CLOSE: Position closed (qty={qty} {side}) due to weekly DD {weekly_dd:.2%}", telegram_bot, telegram_chat_id)
         except Exception as e:
             log(f"Emergency close failed: {str(e)}", telegram_bot, telegram_chat_id)
-        
+
         return Decimal("0")
-    
+
     else:
         # Reset alert when recovered
         if weekly_dd_alert_triggered:
             weekly_dd_alert_triggered = False
             log("Weekly DD recovered – trading resumed.", telegram_bot, telegram_chat_id)
-    
+
     return Decimal("1")
 # ==================== SINGLE INSTANCE LOCK (Windows + Linux) ====================
 LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'sol_rsi_bot.lock')
@@ -1819,6 +1831,14 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
 
             if not trading_allowed(client, symbol, telegram_bot, telegram_chat_id):
                 time.sleep(1)
+                continue
+            
+            # === 3 CONSECUTIVE FULL LOSS GUARD ===
+            if USE_CONSEC_LOSS_GUARD and CONSEC_LOSSES >= MAX_CONSEC_LOSSES:
+                if not hasattr(trading_loop, 'consec_loss_guard_alert_sent') or not trading_loop.consec_loss_guard_alert_sent:
+                    log(f"🚫 3 CONSECUTIVE FULL LOSSES REACHED ({CONSEC_LOSSES}) — TRADING PAUSED UNTIL NEXT WEEK OR WIN", telegram_bot, telegram_chat_id)
+                    trading_loop.consec_loss_guard_alert_sent = True
+                time.sleep(60)
                 continue
 
             current_balance = fetch_balance(client)
