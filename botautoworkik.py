@@ -1420,9 +1420,14 @@ def debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, tel
         
         # === STEP 3: Fetch orders and check for missing ===
         regular_open_orders = {o["orderId"]: o for o in client.get_open_orders(symbol) if isinstance(o, dict) and "orderId" in o}
-        algo_open_ids = {o.get("algoId") for o in algo_open_orders if isinstance(o, dict) and o.get("algoId") is not None}
+        
+        # Fetch algo orders FIRST
+        algo_open_orders_resp = client.send_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
         algo_open_orders = algo_open_orders_resp if isinstance(algo_open_orders_resp, list) else []
-        algo_open_ids = {o.get("algoId") for o in algo_open_orders}
+        
+        # Now build IDs safely
+        algo_open_ids = {o.get("algoId") for o in algo_open_orders if isinstance(o, dict) and o.get("algoId") is not None}
+        
         all_open_ids = set(regular_open_orders.keys()) | algo_open_ids
         
         recovered_something = False
