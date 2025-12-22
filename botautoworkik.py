@@ -183,10 +183,29 @@ def get_current_risk_pct(
         # Emergency close any open position
         try:
             pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-            positions = pos_resp['data'] if isinstance(pos_resp, dict) and 'data' in pos_resp else pos_resp if isinstance(pos_resp, list) else []
-            pos_item = next((p for p in positions if p.get("symbol") == symbol), None)
-            pos_amt = Decimal(str(pos_item.get("positionAmt", "0"))) if pos_item else Decimal('0')
-
+            
+            # Normalize response to list of dicts
+            if isinstance(pos_resp, dict) and 'data' in pos_resp:
+                positions = pos_resp['data']
+            elif isinstance(pos_resp, list):
+                positions = pos_resp
+            else:
+                log(f"Unexpected positionRisk response type: {type(pos_resp)}. Skipping close.", telegram_bot, telegram_chat_id)
+                positions = []
+            
+            # Defensive: Find matching symbol only if item is dict
+            pos_item = None
+            for item in positions:
+                if isinstance(item, dict) and item.get("symbol") == symbol:
+                    pos_item = item
+                    break
+            
+            if pos_item is None:
+                # No position found for symbol
+                return Decimal("0")
+            
+            pos_amt = Decimal(str(pos_item.get("positionAmt", "0")))
+            
             if pos_amt != 0:
                 side = "SELL" if pos_amt > 0 else "BUY"
                 qty = abs(pos_amt)
@@ -197,6 +216,7 @@ def get_current_risk_pct(
                     "quantity": str(qty)
                 })
                 log(f"EMERGENCY CLOSE: Position closed (qty={qty} {side}) due to weekly DD {weekly_dd:.2%}", telegram_bot, telegram_chat_id)
+                
         except Exception as e:
             log(f"Emergency close failed: {str(e)}", telegram_bot, telegram_chat_id)
 
@@ -1348,12 +1368,39 @@ def debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, tel
     time.sleep(2.5)
     
     try:
-        # STEP 1: VERIFY position still exists
-        pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-        pos_amt = Decimal(str(pos_resp.get("positionAmt", "0")))
-        if pos_amt == 0:
-            log("No position open — skipping recovery (likely already closed by SL/TP/trailing)", telegram_bot, telegram_chat_id)
-            return  # EXIT EARLY — prevents re-issuing on closed trades
+                # STEP 1: VERIFY position still exists
+        try:
+            pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+            
+            # Normalize response: dict with 'data' or direct list
+            if isinstance(pos_resp, dict) and 'data' in pos_resp:
+                positions = pos_resp['data']
+            elif isinstance(pos_resp, list):
+                positions = pos_resp
+            else:
+                log(f"Unexpected positionRisk format: {type(pos_resp)}", telegram_bot, telegram_chat_id)
+                return
+            
+            # Find the position for our symbol
+            pos_item = None
+            for item in positions:
+                if isinstance(item, dict) and item.get("symbol") == symbol:
+                    pos_item = item
+                    break
+            
+            if pos_item is None:
+                log("No position found for symbol — skipping recovery", telegram_bot, telegram_chat_id)
+                return
+            
+            pos_amt = Decimal(str(pos_item.get("positionAmt", "0")))
+            
+            if pos_amt == 0:
+                log("No position open — skipping recovery (likely already closed by SL/TP/trailing)", telegram_bot, telegram_chat_id)
+                return
+                
+        except Exception as e:
+            log(f"Position verification failed: {str(e)} — skipping recovery", telegram_bot, telegram_chat_id)
+            return
         
         # STEP 2: CHECK current price hasn't crashed
         current_price = Decimal(str(client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})["price"]))
@@ -1592,10 +1639,29 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
             # --- Position Check ---
             try:
                 pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-                positions = pos_resp['data'] if isinstance(pos_resp, dict) and 'data' in pos_resp else pos_resp if isinstance(pos_resp, list) else []
-                pos_item = next((p for p in positions if p.get("symbol") == symbol), None)
-                pos_amt = Decimal(str(pos_item.get("positionAmt", "0"))) if pos_item else Decimal('0')
-
+                
+                # Normalize to list of dicts
+                if isinstance(pos_resp, dict) and 'data' in pos_resp:
+                    positions = pos_resp['data']
+                elif isinstance(pos_resp, list):
+                    positions = pos_resp
+                else:
+                    log(f"Unexpected positionRisk response type: {type(pos_resp)}", telegram_bot, telegram_chat_id)
+                    positions = []
+                
+                # Defensive: Find matching symbol only if item is dict
+                pos_item = None
+                for item in positions:
+                    if isinstance(item, dict) and item.get("symbol") == symbol:
+                        pos_item = item
+                        break
+                
+                if pos_item is None:
+                    log("No position data found for symbol during monitor", telegram_bot, telegram_chat_id)
+                    pos_amt = Decimal('0')
+                else:
+                    pos_amt = Decimal(str(pos_item.get("positionAmt", "0")))
+                
                 if pos_amt == 0 and trade_state.active:
                     # === POSITION CLOSED – DETERMINE EXACT REASON & FILL PRICE ===
                     log("Position closed (verified via positionAmt == 0). Determining exit reason and exact fill price...", telegram_bot, telegram_chat_id)
