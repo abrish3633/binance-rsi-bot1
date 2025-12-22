@@ -1942,11 +1942,11 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 log(f"⚠️ Warning: Latest candle is {stale_minutes:.1f} minutes old — possible delay in data feed", 
                     telegram_bot, telegram_chat_id)
 
-            # === ALIGN TO NEW CANDLE CLOSE ===
+                        # === ALIGN TO NEW CANDLE CLOSE ===
             if bot_state.last_processed_close_ms is not None and latest_close_ms <= bot_state.last_processed_close_ms:
                 wait_sec = max(1.0, (latest_close_ms + interval_ms(timeframe) - int(time.time() * 1000)) / 1000.0 + 2)
                 next_dt = datetime.fromtimestamp((latest_close_ms + interval_ms(timeframe)) / 1000, tz=timezone.utc)
-                log(f"Waiting for next {timeframe} candle close in {wait_sec:.1f}s → {next_dt.strftime('%H:%M')} UTC", 
+                log(f"Waiting for next {timeframe} candle close in {wait_sec:.1f}s → {next_dt.strftime('%H:%M')} UTC",
                     telegram_bot, telegram_chat_id)
                 _safe_sleep(wait_sec)
                 continue
@@ -1955,12 +1955,21 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
 
             dt = datetime.fromtimestamp(latest_close_ms / 1000, tz=timezone.utc)
             log(f"Aligned to {timeframe} candle close: {dt.strftime('%H:%M')} UTC", telegram_bot, telegram_chat_id)
-            
-            # ... candle processing (close_price, rsi, etc.) ...
 
-            state = f"{close_price:.4f}|{rsi:.2f}|{curr_vol:.0f}|{vol_sma15:.2f}|{'G' if is_green_candle else 'R'}"
+            close_price = Decimal(str(klines[-1][4]))
+            open_price  = Decimal(str(klines[-1][1]))
+            curr_vol    = float(klines[-1][5])
+            is_green_candle = close_price > open_price
+
+            closes, volumes, _, _ = closes_and_volumes_from_klines(klines)
+            rsi = compute_rsi(closes)
+            vol_sma15 = sma(volumes, VOL_SMA_PERIOD) if len(volumes) >= VOL_SMA_PERIOD else None
+
+            state = f"{close_price:.4f}|{rsi:.2f if rsi is not None else 'N/A'}|{curr_vol:.0f}|{vol_sma15:.2f if vol_sma15 is not None else 'N/A'}|{'G' if is_green_candle else 'R'}"
+
             if bot_state.last_candle_state is None or state != bot_state.last_candle_state:
-                log(f"Candle: {close_price:.4f} RSI={rsi:.2f} Vol={curr_vol:.0f} SMA15={vol_sma15:.2f} {'Green' if is_green_candle else 'Red'}", telegram_bot, telegram_chat_id)
+                log(f"Candle: {close_price:.4f} RSI={rsi:.2f if rsi is not None else 'N/A'} Vol={curr_vol:.0f} SMA15={vol_sma15:.2f if vol_sma15 is not None else 'N/A'} {'Green' if is_green_candle else 'Red'}",
+                    telegram_bot, telegram_chat_id)
                 bot_state.last_candle_state = state
 
             buy_signal  = (rsi and BUY_RSI_MIN  <= rsi <= BUY_RSI_MAX  and is_green_candle and (not use_volume_filter or curr_vol > vol_sma15))
