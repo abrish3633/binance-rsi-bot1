@@ -776,34 +776,50 @@ class BinanceClient:
         return self.send_signed_request("POST", "/fapi/v1/leverage", params)
     
     def get_algo_fill_details(self, symbol: str, algo_id: int) -> Tuple[Optional[Decimal], Optional[Decimal]]:
-        """
-        Query a specific algo order by algoId and return avgPrice and executed qty if filled.
-        Returns (avg_price: Decimal or None, executed_qty: Decimal or None)
-        """
-        if not algo_id:
-            return None, None
-        
-        params = {
-            "symbol": symbol,
-            "algoId": algo_id
-        }
-        
-        try:
-            res = self.send_signed_request("GET", "/fapi/v1/allAlgoOrders", params)
-            if isinstance(res, list) and len(res) > 0:
-                order = res[0]  # Most recent / only match
-                status = order.get("orderStatus")
-                if status in ["FILLED", "PARTIALLY_FILLED"]:
-                    avg_price_str = order.get("avgPrice", "0")
-                    qty_str = order.get("executedQty", "0")  # or cumQty depending on response
-                    return (
-                        Decimal(avg_price_str) if avg_price_str != "0" else None,
-                        Decimal(qty_str) if qty_str != "0" else None
-                    )
-        except Exception as e:
-            log(f"Error querying algo fill details for algoId {algo_id}: {e}")
-        
+    if not algo_id:
         return None, None
+    
+    params = {
+        "symbol": symbol,
+        "algoId": algo_id
+    }
+    
+    try:
+        # Primary: Query specific algo order
+        order = self.send_signed_request("GET", "/fapi/v1/algoOrder", params)
+        if isinstance(order, dict):
+            status = order.get("orderStatus")
+            if status in ["FILLED", "PARTIALLY_FILLED"]:
+                avg_price_str = order.get("avgPrice", "0")
+                qty_str = order.get("executedQty", "0")
+                return (
+                    Decimal(avg_price_str) if avg_price_str != "0" else None,
+                    Decimal(qty_str) if qty_str != "0" else None
+                )
+        
+        # Fallback: Historical if not found (e.g., already filled and archived)
+        historical_params = {
+            "symbol": symbol,
+            "startTime": int((time.time() - 3600) * 1000),  # Last hour
+            "endTime": int(time.time() * 1000),
+            "limit": 10
+        }
+        res = self.send_signed_request("GET", "/fapi/v1/historicalAlgoOrders", historical_params)
+        if isinstance(res, list):
+            for hist_order in res:
+                if hist_order.get("algoId") == algo_id:
+                    status = hist_order.get("orderStatus")
+                    if status in ["FILLED", "PARTIALLY_FILLED"]:
+                        avg_price_str = hist_order.get("avgPrice", "0")
+                        qty_str = hist_order.get("executedQty", "0")
+                        return (
+                            Decimal(avg_price_str) if avg_price_str != "0" else None,
+                            Decimal(qty_str) if qty_str != "0" else None
+                        )
+    except Exception as e:
+        log(f"Error querying algo fill details for algoId {algo_id}: {e}")
+    
+    return None, None
     def get_filled_order_reason_and_price(self, symbol: str, sl_id: Optional[int] = None, 
                                           tp_id: Optional[int] = None, trail_id: Optional[int] = None) -> Tuple[str, Optional[Decimal]]:
         """
@@ -971,7 +987,8 @@ class BinanceClient:
             "type": order_type,           # ← FIXED: lowercase 't' — this was the bug
             "quantity": str(quantity),
             "reduceOnly": "true" if reduce_only else "false",
-            "timeInForce": "GTE_GTC"
+            "timeInForce": "GTE_GTC",
+            "priceProtect": "true"  # Add this
         }
         if trigger_price is not None:
             params["triggerPrice"] = str(trigger_price)     # ← Docs confirm: triggerPrice for SL/TP
@@ -1308,15 +1325,23 @@ def trading_allowed(client, symbol, telegram_bot, telegram_chat_id) -> bool:
     
     # 1. Weekly DD Guard (20% hard stop)
     current_balance = fetch_balance(client)
-    risk_allowed = get_current_risk_pct(current_balance, telegram_bot, telegram_chat_id)
+    risk_allowed = get_current_risk_pct(
+        current_equity=current_balance,
+        client=client,
+        symbol=symbol,
+        telegram_bot=telegram_bot,
+        telegram_chat_id=telegram_chat_id
+    )
     if risk_allowed <= Decimal("0"):
         return False  # Weekly DD stop triggered
-    # ...
+
+    # 2. Consecutive Loss Guard
     if USE_CONSEC_LOSS_GUARD and CONSEC_LOSSES >= MAX_CONSEC_LOSSES:
         if not bot_state.consec_loss_guard_alert_sent:
-            log(f"🚫 3 CONSECUTIVE FULL LOSSES REACHED ({CONSEC_LOSSES}) — TRADING PAUSED UNTIL NEXT WEEK OR WIN", telegram_bot, telegram_chat_id)
+            log(f"CONSECUTIVE FULL LOSSES REACHED ({CONSEC_LOSSES}) — TRADING PAUSED UNTIL NEXT WEEK OR WIN", telegram_bot, telegram_chat_id)
             bot_state.consec_loss_guard_alert_sent = True
         return False
+    
     return True
 
 def has_active_position(client: BinanceClient, symbol: str, telegram_bot=None, telegram_chat_id=None):
