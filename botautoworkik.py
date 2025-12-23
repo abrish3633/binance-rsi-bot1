@@ -776,50 +776,47 @@ class BinanceClient:
         return self.send_signed_request("POST", "/fapi/v1/leverage", params)
     
     def get_algo_fill_details(self, symbol: str, algo_id: int) -> Tuple[Optional[Decimal], Optional[Decimal]]:
-    if not algo_id:
-        return None, None
-    
-    params = {
-        "symbol": symbol,
-        "algoId": algo_id
-    }
-    
-    try:
-        # Primary: Query specific algo order
-        order = self.send_signed_request("GET", "/fapi/v1/algoOrder", params)
-        if isinstance(order, dict):
-            status = order.get("orderStatus")
-            if status in ["FILLED", "PARTIALLY_FILLED"]:
-                avg_price_str = order.get("avgPrice", "0")
-                qty_str = order.get("executedQty", "0")
-                return (
-                    Decimal(avg_price_str) if avg_price_str != "0" else None,
-                    Decimal(qty_str) if qty_str != "0" else None
-                )
+        if not algo_id:
+            return None, None
         
-        # Fallback: Historical if not found (e.g., already filled and archived)
-        historical_params = {
-            "symbol": symbol,
-            "startTime": int((time.time() - 3600) * 1000),  # Last hour
-            "endTime": int(time.time() * 1000),
-            "limit": 10
-        }
-        res = self.send_signed_request("GET", "/fapi/v1/historicalAlgoOrders", historical_params)
-        if isinstance(res, list):
-            for hist_order in res:
-                if hist_order.get("algoId") == algo_id:
-                    status = hist_order.get("orderStatus")
-                    if status in ["FILLED", "PARTIALLY_FILLED"]:
-                        avg_price_str = hist_order.get("avgPrice", "0")
-                        qty_str = hist_order.get("executedQty", "0")
-                        return (
-                            Decimal(avg_price_str) if avg_price_str != "0" else None,
-                            Decimal(qty_str) if qty_str != "0" else None
-                        )
-    except Exception as e:
-        log(f"Error querying algo fill details for algoId {algo_id}: {e}")
-    
-    return None, None
+        params = {"symbol": symbol, "algoId": algo_id}
+        
+        try:
+            # Primary: Query specific algo order
+            order = self.send_signed_request("GET", "/fapi/v1/algoOrder", params)
+            if isinstance(order, dict):
+                status = order.get("orderStatus")
+                if status in ["FILLED", "PARTIALLY_FILLED"]:
+                    avg_price_str = order.get("avgPrice", "0")
+                    qty_str = order.get("executedQty", "0")
+                    return (
+                        Decimal(avg_price_str) if avg_price_str != "0" else None,
+                        Decimal(qty_str) if qty_str != "0" else None
+                    )
+            
+            # Fallback: Historical orders (last hour)
+            historical_params = {
+                "symbol": symbol,
+                "startTime": int((time.time() - 3600) * 1000),
+                "endTime": int(time.time() * 1000),
+                "limit": 10
+            }
+            res = self.send_signed_request("GET", "/fapi/v1/historicalAlgoOrders", historical_params)
+            if isinstance(res, list):
+                for hist_order in res:
+                    if hist_order.get("algoId") == algo_id:
+                        status = hist_order.get("orderStatus")
+                        if status in ["FILLED", "PARTIALLY_FILLED"]:
+                            avg_price_str = hist_order.get("avgPrice", "0")
+                            qty_str = hist_order.get("executedQty", "0")
+                            return (
+                                Decimal(avg_price_str) if avg_price_str != "0" else None,
+                                Decimal(qty_str) if qty_str != "0" else None
+                            )
+        except Exception as e:
+            log(f"Error querying algo fill details for algoId {algo_id}: {e}")
+        
+        return None, None
     def get_filled_order_reason_and_price(self, symbol: str, sl_id: Optional[int] = None, 
                                           tp_id: Optional[int] = None, trail_id: Optional[int] = None) -> Tuple[str, Optional[Decimal]]:
         """
