@@ -121,6 +121,8 @@ news_guard_was_active: bool = False
 _last_news_block_reason: Optional[str] = None
 weekly_peak_equity = None
 weekly_start_time  = None
+symbol_filters_cache = {}
+PNL_FIELDS = ['date', 'trade_id', 'side', 'entry', 'exit', 'pnl_usd', 'pnl_r', 'loss_streak']
 
 # Add these 3 lines near other global state variables
 CONSEC_LOSSES = 0
@@ -235,25 +237,39 @@ def get_current_risk_pct(
 # ==================== SINGLE INSTANCE LOCK (Windows + Linux) ====================
 LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'sol_rsi_bot.lock')
 
-try:
-    # 'x' mode = create exclusively → fails if file exists
-    LOCK_HANDLE = open(LOCK_FILE, 'x')
-except FileExistsError:
-    print("Another instance is already running! Exiting.")
-    sys.exit(1)
-except FileNotFoundError:
-    # Windows TEMP may not exist
-    os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
-    LOCK_HANDLE = open(LOCK_FILE, 'x')
-
-# Optional real lock on Linux only
-if platform.system() != "Windows":
+def is_process_alive(pid):
+    """Check if a PID is running (cross-platform)."""
     try:
-        import fcntl
-        fcntl.lockf(LOCK_HANDLE.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except Exception:
-        pass
+        os.kill(pid, 0)  # Signal 0 = test if exists
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # Exists but we can't kill it (running)
 
+try:
+    # Try to create exclusive lock file
+    with open(LOCK_FILE, 'x') as f:
+        f.write(str(os.getpid()))  # Write our PID
+    LOCK_HANDLE = open(LOCK_FILE, 'r+')  # Keep open for cleanup
+except FileExistsError:
+    # File exists — check if stale
+    try:
+        with open(LOCK_FILE, 'r') as f:
+            old_pid = int(f.read().strip())
+        if is_process_alive(old_pid):
+            print("Another instance is already running! Exiting.")
+            sys.exit(1)
+        else:
+            print("Stale lock file found — removing and continuing.")
+            os.remove(LOCK_FILE)
+            # Retry creation
+            with open(LOCK_FILE, 'x') as f:
+                f.write(str(os.getpid()))
+            LOCK_HANDLE = open(LOCK_FILE, 'r+')
+    except Exception as e:
+        print(f"Lock file error: {e} — proceeding anyway (risky).")
+        LOCK_HANDLE = None
 # ==================== MEMORY LIMIT (Linux / OCI only) ====================
 if platform.system() != "Windows":
     try:
@@ -453,7 +469,7 @@ def check_volatility_abort(klines: list, period: int = 14) -> bool:
 def init_pnl_log():
     if not os.path.exists(PNL_LOG_FILE):
         with open(PNL_LOG_FILE, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=['date', 'trade_id', 'side', 'entry', 'exit', 'pnl_usd', 'pnl_r'])
+            writer = csv.DictWriter(f, fieldnames=PNL_FIELDS)
             writer.writeheader()
 
 def log_pnl(trade_id, side, entry, exit_price, qty, R):
@@ -467,7 +483,8 @@ def log_pnl(trade_id, side, entry, exit_price, qty, R):
     pnl_r = pnl_usd / total_risk if total_risk > 0 else 0
     
     # === CONSECUTIVE LOSS TRACKING ===
-    loss_pct = abs(pnl_usd) / (entry * qty) if pnl_usd < 0 else 0
+    denom = (Decimal(str(entry)) * Decimal(str(qty))) if entry and qty else Decimal("1")
+    loss_pct = abs(pnl_usd) / denom if pnl_usd < 0 else Decimal("0")
     is_full_loss = loss_pct >= 0.0074  # ~0.75% loss (1R)
     
     if pnl_usd < 0 and is_full_loss:
@@ -487,7 +504,7 @@ def log_pnl(trade_id, side, entry, exit_price, qty, R):
     }
     pnl_data.append(row)
     with open(PNL_LOG_FILE, 'a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=row.keys())
+        writer = csv.DictWriter(f, fieldnames=PNL_FIELDS)
         writer.writerow(row)
     
     return row
@@ -957,7 +974,8 @@ class BinanceClient:
                 return Decimal(str(trades[-1].get("price", "0")))
             return None
         except Exception as e:
-            log(f"Failed to fetch fill price: {str(e)}")
+            log(f"Failed to fetch fill price: {str(e)}", telegram_bot, telegram_chat_id)
+            logger.debug(traceback.format_exc())
             return None
 
     def place_algo_order(self, symbol: str, side: str, quantity: Decimal,
@@ -1076,22 +1094,32 @@ def aggregate_klines_to_45m(klines_15m):
 # ------------------- SYMBOL FILTERS -------------------
 def get_symbol_filters(client: BinanceClient, symbol: str):
     global symbol_filters_cache
-    if symbol_filters_cache is not None:
-        return symbol_filters_cache
+    if symbol in symbol_filters_cache:
+        return symbol_filters_cache[symbol]
+    
     info = client.public_request("/fapi/v1/exchangeInfo")
     s = next((x for x in info.get("symbols", []) if x.get("symbol") == symbol.upper()), None)
     if not s:
         raise ValueError(f"{symbol} not found in exchangeInfo")
+    
     filters = {f["filterType"]: f for f in s.get("filters", [])}
     lot = filters.get("LOT_SIZE")
     if not lot:
         raise ValueError("LOT_SIZE filter missing for symbol")
+    
     step_size = Decimal(str(lot["stepSize"]))
     min_qty = Decimal(str(lot["minQty"]))
     tick_size = Decimal(str(filters.get("PRICE_FILTER", {}).get("tickSize", "0.00000001")))
     min_notional = Decimal(str(filters.get("MIN_NOTIONAL", {}).get("notional", "0")))
-    symbol_filters_cache = {"stepSize": step_size, "minQty": min_qty, "tickSize": tick_size, "minNotional": min_notional}
-    return symbol_filters_cache
+    
+    cache_entry = {
+        "stepSize": step_size,
+        "minQty": min_qty,
+        "tickSize": tick_size,
+        "minNotional": min_notional
+    }
+    symbol_filters_cache[symbol] = cache_entry
+    return cache_entry
 
 # ------------------- ORDERS (REUSABLE) -------------------
 def place_orders(client, symbol, trade_state, tick_size, telegram_bot=None, telegram_chat_id=None):
@@ -1146,55 +1174,150 @@ def place_orders(client, symbol, trade_state, tick_size, telegram_bot=None, tele
             log(f"WARNING: Trailing activation {trail_activation_price_quant} >= current {current_price} for SHORT — may trigger immediately!", telegram_bot, telegram_chat_id)
     except Exception as e:
         log(f"Could not fetch current price for trailing validation: {e}", telegram_bot, telegram_chat_id)
-
-    # === PLACE ORDERS ===
-    failures = 0
-
-    # Stop Loss
+        
+            # === OPTIONAL: FINAL VALIDATION + SLIPPAGE CHECK AGAINST CURRENT MARKET PRICE ===
     try:
-        sl_order = client.place_stop_market(
-            symbol, close_side, qty_dec, sl_price_quant,
-            reduce_only=True
-        )
-        trade_state.sl_order_id = sl_order.get("orderId")
-        trade_state.sl_algo_id = sl_order.get("algoId")
-        trade_state.sl = float(sl_price_quant)
-        log(f"Placed STOP_MARKET SL at {float(sl_price_quant):.4f}: {sl_order}", telegram_bot, telegram_chat_id)
+        ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+        current_price = Decimal(str(ticker["price"]))
     except Exception as e:
-        failures += 1
-        log(f"Failed to place SL: {str(e)}", telegram_bot, telegram_chat_id)
+        log(f"Could not fetch current price for validation/slippage check: {e}", telegram_bot, telegram_chat_id)
+        logger.debug(traceback.format_exc())  # Full traceback in bot.log
+        current_price = None  # Skip checks if failed
 
-    # Take Profit
-    try:
-        tp_order = client.place_take_profit_market(
-            symbol, close_side, qty_dec, tp_price_quant,
-            reduce_only=True
-        )
-        trade_state.tp_order_id = tp_order.get("orderId")
-        trade_state.tp_algo_id = tp_order.get("algoId")
-        trade_state.tp = float(tp_price_quant)
-        log(f"Placed TAKE_PROFIT_MARKET TP at {float(tp_price_quant):.4f}: {tp_order}", telegram_bot, telegram_chat_id)
-    except Exception as e:
-        failures += 1
-        log(f"Failed to place TP: {str(e)}", telegram_bot, telegram_chat_id)
+    # Default to placing orders
+    sl_order = None
+    tp_order = None
+    trail_order = None
 
-    # Trailing Stop — uses correct pre-calculated activation price
+    if current_price is not None:
+        # Trailing activation warning
+        if trade_state.side == "LONG" and trail_activation_price_quant <= current_price:
+            log(f"WARNING: Trailing activation {trail_activation_price_quant} <= current {current_price} for LONG — may trigger immediately!", telegram_bot, telegram_chat_id)
+        elif trade_state.side == "SHORT" and trail_activation_price_quant >= current_price:
+            log(f"WARNING: Trailing activation {trail_activation_price_quant} >= current {current_price} for SHORT — may trigger immediately!", telegram_bot, telegram_chat_id)
+        
+        # SL slippage check
+        if trade_state.side == "LONG" and sl_price_quant < current_price * (Decimal("1") - MAX_ENTRY_SLIPPAGE_PCT):
+            log(f"SL skipped — slippage too high ({sl_price_quant} vs current {current_price})", telegram_bot, telegram_chat_id)
+        else:
+            try:
+                sl_order = client.place_stop_market(
+                    symbol, close_side, qty_dec, sl_price_quant,
+                    reduce_only=True
+                )
+                trade_state.sl_order_id = sl_order.get("orderId")
+                trade_state.sl_algo_id = sl_order.get("algoId")
+                trade_state.sl = float(sl_price_quant)
+                log(f"Placed STOP_MARKET SL at {float(sl_price_quant):.4f}: {sl_order}", telegram_bot, telegram_chat_id)
+            except Exception as e:
+                log(f"Failed to place SL: {str(e)}", telegram_bot, telegram_chat_id)
+                logger.debug(traceback.format_exc())  # Full traceback
+        
+        # TP slippage check
+        if trade_state.side == "LONG" and tp_price_quant > current_price * (Decimal("1") + MAX_ENTRY_SLIPPAGE_PCT):
+            log(f"TP skipped — slippage too high ({tp_price_quant} vs current {current_price})", telegram_bot, telegram_chat_id)
+        else:
+            try:
+                tp_order = client.place_take_profit_market(
+                    symbol, close_side, qty_dec, tp_price_quant,
+                    reduce_only=True
+                )
+                trade_state.tp_order_id = tp_order.get("orderId")
+                trade_state.tp_algo_id = tp_order.get("algoId")
+                trade_state.tp = float(tp_price_quant)
+                log(f"Placed TAKE_PROFIT_MARKET TP at {float(tp_price_quant):.4f}: {tp_order}", telegram_bot, telegram_chat_id)
+            except Exception as e:
+                log(f"Failed to place TP: {str(e)}", telegram_bot, telegram_chat_id)
+                logger.debug(traceback.format_exc())
+        
+        # Trailing — dynamic, always place with warning
+        try:
+            trail_order = client.place_trailing_stop_market(
+                symbol, close_side, qty_dec,
+                callback_rate=callback_rate,
+                activation_price=trail_activation_price_quant,
+                reduce_only=True
+            )
+            trade_state.trail_order_id = trail_order.get("orderId")
+            trade_state.trail_algo_id = trail_order.get("algoId")
+            trade_state.trail_activation_price = float(trail_activation_price_quant)
+            log(f"Placed TRAILING_STOP_MARKET (activation: {float(trail_activation_price_quant):.4f}, callback: {float(callback_rate):.2f}%): {trail_order}",
+                telegram_bot, telegram_chat_id)
+        except Exception as e:
+            log(f"Failed to place trailing stop: {str(e)}", telegram_bot, telegram_chat_id)
+            logger.debug(traceback.format_exc())
+
+    # === OPTIONAL: FINAL VALIDATION + SLIPPAGE CHECK AGAINST CURRENT MARKET PRICE ===
     try:
-        trail_order = client.place_trailing_stop_market(
-            symbol, close_side, qty_dec,
-            callback_rate=callback_rate,
-            activation_price=trail_activation_price_quant,
-            reduce_only=True
-        )
-        trade_state.trail_order_id = trail_order.get("orderId")
-        trade_state.trail_algo_id = trail_order.get("algoId")
-        # trail_activation_price already stored upstream, but confirm
-        trade_state.trail_activation_price = float(trail_activation_price_quant)
-        log(f"Placed TRAILING_STOP_MARKET (activation: {float(trail_activation_price_quant):.4f}, callback: {float(callback_rate):.2f}%): {trail_order}",
-            telegram_bot, telegram_chat_id)
+        ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+        current_price = Decimal(str(ticker["price"]))
     except Exception as e:
-        failures += 1
-        log(f"Failed to place trailing stop: {str(e)}", telegram_bot, telegram_chat_id)
+        log(f"Could not fetch current price for validation/slippage check: {e}", telegram_bot, telegram_chat_id)
+        logger.debug(traceback.format_exc())  # Full traceback in bot.log
+        current_price = None  # Skip checks if failed
+
+    # Default to placing orders
+    sl_order = None
+    tp_order = None
+    trail_order = None
+
+    if current_price is not None:
+        # Trailing activation warning
+        if trade_state.side == "LONG" and trail_activation_price_quant <= current_price:
+            log(f"WARNING: Trailing activation {trail_activation_price_quant} <= current {current_price} for LONG — may trigger immediately!", telegram_bot, telegram_chat_id)
+        elif trade_state.side == "SHORT" and trail_activation_price_quant >= current_price:
+            log(f"WARNING: Trailing activation {trail_activation_price_quant} >= current {current_price} for SHORT — may trigger immediately!", telegram_bot, telegram_chat_id)
+        
+        # SL slippage check
+        if trade_state.side == "LONG" and sl_price_quant < current_price * (Decimal("1") - MAX_ENTRY_SLIPPAGE_PCT):
+            log(f"SL skipped — slippage too high ({sl_price_quant} vs current {current_price})", telegram_bot, telegram_chat_id)
+        else:
+            try:
+                sl_order = client.place_stop_market(
+                    symbol, close_side, qty_dec, sl_price_quant,
+                    reduce_only=True
+                )
+                trade_state.sl_order_id = sl_order.get("orderId")
+                trade_state.sl_algo_id = sl_order.get("algoId")
+                trade_state.sl = float(sl_price_quant)
+                log(f"Placed STOP_MARKET SL at {float(sl_price_quant):.4f}: {sl_order}", telegram_bot, telegram_chat_id)
+            except Exception as e:
+                log(f"Failed to place SL: {str(e)}", telegram_bot, telegram_chat_id)
+                logger.debug(traceback.format_exc())  # Full traceback
+        
+        # TP slippage check
+        if trade_state.side == "LONG" and tp_price_quant > current_price * (Decimal("1") + MAX_ENTRY_SLIPPAGE_PCT):
+            log(f"TP skipped — slippage too high ({tp_price_quant} vs current {current_price})", telegram_bot, telegram_chat_id)
+        else:
+            try:
+                tp_order = client.place_take_profit_market(
+                    symbol, close_side, qty_dec, tp_price_quant,
+                    reduce_only=True
+                )
+                trade_state.tp_order_id = tp_order.get("orderId")
+                trade_state.tp_algo_id = tp_order.get("algoId")
+                trade_state.tp = float(tp_price_quant)
+                log(f"Placed TAKE_PROFIT_MARKET TP at {float(tp_price_quant):.4f}: {tp_order}", telegram_bot, telegram_chat_id)
+            except Exception as e:
+                log(f"Failed to place TP: {str(e)}", telegram_bot, telegram_chat_id)
+                logger.debug(traceback.format_exc())
+        
+        # Trailing — dynamic, always place with warning
+        try:
+            trail_order = client.place_trailing_stop_market(
+                symbol, close_side, qty_dec,
+                callback_rate=callback_rate,
+                activation_price=trail_activation_price_quant,
+                reduce_only=True
+            )
+            trade_state.trail_order_id = trail_order.get("orderId")
+            trade_state.trail_algo_id = trail_order.get("algoId")
+            trade_state.trail_activation_price = float(trail_activation_price_quant)
+            log(f"Placed TRAILING_STOP_MARKET (activation: {float(trail_activation_price_quant):.4f}, callback: {float(callback_rate):.2f}%): {trail_order}",
+                telegram_bot, telegram_chat_id)
+        except Exception as e:
+            log(f"Failed to place trailing stop: {str(e)}", telegram_bot, telegram_chat_id)
+            logger.debug(traceback.format_exc())
 
     # === EMERGENCY: All protective orders failed ===
     if failures >= 3:
@@ -1370,114 +1493,113 @@ class TradeState:
 def debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot=None, telegram_chat_id=None):
     """Recover missing SL/TP/Trailing orders. Idempotent. Thread-safe. Supports 2025 Algo Orders."""
     if not trade_state.active:
-        return
+        return False
     
-    try:
-                # STEP 1: VERIFY position still exists
+    # PAUSE 2.5s to let dust settle (moved here from caller)
+    time.sleep(2.5)
+    
+    max_retries = 3
+    retry_delay = 1  # seconds
+    
+    for attempt in range(max_retries):
         try:
+            # STEP 1: VERIFY position still exists
             pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
             
-            # Normalize response: dict with 'data' or direct list
+            # Normalize response
             if isinstance(pos_resp, dict) and 'data' in pos_resp:
                 positions = pos_resp['data']
             elif isinstance(pos_resp, list):
                 positions = pos_resp
             else:
                 log(f"Unexpected positionRisk format: {type(pos_resp)}", telegram_bot, telegram_chat_id)
-                return
+                return False
             
-            # Find the position for our symbol
-            pos_item = None
-            for item in positions:
-                if isinstance(item, dict) and item.get("symbol") == symbol:
-                    pos_item = item
-                    break
+            pos_item = next((p for p in positions if p.get("symbol") == symbol), None)
+            if pos_item is None or Decimal(str(pos_item.get("positionAmt", "0"))) == 0:
+                return False  # Silent skip
             
-            if pos_item is None:
-                log("No position found for symbol — skipping recovery", telegram_bot, telegram_chat_id)
-                return
+            # STEP 2: CHECK current price hasn't crashed
+            current_price = Decimal(str(client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})["price"]))
+            entry = Decimal(str(trade_state.entry_price))
+            if current_price < entry * Decimal("0.99"):
+                return False  # Silent skip
             
-            pos_amt = Decimal(str(pos_item.get("positionAmt", "0")))
+            # STEP 3: Fetch orders
+            regular_open_orders = {o["orderId"]: o for o in client.get_open_orders(symbol) if isinstance(o, dict) and "orderId" in o}
+            algo_open_orders_resp = client.send_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
+            algo_open_orders = algo_open_orders_resp if isinstance(algo_open_orders_resp, list) else []
+            algo_open_ids = {o.get("algoId") for o in algo_open_orders if isinstance(o, dict) and o.get("algoId") is not None}
+            all_open_ids = set(regular_open_orders.keys()) | algo_open_ids
             
-            if pos_amt == 0:
-                log("No position open — skipping recovery (likely already closed by SL/TP/trailing)", telegram_bot, telegram_chat_id)
-                return
-                
+            recovered = False
+            
+            # Recover SL
+            sl_id = trade_state.sl_order_id or trade_state.sl_algo_id
+            if sl_id and sl_id not in all_open_ids:
+                log(f"SL missing (ID={sl_id}). Re-issuing...", telegram_bot, telegram_chat_id)
+                sl_price = _calc_sl_price(trade_state.entry_price, trade_state.side, tick_size)
+                new_sl = _place_stop_market(client, symbol, trade_state, sl_price)
+                if new_sl:
+                    trade_state.sl_order_id = new_sl.get("orderId")
+                    trade_state.sl_algo_id = new_sl.get("algoId")
+                    trade_state.sl = float(sl_price)
+                    _tg_notify("SL Recovered", f"New Stop: {trade_state.sl:.4f}\nID: {trade_state.sl_algo_id or trade_state.sl_order_id}", symbol, telegram_bot, telegram_chat_id)
+                    recovered = True
+            
+            # Recover TP
+            tp_id = trade_state.tp_order_id or trade_state.tp_algo_id
+            if tp_id and tp_id not in all_open_ids:
+                log(f"TP missing (ID={tp_id}). Re-issuing...", telegram_bot, telegram_chat_id)
+                tp_price = _calc_tp_price(trade_state.entry_price, trade_state.side, tick_size)
+                new_tp = _place_take_profit(client, symbol, trade_state, tp_price)
+                if new_tp:
+                    trade_state.tp_order_id = new_tp.get("orderId")
+                    trade_state.tp_algo_id = new_tp.get("algoId")
+                    trade_state.tp = float(tp_price)
+                    _tg_notify("TP Recovered", f"New TP: {trade_state.tp:.4f}\nID: {trade_state.tp_algo_id or trade_state.tp_order_id}", symbol, telegram_bot, telegram_chat_id)
+                    recovered = True
+            
+            # Recover Trailing
+            trail_id = trade_state.trail_order_id or trade_state.trail_algo_id
+            if trail_id and trail_id not in all_open_ids:
+                log(f"Trailing missing (ID={trail_id}). Re-issuing safely...", telegram_bot, telegram_chat_id)
+                act_price = current_price
+                new_trail = _place_trailing_stop(client, symbol, trade_state, act_price)
+                if new_trail:
+                    trade_state.trail_order_id = new_trail.get("orderId")
+                    trade_state.trail_algo_id = new_trail.get("algoId")
+                    trade_state.trail_activation_price = float(act_price)
+                    trade_state.current_trail_stop = float(new_trail.get("stopPrice") or act_price)
+                    _tg_notify("Trailing Recovered Safely", f"New activation: {act_price:.4f}", symbol, telegram_bot, telegram_chat_id)
+                    recovered = True
+            
+            if not recovered:
+                # Quiet success — no log
+                pass
+            
+            return recovered
+        
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429 or "throttled" in str(e).lower():
+                if attempt < max_retries - 1:
+                    wait = retry_delay * (2 ** attempt)
+                    log(f"Rate limited (attempt {attempt+1}/{max_retries}) — waiting {wait}s...", telegram_bot, telegram_chat_id)
+                    time.sleep(wait)
+                    continue
+                else:
+                    log("Max retries exceeded for recovery — skipping", telegram_bot, telegram_chat_id)
+                    return False
+            else:
+                log(f"Recovery failed: {str(e)}", telegram_bot, telegram_chat_id)
+                logger.debug(traceback.format_exc())
+                return False
         except Exception as e:
-            log(f"Position verification failed: {str(e)} — skipping recovery", telegram_bot, telegram_chat_id)
-            return
-        
-        # STEP 2: CHECK current price hasn't crashed
-        current_price = Decimal(str(client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})["price"]))
-        entry = Decimal(str(trade_state.entry_price))
-        
-        if current_price < entry * Decimal("0.99"):  # Already down >1% — too late for safe recovery
-            log(f"Price too low ({current_price:.4f} < {entry * 0.99:.4f}) — skipping recovery to avoid worse loss", telegram_bot, telegram_chat_id)
-            return
-        
-        # If we reach here: position exists AND price is safe → proceed with recovery
-        log("Position still open and price safe — proceeding with recovery checks...", telegram_bot, telegram_chat_id)
-        
-        # === STEP 3: Fetch orders and check for missing ===
-        regular_open_orders = {o["orderId"]: o for o in client.get_open_orders(symbol) if isinstance(o, dict) and "orderId" in o}
-        
-        # Fetch algo orders FIRST
-        algo_open_orders_resp = client.send_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
-        algo_open_orders = algo_open_orders_resp if isinstance(algo_open_orders_resp, list) else []
-        
-        # Now build IDs safely
-        algo_open_ids = {o.get("algoId") for o in algo_open_orders if isinstance(o, dict) and o.get("algoId") is not None}
-        
-        all_open_ids = set(regular_open_orders.keys()) | algo_open_ids
-        
-        recovered_something = False
-        
-        # Recover SL
-        sl_id = trade_state.sl_order_id or trade_state.sl_algo_id
-        if sl_id and sl_id not in all_open_ids:
-            log(f"SL missing (ID={sl_id}). Re-issuing...", telegram_bot, telegram_chat_id)
-            sl_price = _calc_sl_price(trade_state.entry_price, trade_state.side, tick_size)
-            new_sl = _place_stop_market(client, symbol, trade_state, sl_price)
-            if new_sl:
-                trade_state.sl_order_id = new_sl.get("orderId")
-                trade_state.sl_algo_id = new_sl.get("algoId")
-                trade_state.sl = float(sl_price)
-                _tg_notify("SL Recovered", f"New Stop: {trade_state.sl:.4f}\nID: {trade_state.sl_algo_id or trade_state.sl_order_id}", symbol, telegram_bot, telegram_chat_id)
-                recovered_something = True
-        
-        # Recover TP
-        tp_id = trade_state.tp_order_id or trade_state.tp_algo_id
-        if tp_id and tp_id not in all_open_ids:
-            log(f"TP missing (ID={tp_id}). Re-issuing...", telegram_bot, telegram_chat_id)
-            tp_price = _calc_tp_price(trade_state.entry_price, trade_state.side, tick_size)
-            new_tp = _place_take_profit(client, symbol, trade_state, tp_price)
-            if new_tp:
-                trade_state.tp_order_id = new_tp.get("orderId")
-                trade_state.tp_algo_id = new_tp.get("algoId")
-                trade_state.tp = float(tp_price)
-                _tg_notify("TP Recovered", f"New TP: {trade_state.tp:.4f}\nID: {trade_state.tp_algo_id or trade_state.tp_order_id}", symbol, telegram_bot, telegram_chat_id)
-                recovered_something = True
-        
-        # Recover Trailing — only if safe
-        trail_id = trade_state.trail_order_id or trade_state.trail_algo_id
-        if trail_id and trail_id not in all_open_ids:
-            log(f"Trailing missing (ID={trail_id}). Re-issuing safely...", telegram_bot, telegram_chat_id)
-            # Use current price for new trail activation (prevents immediate trigger)
-            act_price = current_price
-            new_trail = _place_trailing_stop(client, symbol, trade_state, act_price)
-            if new_trail:
-                trade_state.trail_order_id = new_trail.get("orderId")
-                trade_state.trail_algo_id = new_trail.get("algoId")
-                trade_state.trail_activation_price = float(act_price)
-                trade_state.current_trail_stop = float(new_trail.get("stopPrice") or act_price)
-                _tg_notify("Trailing Recovered Safely", f"New activation: {act_price:.4f}", symbol, telegram_bot, telegram_chat_id)
-                recovered_something = True
-        
-        if not recovered_something:
-            log("All protective orders confirmed present. No recovery needed.", telegram_bot, telegram_chat_id)
+            log(f"Recovery failed: {str(e)}", telegram_bot, telegram_chat_id)
+            logger.debug(traceback.format_exc())
+            return False
     
-    except Exception as e:
-        log(f"Recovery failed: {e}", telegram_bot, telegram_chat_id)
+    return False  # All retries failed
         
 
 # === PRIVATE HELPERS (DRY + SAFE) ===
@@ -1521,8 +1643,7 @@ def _tg_notify(title, body, symbol, bot, chat_id):
     if bot and chat_id:
         telegram_post(bot, chat_id, f"{title} for {symbol}\n{body}")
 # ------------------- POLLING FALLBACK -------------------
-def start_polling_mode(symbol, telegram_bot, telegram_chat_id):
-    global _polling_active
+def start_polling_mode(client, symbol, telegram_bot, telegram_chat_id):
     if _polling_active:
         return
     _polling_active = True
@@ -1567,14 +1688,14 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
             log("WebSocket connection failed. Switching to polling mode.", telegram_bot, telegram_chat_id)
             telegram_post(telegram_bot, telegram_chat_id, "WebSocket failed  Switched to REST polling (3s)")
             _ws_failed = True
-            start_polling_mode(symbol, telegram_bot, telegram_chat_id)
+            start_polling_mode(client, symbol, telegram_bot, telegram_chat_id)
 
     def on_close(ws_app, close_status_code, close_reason):
         global _ws_failed
         if not _ws_failed and trade_state.active:
             log("WebSocket closed. Switching to polling mode.", telegram_bot, telegram_chat_id)
             _ws_failed = True
-            start_polling_mode(symbol, telegram_bot, telegram_chat_id)
+            start_polling_mode(client, symbol, telegram_bot, telegram_chat_id)
 
     def on_open(ws_app):
         subscribe_msg = {
@@ -2270,13 +2391,6 @@ def _safe_sleep(total_seconds):
             break
         time.sleep(min(1, remaining))
         remaining -= 1
-
-def closes_and_volumes_from_klines(klines):
-    closes = [float(k[4]) for k in klines]
-    volumes = [float(k[5]) for k in klines]
-    close_times = [int(k[6]) for k in klines]
-    opens = [float(k[1]) for k in klines]
-    return closes, volumes, close_times, opens
 
 def run_scheduler(bot, chat_id):
     global daily_start_equity, account_size
