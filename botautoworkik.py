@@ -1059,7 +1059,7 @@ def place_orders(client, symbol, trade_state, tick_size, telegram_bot=None, tele
         trade_state.sl_order_id = sl_order.get("orderId")
         trade_state.sl_algo_id = sl_order.get("algoId")
         trade_state.sl = sl_price_quant
-        log(f"Placed STOP_MARKET SL at {float(sl_price_quant):.4f}: {json.dumps(sl_order, indent=2)}", telegram_bot, telegram_chat_id)
+        log(f"Placed STOP_MARKET SL at {float(sl_price_quant):.4f}: {sl_order}", telegram_bot, telegram_chat_id)
     except Exception as e:
         failures += 1
         log(f"Failed to place SL: {str(e)}", telegram_bot, telegram_chat_id)
@@ -1073,7 +1073,7 @@ def place_orders(client, symbol, trade_state, tick_size, telegram_bot=None, tele
         trade_state.tp_order_id = tp_order.get("orderId")
         trade_state.tp_algo_id = tp_order.get("algoId")
         trade_state.tp = tp_price_quant
-        log(f"Placed TAKE_PROFIT_MARKET TP at {float(tp_price_quant):.4f}: {json.dumps(tp_order, indent=2)}", telegram_bot, telegram_chat_id)
+        log(f"Placed TAKE_PROFIT_MARKET TP at {float(tp_price_quant):.4f}: {tp_order}", telegram_bot, telegram_chat_id)
     except Exception as e:
         failures += 1
         log(f"Failed to place TP: {str(e)}", telegram_bot, telegram_chat_id)
@@ -1088,8 +1088,8 @@ def place_orders(client, symbol, trade_state, tick_size, telegram_bot=None, tele
         )
         trade_state.trail_order_id = trail_order.get("orderId")
         trade_state.trail_algo_id = trail_order.get("algoId")
-        log(f"Placed TRAILING_STOP_MARKET (activation: {float(trail_activation_price_quant):.4f}, callback: {float(callback_rate):.2f}%): "
-        f"{json.dumps(trail_order, indent=2)}", telegram_bot, telegram_chat_id)
+        log(f"Placed TRAILING_STOP_MARKET (activation: {float(trail_activation_price_quant):.4f}, callback: {float(callback_rate):.2f}%): {trail_order}",
+            telegram_bot, telegram_chat_id)
     except Exception as e:
         failures += 1
         log(f"Failed to place trailing stop: {str(e)}", telegram_bot, telegram_chat_id)
@@ -1422,18 +1422,34 @@ def send_closure_telegram(symbol, side, entry_price, exit_price, qty, pnl_usd, p
     )
     telegram_post(bot, chat_id, message)
 
-# ------------------- MONITOR TRADE (FIXED: Complete with all logic) -------------------
+def start_polling_mode(symbol, telegram_bot, telegram_chat_id):
+    global _polling_active
+    if _polling_active:
+        return
+    _polling_active = True
+    log(f"Now polling price every {POLLING_INTERVAL}s via REST API.", telegram_bot, telegram_chat_id)
+
+    def polling_loop():
+        while _polling_active and not STOP_REQUESTED:
+            try:
+                ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+                price = Decimal(str(ticker['price']))
+                _price_queue.put(price)
+            except Exception as e:
+                log(f"Polling failed: {e}. Will retry...", telegram_bot, telegram_chat_id)
+            time.sleep(POLLING_INTERVAL)
+
+    threading.Thread(target=polling_loop, daemon=True).start()
+
+# ------------------- MONITOR TRADE (FULLY CORRECTED) -------------------
 def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, current_candle_close_time):
     global _orders_cancelled, _polling_active, _ws_failed
-    
-    # Initialize all variables at top of function
-    trade_start_time = time.time()
+    log("Monitoring active trade...", telegram_bot, telegram_chat_id)
+    trade_start_time = time.time()  # ← This fixes the error
     last_recovery_check = 0
     current_price = None
     ws = None
     ws_running = False
-    
-    log("Monitoring active trade...", telegram_bot, telegram_chat_id)
 
     # === WEBSOCKET CALLBACKS ===
     def on_message(ws_app, message):
@@ -1452,14 +1468,14 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
             log("WebSocket connection failed. Switching to polling mode.", telegram_bot, telegram_chat_id)
             telegram_post(telegram_bot, telegram_chat_id, "WebSocket failed  Switched to REST polling (3s)")
             _ws_failed = True
-            start_polling_mode(client, symbol, telegram_bot, telegram_chat_id)
+            start_polling_mode(symbol, telegram_bot, telegram_chat_id)
 
     def on_close(ws_app, close_status_code, close_reason):
         global _ws_failed
         if not _ws_failed and trade_state.active:
             log("WebSocket closed. Switching to polling mode.", telegram_bot, telegram_chat_id)
             _ws_failed = True
-            start_polling_mode(client, symbol, telegram_bot, telegram_chat_id)
+            start_polling_mode(symbol, telegram_bot, telegram_chat_id)
 
     def on_open(ws_app):
         subscribe_msg = {
@@ -1496,20 +1512,25 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
 
     start_ws()
 
+
     try:
         while trade_state.active and not STOP_REQUESTED:
             if current_price is None:
                 time.sleep(1)
                 continue
             
-            # === RECOVERY CHECK ===
+            # --- Recovery Check ---
             if time.time() - last_recovery_check >= RECOVERY_CHECK_INTERVAL:
-                try:
-                    debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
-                except Exception as e:
-                    log(f"Recovery check error: {e}", telegram_bot, telegram_chat_id)
+                # Optional: Brief status every minute to prove the check is alive
+                if int(time.time()) % 60 == 0:
+                    log("Periodic recovery check running...", telegram_bot, telegram_chat_id)
+                
+                recovered = debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
+                
                 last_recovery_check = time.time()
-
+                
+                if recovered:
+                    log("Recovery successful — missing protective orders restored.", telegram_bot, telegram_chat_id)
             # === GET LATEST PRICE ===
             try:
                 price_candidate = _price_queue.get_nowait()
@@ -1733,26 +1754,6 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
             except Exception:
                 pass
 
-# ------------------- START POLLING MODE -------------------
-def start_polling_mode(client, symbol, telegram_bot, telegram_chat_id):
-    """Start polling mode with client passed as parameter."""
-    global _polling_active
-    if _polling_active:
-        return
-    _polling_active = True
-    log(f"Now polling price every {POLLING_INTERVAL}s via REST API.", telegram_bot, telegram_chat_id)
-
-    def polling_loop():
-        while _polling_active and not STOP_REQUESTED:
-            try:
-                ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
-                price = Decimal(str(ticker['price']))
-                _price_queue.put(price)
-            except Exception as e:
-                log(f"Polling failed: {e}. Will retry...", telegram_bot, telegram_chat_id)
-            time.sleep(POLLING_INTERVAL)
-
-    threading.Thread(target=polling_loop, daemon=True).start()
 # ------------------- TRADING LOOP (FIXED: Complete signature and consistent Decimal usage) -------------------
 def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, telegram_bot, telegram_chat_id):
     # FIXED: Complete function signature
