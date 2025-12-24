@@ -1512,10 +1512,7 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
         )
         thread = threading.Thread(
             target=ws.run_forever,
-            kwargs={
-                'ping_interval': None,   # ← Disable client pings completely
-                'ping_timeout': None     # ← No timeout enforcement
-            },
+            kwargs={'ping_interval': 20, 'ping_timeout': 10},
             daemon=True
         )
         thread.start()
