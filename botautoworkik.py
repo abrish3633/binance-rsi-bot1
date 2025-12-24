@@ -776,26 +776,18 @@ class BinanceClient:
         return self.send_signed_request("POST", "/fapi/v1/leverage", params)
     
     def get_algo_fill_details(self, symbol: str, algo_id: int) -> Tuple[Optional[Decimal], Optional[Decimal]]:
-        """
-        Query a specific algo order by algoId and return avgPrice and executed qty if filled.
-        Returns (avg_price: Decimal or None, executed_qty: Decimal or None)
-        """
         if not algo_id:
             return None, None
         
-        params = {
-            "symbol": symbol,
-            "algoId": algo_id
-        }
+        params = {"symbol": symbol, "algoId": algo_id}
         
         try:
-            res = self.send_signed_request("GET", "/fapi/v1/allAlgoOrders", params)
-            if isinstance(res, list) and len(res) > 0:
-                order = res[0]  # Most recent / only match
+            order = self.send_signed_request("GET", "/fapi/v1/algoOrder", params)
+            if isinstance(order, dict):
                 status = order.get("orderStatus")
                 if status in ["FILLED", "PARTIALLY_FILLED"]:
                     avg_price_str = order.get("avgPrice", "0")
-                    qty_str = order.get("executedQty", "0")  # or cumQty depending on response
+                    qty_str = order.get("executedQty", "0")
                     return (
                         Decimal(avg_price_str) if avg_price_str != "0" else None,
                         Decimal(qty_str) if qty_str != "0" else None
@@ -803,26 +795,7 @@ class BinanceClient:
         except Exception as e:
             log(f"Error querying algo fill details for algoId {algo_id}: {e}")
         
-        return None, None
-    def get_filled_order_reason_and_price(self, symbol: str, sl_id: Optional[int] = None, 
-                                          tp_id: Optional[int] = None, trail_id: Optional[int] = None) -> Tuple[str, Optional[Decimal]]:
-        """
-        Check SL, TP, and Trailing algo orders in priority order.
-        Returns (reason: str, avg_fill_price: Decimal or None)
-        """
-        checks = [
-            (sl_id, "Stop Loss"),
-            (tp_id, "Take Profit"),
-            (trail_id, "Trailing Stop")
-        ]
-        
-        for algo_id, reason in checks:
-            if algo_id:
-                avg_price, _ = self.get_algo_fill_details(symbol, algo_id)
-                if avg_price is not None:
-                    return reason, avg_price
-        
-        return "Unknown", None
+        return None, None  # ← No historical fallback — rely on closure detection instead
     
     def _check_position_mode(self):
         try:
@@ -971,7 +944,8 @@ class BinanceClient:
             "type": order_type,           # ← FIXED: lowercase 't' — this was the bug
             "quantity": str(quantity),
             "reduceOnly": "true" if reduce_only else "false",
-            "timeInForce": "GTE_GTC"
+            "timeInForce": "GTE_GTC",
+            "priceProtect": "true"  # Add this
         }
         if trigger_price is not None:
             params["triggerPrice"] = str(trigger_price)     # ← Docs confirm: triggerPrice for SL/TP
@@ -1308,15 +1282,23 @@ def trading_allowed(client, symbol, telegram_bot, telegram_chat_id) -> bool:
     
     # 1. Weekly DD Guard (20% hard stop)
     current_balance = fetch_balance(client)
-    risk_allowed = get_current_risk_pct(current_balance, telegram_bot, telegram_chat_id)
+    risk_allowed = get_current_risk_pct(
+        current_equity=current_balance,
+        client=client,
+        symbol=symbol,
+        telegram_bot=telegram_bot,
+        telegram_chat_id=telegram_chat_id
+    )
     if risk_allowed <= Decimal("0"):
         return False  # Weekly DD stop triggered
-    # ...
+
+    # 2. Consecutive Loss Guard
     if USE_CONSEC_LOSS_GUARD and CONSEC_LOSSES >= MAX_CONSEC_LOSSES:
         if not bot_state.consec_loss_guard_alert_sent:
-            log(f"🚫 3 CONSECUTIVE FULL LOSSES REACHED ({CONSEC_LOSSES}) — TRADING PAUSED UNTIL NEXT WEEK OR WIN", telegram_bot, telegram_chat_id)
+            log(f"CONSECUTIVE FULL LOSSES REACHED ({CONSEC_LOSSES}) — TRADING PAUSED UNTIL NEXT WEEK OR WIN", telegram_bot, telegram_chat_id)
             bot_state.consec_loss_guard_alert_sent = True
         return False
+    
     return True
 
 def has_active_position(client: BinanceClient, symbol: str, telegram_bot=None, telegram_chat_id=None):
@@ -1368,86 +1350,80 @@ class TradeState:
         self.tp_algo_id     = None
         self.trail_algo_id  = None
 def debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot=None, telegram_chat_id=None):
-    """Recover missing SL/TP/Trailing orders. Idempotent. Thread-safe. Supports 2025 Algo Orders."""
+    """Recover missing protective algo orders. Idempotent. Thread-safe."""
     if not trade_state.active:
         return False
     
     try:
-        # STEP 1: VERIFY position still exists
+        # Verify position exists
         pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-        
-        # Normalize response
-        if isinstance(pos_resp, dict) and 'data' in pos_resp:
-            positions = pos_resp['data']
-        elif isinstance(pos_resp, list):
-            positions = pos_resp
-        else:
-            return False  # Silent skip
-        
+        positions = pos_resp.get('data') if isinstance(pos_resp, dict) else pos_resp if isinstance(pos_resp, list) else []
         pos_item = next((p for p in positions if p.get("symbol") == symbol), None)
-        if pos_item is None or Decimal(str(pos_item.get("positionAmt", "0"))) == 0:
-            return False  # Silent skip
+        if not pos_item or Decimal(str(pos_item.get("positionAmt", "0"))) == 0:
+            return False
         
-        # STEP 2: CHECK current price hasn't crashed
+        # Emergency close on ~1% adverse move (symmetric for long/short)
         current_price = Decimal(str(client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})["price"]))
         entry = Decimal(str(trade_state.entry_price))
-        if current_price < entry * Decimal("0.99"):
-            return False  # Silent skip
         
-        # STEP 3: Fetch orders
-        regular_open_orders = {o["orderId"]: o for o in client.get_open_orders(symbol) if isinstance(o, dict) and "orderId" in o}
-        algo_open_orders_resp = client.send_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
-        algo_open_orders = algo_open_orders_resp if isinstance(algo_open_orders_resp, list) else []
-        algo_open_ids = {o.get("algoId") for o in algo_open_orders if isinstance(o, dict) and o.get("algoId") is not None}
-        all_open_ids = set(regular_open_orders.keys()) | algo_open_ids
+        adverse_move = False
+        if trade_state.side == "LONG" and current_price <= entry * Decimal("0.99"):
+            adverse_move = True
+        elif trade_state.side == "SHORT" and current_price >= entry * Decimal("1.01"):
+            adverse_move = True
+        
+        if adverse_move:
+            log(f"EMERGENCY CLOSE: Price moved adversely ~1% | Entry={float(entry):.4f} Current={float(current_price):.4f}", telegram_bot, telegram_chat_id)
+            _request_stop(symbol=symbol, telegram_bot=telegram_bot, telegram_chat_id=telegram_chat_id)
+            trade_state.active = False
+            return True  # Action taken (closure)
+        
+        # Fetch ONLY open algo orders (protectives are algo)
+        algo_resp = client.send_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
+        algo_open = algo_resp if isinstance(algo_resp, list) else []
+        open_algo_ids = {o.get("algoId") for o in algo_open if o.get("algoId") is not None}
         
         recovered = False
         
         # Recover SL
-        sl_id = trade_state.sl_order_id or trade_state.sl_algo_id
-        if sl_id and sl_id not in all_open_ids:
-            log(f"SL missing (ID={sl_id}). Re-issuing...", telegram_bot, telegram_chat_id)
+        if trade_state.sl_algo_id and trade_state.sl_algo_id not in open_algo_ids:
+            log(f"SL missing (algoId={trade_state.sl_algo_id}). Re-issuing...", telegram_bot, telegram_chat_id)
             sl_price = _calc_sl_price(trade_state.entry_price, trade_state.side, tick_size)
             new_sl = _place_stop_market(client, symbol, trade_state, sl_price)
-            if new_sl:
-                trade_state.sl_order_id = new_sl.get("orderId")
-                trade_state.sl_algo_id = new_sl.get("algoId")
+            if new_sl and new_sl.get("algoId"):
+                trade_state.sl_algo_id = new_sl["algoId"]
                 trade_state.sl = float(sl_price)
-                _tg_notify("SL Recovered", f"New Stop: {trade_state.sl:.4f}\nID: {trade_state.sl_algo_id or trade_state.sl_order_id}", symbol, telegram_bot, telegram_chat_id)
+                log(f"SL RECOVERED | New algoId={trade_state.sl_algo_id} | Price={sl_price:.4f}", telegram_bot, telegram_chat_id)
                 recovered = True
         
         # Recover TP
-        tp_id = trade_state.tp_order_id or trade_state.tp_algo_id
-        if tp_id and tp_id not in all_open_ids:
-            log(f"TP missing (ID={tp_id}). Re-issuing...", telegram_bot, telegram_chat_id)
+        if trade_state.tp_algo_id and trade_state.tp_algo_id not in open_algo_ids:
+            log(f"TP missing (algoId={trade_state.tp_algo_id}). Re-issuing...", telegram_bot, telegram_chat_id)
             tp_price = _calc_tp_price(trade_state.entry_price, trade_state.side, tick_size)
             new_tp = _place_take_profit(client, symbol, trade_state, tp_price)
-            if new_tp:
-                trade_state.tp_order_id = new_tp.get("orderId")
-                trade_state.tp_algo_id = new_tp.get("algoId")
+            if new_tp and new_tp.get("algoId"):
+                trade_state.tp_algo_id = new_tp["algoId"]
                 trade_state.tp = float(tp_price)
-                _tg_notify("TP Recovered", f"New TP: {trade_state.tp:.4f}\nID: {trade_state.tp_algo_id or trade_state.tp_order_id}", symbol, telegram_bot, telegram_chat_id)
+                log(f"TP RECOVERED | New algoId={trade_state.tp_algo_id} | Price={tp_price:.4f}", telegram_bot, telegram_chat_id)
                 recovered = True
         
-        # Recover Trailing
-        trail_id = trade_state.trail_order_id or trade_state.trail_algo_id
-        if trail_id and trail_id not in all_open_ids:
-            log(f"Trailing missing (ID={trail_id}). Re-issuing safely...", telegram_bot, telegram_chat_id)
-            act_price = current_price
+        # Recover Trailing — preserve original activation
+        if trade_state.trail_algo_id and trade_state.trail_algo_id not in open_algo_ids:
+            log(f"Trailing missing (algoId={trade_state.trail_algo_id}). Re-issuing...", telegram_bot, telegram_chat_id)
+            act_price = Decimal(str(trade_state.trail_activation_price))
             new_trail = _place_trailing_stop(client, symbol, trade_state, act_price)
-            if new_trail:
-                trade_state.trail_order_id = new_trail.get("orderId")
-                trade_state.trail_algo_id = new_trail.get("algoId")
-                trade_state.trail_activation_price = float(act_price)
-                trade_state.current_trail_stop = float(new_trail.get("stopPrice") or act_price)
-                _tg_notify("Trailing Recovered Safely", f"New activation: {act_price:.4f}", symbol, telegram_bot, telegram_chat_id)
+            if new_trail and new_trail.get("algoId"):
+                trade_state.trail_algo_id = new_trail["algoId"]
+                log(f"TRAILING RECOVERED | New algoId={trade_state.trail_algo_id} | Activation={float(act_price):.4f}", telegram_bot, telegram_chat_id)
                 recovered = True
         
-        return recovered  # True only if action taken
-    
+        if recovered:
+            log("Recovery complete — protective orders restored.", telegram_bot, telegram_chat_id)
+        
+        return recovered
+        
     except Exception as e:
-        log(f"Recovery failed: {str(e)}", telegram_bot, telegram_chat_id)
-        logger.debug(traceback.format_exc())
+        log(f"Recovery failed: {e}", telegram_bot, telegram_chat_id)
         return False
         
 
@@ -1603,18 +1579,16 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                 return
             # --- Recovery Check ---
             if time.time() - last_recovery_check >= RECOVERY_CHECK_INTERVAL:
-                # Pause only in first 5 minutes (safe default)
-                # if time.time() - trade_start_time < 300:
-                    #log("Recovery check: Pausing 2.5s to let dust settle...", telegram_bot, telegram_chat_id)
+                # Optional: Brief status every minute to prove the check is alive
+                if int(time.time()) % 60 == 0:
+                    log("Periodic recovery check running...", telegram_bot, telegram_chat_id)
                 
-                # Run recovery (it now returns True if anything was recovered)
                 recovered = debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
                 
                 last_recovery_check = time.time()
                 
-                # Optional: quiet confirmation only if something was recovered
                 if recovered:
-                    log("Recovery action taken — protective orders restored.", telegram_bot, telegram_chat_id)
+                    log("Recovery successful — missing protective orders restored.", telegram_bot, telegram_chat_id)
 
             # --- Get Latest Price (WITH SANITY CHECK) ---
             try:
@@ -1662,16 +1636,43 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                     # Give Binance time to finalize internal state
                     time.sleep(1.2)
 
-                    # Use the new precise method: checks each algoId for fill + avgPrice
-                    reason, exit_price_dec = client.get_filled_order_reason_and_price(
-                        symbol=symbol,
-                        sl_id=trade_state.sl_algo_id,
-                        tp_id=trade_state.tp_algo_id,
-                        trail_id=trade_state.trail_algo_id
-                    )
+                    reason = "Unknown"
+                    exit_price_dec = None
 
+                    try:
+                        # Fetch open algo orders (specific to conditional/algo types)
+                        algo_open_resp = client.send_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
+                        algo_open = algo_open_resp if isinstance(algo_open_resp, list) else []
+                        open_algo_ids = {o.get("algoId") for o in algo_open if o.get("algoId")}
+
+                        # Use stored algo IDs (updated by place_orders/recovery)
+                        sl_algo_id = trade_state.sl_algo_id
+                        tp_algo_id = trade_state.tp_algo_id
+                        trail_algo_id = trade_state.trail_algo_id
+
+                        # Priority check: Trailing → SL → TP
+                        triggered_id = None
+                        if (trade_state.trail_activated and trail_algo_id and trail_algo_id not in open_algo_ids):
+                            reason = "Trailing Stop"
+                            triggered_id = trail_algo_id
+                        elif sl_algo_id and sl_algo_id not in open_algo_ids:
+                            reason = "Stop Loss"
+                            triggered_id = sl_algo_id
+                        elif tp_algo_id and tp_algo_id not in open_algo_ids:
+                            reason = "Take Profit"
+                            triggered_id = tp_algo_id
+                        else:
+                            reason = "Manual Close" if not STOP_REQUESTED else "Stop Requested"
+
+                        # Primary: Get exact fill price from triggered algo order's trades
+                        if triggered_id:
+                            exit_price_dec = client.get_latest_fill_price(symbol, triggered_id)
+
+                    except Exception as e:
+                        log(f"Error detecting protective order trigger: {e}. Falling back to trade history.", telegram_bot, telegram_chat_id)
+
+                    # Fallback if no protective fill price
                     if exit_price_dec is None:
-                        log("⚠️ No exact fill price from algo orders. Falling back to recent trade history.", telegram_bot, telegram_chat_id)
                         latest = client.get_latest_trade_details(symbol)
                         if latest and latest.get("price"):
                             exit_price_dec = Decimal(str(latest["price"]))
@@ -1687,7 +1688,7 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
                                 exit_price_dec = Decimal("0")
                                 reason = "Unknown (Data Unavailable)"
 
-                    exit_price_f = float(exit_price_dec)
+                    exit_price_f = float(exit_price_dec if exit_price_dec else 0)
 
                     # --- Log PNL ---
                     entry_price_safe = float(trade_state.entry_price or 0.0)
