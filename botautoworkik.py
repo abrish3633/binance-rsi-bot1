@@ -1,8 +1,9 @@
 # Binance Futures RSI Bot (Binance-Handled Trailing Stop, 30m Optimized, SOLUSDT)
-# FINAL PRODUCTION VERSION — ALL REMAINING AUDIT FIXES APPLIED
+# FINAL PRODUCTION VERSION — ALL 22 FIXES + WS → POLLING FALLBACK
 # ENHANCED: WebSocket failure → ONE-TIME TG + LOG → switch to REST polling (3s interval)
 # ENHANCED: Zero spam, thread-safe, idempotent, crash-proof
 # ENHANCED: Wilder RSI, Decimal math, safe quantize, recovery, clean logs
+
 import argparse
 import logging
 import time
@@ -24,6 +25,7 @@ import atexit
 import websocket
 import json
 import queue
+import feedparser  # ← NEW
 import socket
 import platform
 
@@ -52,11 +54,12 @@ RATE_LIMIT_THRESHOLD = 80
 RECOVERY_CHECK_INTERVAL = 10  # Seconds between recovery checks
 TRAIL_UPDATE_THROTTLE = 10.0  # Alert trailing updates every 10 seconds max
 POLLING_INTERVAL = 3  # ENHANCED: Polling interval after WS failure
-
+# ---------------------------------------------------------------------------------------
 # === CONFIG: BLACKOUT WINDOWS (UTC) ===
+# (weekday: 0=Mon..6=Sun, None=every day), (start_h, m), (end_h, m)
 NEWS_BLACKOUT_WINDOWS = [
-    (4, (12, 25), (13, 5)),  # Friday 12:30–13:00 UTC (NFP)
-    (2, (18, 55), (19, 35)),  # Wednesday 19:00–19:30 UTC (FOMC)
+    (4, (12, 25), (13, 5)),     # Friday 12:30–13:00 UTC (NFP)
+    (2, (18, 55), (19, 35)),     # Wednesday 19:00–19:30 UTC (FOMC)
 ]
 
 # === CONFIG: LIVE API ===
@@ -64,8 +67,8 @@ LIVE_APIS = [
     "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
     "https://ec.forexprostools.com/?columns=exc_currency,exc_type&timezone=utc"
 ]
-LOCAL_CALENDAR = "high_impact_calendar.json"
-LOCAL_OVERRIDE = "news_calendar_override.json"
+LOCAL_CALENDAR = "high_impact_calendar.json"          # you update weekly
+LOCAL_OVERRIDE = "news_calendar_override.json"       # one-off manual block
 CACHE_DURATION = 300  # 5 min
 HIGH_IMPACT_KEYWORDS = {
     "NFP", "NONFARM", "CPI", "FOMC", "GDP", "UNEMPLOYMENT", "RATE DECISION",
@@ -73,70 +76,79 @@ HIGH_IMPACT_KEYWORDS = {
     "RETAIL SALES", "ADP", "FLASH", "PRELIMINARY"
 }
 BUFFER_MINUTES = 5
-NEWS_GUARD_ENABLED = True
-
+# === CONFIG: NEWS GUARD ===
+NEWS_GUARD_ENABLED = True   # ← Will be overridden by --no-news-guard
+# if not NEWS_GUARD_ENABLED:
+    # logging.getLogger().setLevel(logging.WARNING)  # Optional: reduce noise
+# CONFIG SLIPAGE
 MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")
-MAX_PROTECTIVE_SLIPPAGE_PCT = Decimal("0.005")  # NEW: 0.5% max slippage on SL/TP/trailing
-
-BASE_RISK_PCT = Decimal("0.068")
-MAX_LEVERAGE = Decimal("9")
-ENABLE_WEEKLY_SCALING = True
-
 LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'sol_rsi_bot.lock')
-LOCK_PID_FILE = LOCK_FILE + '.pid'  # NEW: PID check for stale lock
+BASE_RISK_PCT = Decimal("0.068")        # 2.25% when drawdown = 0%
+MAX_LEVERAGE = Decimal("9")
+# === WEEKLY SCALING QUICK TOGGLE ===
+ENABLE_WEEKLY_SCALING = True      # ← Set to False to disable scaling completely
 
 # ------------------- GLOBAL STATE -------------------
 STOP_REQUESTED = False
 client = None
-symbol_filters_cache = {}  # FIXED: now dict keyed by symbol
+symbol_filters_cache = None
 klines_cache = None
 klines_cache_time = 0
 last_rate_limit_check = 0
-
 PNL_LOG_FILE = 'pnl_log.csv'
-PNL_FIELDS = ['date', 'trade_id', 'side', 'entry', 'exit', 'pnl_usd', 'pnl_r', 'loss_streak']  # FIXED: stable order
-
 pnl_data = []
 last_trade_date = None
 last_exit_candle_time = None
 socket.setdefaulttimeout(10)
-
+# ENHANCED: Thread-safe stop & order cancellation
 _stop_lock = threading.Lock()
 _orders_cancelled = False
 
+# ENHANCED: WebSocket → Polling fallback state
 _ws_failed = False
 _polling_active = False
-_price_queue = queue.Queue()
-
+_price_queue = queue.Queue()  # Shared price source (WS or polling)
+# ---------------------------------------------------------------------------------------
 # === INTERNAL STATE ===
 _news_lock = threading.Lock()
 _news_cache: list = []
 _cache_ts = 0.0
-NEWS_LOCK = False
-VOLATILITY_ABORT = False
+NEWS_LOCK = False          # <--- blocks entry + forces emergency close
+VOLATILITY_ABORT = False   # set by ATR spike check (see trading loop)
+
 last_news_guard_msg: Optional[str] = None
 news_guard_was_active: bool = False
 _last_news_block_reason: Optional[str] = None
 weekly_peak_equity = None
-weekly_start_time = None
+weekly_start_time  = None
 
+# Add these 3 lines near other global state variables
 CONSEC_LOSSES = 0
 USE_CONSEC_LOSS_GUARD = True
 MAX_CONSEC_LOSSES = 3
 is_testnet = True
 weekly_dd_alert_triggered = False
-
 class BotState:
     def __init__(self):
         self.consec_loss_guard_alert_sent = False
         self.last_processed_close_ms = None
         self.last_candle_state = None
         # Add future flags here
-bot_state = BotState()
 
-# ==================== PURE RISK CALCULATION (NO SIDE EFFECTS) ====================
-def calculate_risk_multiplier(current_equity: Decimal) -> Decimal:
-    """Return 1.0 normally, 0.0 if weekly 20% DD reached."""
+bot_state = BotState()
+def get_current_risk_pct(
+    current_equity: Decimal,
+    client,              # BinanceClient instance
+    symbol: str = "SOLUSDT",  # Made parameter with default for flexibility
+    telegram_bot=None,
+    telegram_chat_id=None
+) -> Decimal:
+    """
+    SIMPLE FIXED 20% WEEKLY DD STOP (Pine Script style)
+    - Blocks new trades if weekly DD >= 20%
+    - Emergency closes open positions if DD >= 20%
+    - Resets consecutive loss streak and alert flag on new week
+    """
     global weekly_peak_equity, weekly_start_time, CONSEC_LOSSES
     global weekly_dd_alert_triggered
 
@@ -144,86 +156,103 @@ def calculate_risk_multiplier(current_equity: Decimal) -> Decimal:
     current_monday = now - timedelta(days=now.weekday())
     current_monday = current_monday.replace(hour=0, minute=0, second=0, microsecond=0)
 
+    # === NEW WEEK DETECTED → RESET ===
     if weekly_start_time is None or now >= current_monday + timedelta(weeks=1):
         weekly_start_time = current_monday
         weekly_peak_equity = current_equity
         CONSEC_LOSSES = 0
         weekly_dd_alert_triggered = False
-        bot_state.consec_loss_guard_alert_sent = False
+        bot_state.consec_loss_guard_alert_sent = False      
+        if telegram_bot and telegram_chat_id:
+            log(f"NEW WEEK -> Weekly peak reset to ${float(current_equity):,.2f}", telegram_bot, telegram_chat_id)
 
+    # === UPDATE PEAK IF HIGHER ===
     if weekly_peak_equity is None or current_equity > weekly_peak_equity:
         weekly_peak_equity = current_equity
 
+    # === CHECK 20% DD LIMIT ===
     if weekly_peak_equity <= 0:
         return Decimal("0")
 
     weekly_dd = (weekly_peak_equity - current_equity) / weekly_peak_equity
+
     if weekly_dd >= Decimal("0.20"):
+        # One-time alert
+        if not weekly_dd_alert_triggered:
+            msg = f"🚨 WEEKLY 20% DD REACHED! Closing ALL positions (DD: {weekly_dd:.2%})"
+            log(msg, telegram_bot, telegram_chat_id)
+            weekly_dd_alert_triggered = True
+
+        # Emergency close any open position
+        try:
+            pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+            
+            # Normalize response to list of dicts
+            if isinstance(pos_resp, dict) and 'data' in pos_resp:
+                positions = pos_resp['data']
+            elif isinstance(pos_resp, list):
+                positions = pos_resp
+            else:
+                log(f"Unexpected positionRisk response type: {type(pos_resp)}. Skipping close.", telegram_bot, telegram_chat_id)
+                positions = []
+            
+            # Defensive: Find matching symbol only if item is dict
+            pos_item = None
+            for item in positions:
+                if isinstance(item, dict) and item.get("symbol") == symbol:
+                    pos_item = item
+                    break
+            
+            if pos_item is None:
+                # No position found for symbol
+                return Decimal("0")
+            
+            pos_amt = Decimal(str(pos_item.get("positionAmt", "0")))
+            
+            if pos_amt != 0:
+                side = "SELL" if pos_amt > 0 else "BUY"
+                qty = abs(pos_amt)
+                client.send_signed_request("POST", "/fapi/v1/order", {
+                    "symbol": symbol,
+                    "side": side,
+                    "type": "MARKET",
+                    "quantity": str(qty)
+                })
+                log(f"EMERGENCY CLOSE: Position closed (qty={qty} {side}) due to weekly DD {weekly_dd:.2%}", telegram_bot, telegram_chat_id)
+                
+        except Exception as e:
+            log(f"Emergency close failed: {str(e)}", telegram_bot, telegram_chat_id)
+
         return Decimal("0")
 
-    if weekly_dd_alert_triggered:
-        weekly_dd_alert_triggered = False
+    else:
+        # Reset alert when recovered
+        if weekly_dd_alert_triggered:
+            weekly_dd_alert_triggered = False
+            log("Weekly DD recovered – trading resumed.", telegram_bot, telegram_chat_id)
 
     return Decimal("1")
+# ==================== SINGLE INSTANCE LOCK (Windows + Linux) ====================
+LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'sol_rsi_bot.lock')
 
-# ==================== SEPARATE EMERGENCY CLOSE ====================
-def emergency_close_if_dd_breached(client, symbol: str, telegram_bot=None, telegram_chat_id=None):
-    """Call only when you already know DD >=20%."""
-    global weekly_dd_alert_triggered
-    try:
-        if weekly_dd_alert_triggered:
-            return
-        weekly_dd_alert_triggered = True
-        log(f"🚨 WEEKLY 20% DD REACHED! Closing ALL positions", telegram_bot, telegram_chat_id)
-
-        pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-        positions = pos_resp['data'] if isinstance(pos_resp, dict) and 'data' in pos_resp else pos_resp if isinstance(pos_resp, list) else []
-        pos_item = next((p for p in positions if isinstance(p, dict) and p.get("symbol") == symbol), None)
-        if not pos_item:
-            return
-        pos_amt = Decimal(str(pos_item.get("positionAmt", "0")))
-        if pos_amt == 0:
-            return
-
-        side = "SELL" if pos_amt > 0 else "BUY"
-        qty = abs(pos_amt)
-        client.send_signed_request("POST", "/fapi/v1/order", {
-            "symbol": symbol,
-            "side": side,
-            "type": "MARKET",
-            "quantity": str(qty)
-        })
-        log(f"EMERGENCY CLOSE executed: {qty} {side}", telegram_bot, telegram_chat_id)
-    except Exception as e:
-        log(f"Emergency close failed: {str(e)}", telegram_bot, telegram_chat_id)
-
-# ==================== SINGLE INSTANCE LOCK WITH PID CHECK ====================
 try:
+    # 'x' mode = create exclusively → fails if file exists
     LOCK_HANDLE = open(LOCK_FILE, 'x')
-    with open(LOCK_PID_FILE, 'w') as f:
-        f.write(str(os.getpid()))
 except FileExistsError:
-    # Check if stale
-    if os.path.exists(LOCK_PID_FILE):
-        try:
-            with open(LOCK_PID_FILE) as f:
-                old_pid = int(f.read().strip())
-            if platform.system() == "Windows" or not os.path.exists(f"/proc/{old_pid}"):
-                log("Stale lock detected – removing")
-                os.unlink(LOCK_FILE)
-                os.unlink(LOCK_PID_FILE)
-                LOCK_HANDLE = open(LOCK_FILE, 'x')
-                with open(LOCK_PID_FILE, 'w') as f:
-                    f.write(str(os.getpid()))
-            else:
-                print("Another instance is running. Exiting.")
-                sys.exit(1)
-        except:
-            print("Lock file exists but corrupted. Exiting.")
-            sys.exit(1)
-    else:
-        print("Another instance is running. Exiting.")
-        sys.exit(1)
+    print("Another instance is already running! Exiting.")
+    sys.exit(1)
+except FileNotFoundError:
+    # Windows TEMP may not exist
+    os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+    LOCK_HANDLE = open(LOCK_FILE, 'x')
+
+# Optional real lock on Linux only
+if platform.system() != "Windows":
+    try:
+        import fcntl
+        fcntl.lockf(LOCK_HANDLE.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except Exception:
+        pass
 
 # ==================== MEMORY LIMIT (Linux / OCI only) ====================
 if platform.system() != "Windows":
@@ -420,26 +449,32 @@ def check_volatility_abort(klines: list, period: int = 14) -> bool:
     mean20 = np.mean(tr[-20:])
     return atr > mean20 * 3.0
 
-# === log_pnl FIXED: stable fields + divide-by-zero guard ===
+# ------------------- PNL LOGGING -------------------
+def init_pnl_log():
+    if not os.path.exists(PNL_LOG_FILE):
+        with open(PNL_LOG_FILE, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['date', 'trade_id', 'side', 'entry', 'exit', 'pnl_usd', 'pnl_r'])
+            writer.writeheader()
+
 def log_pnl(trade_id, side, entry, exit_price, qty, R):
     global CONSEC_LOSSES
+    
     if side == 'LONG':
         pnl_usd = (exit_price - entry) * qty
     else:
         pnl_usd = (entry - exit_price) * qty
-
     total_risk = qty * R
-    pnl_r = pnl_usd / total_risk if total_risk > 0 else Decimal("0")
-
-    denom = (Decimal(str(entry)) * Decimal(str(qty))) if entry and qty else Decimal("1")
-    loss_pct = abs(pnl_usd) / denom if pnl_usd < 0 else Decimal("0")
-    is_full_loss = loss_pct >= Decimal("0.0074")
-
+    pnl_r = pnl_usd / total_risk if total_risk > 0 else 0
+    
+    # === CONSECUTIVE LOSS TRACKING ===
+    loss_pct = abs(pnl_usd) / (entry * qty) if pnl_usd < 0 else 0
+    is_full_loss = loss_pct >= 0.0074  # ~0.75% loss (1R)
+    
     if pnl_usd < 0 and is_full_loss:
         CONSEC_LOSSES += 1
     else:
-        CONSEC_LOSSES = 0
-
+        CONSEC_LOSSES = 0  # Any profit or partial loss resets streak
+    
     row = {
         'date': datetime.now(timezone.utc).isoformat(),
         'trade_id': trade_id,
@@ -448,20 +483,14 @@ def log_pnl(trade_id, side, entry, exit_price, qty, R):
         'exit': exit_price,
         'pnl_usd': float(pnl_usd),
         'pnl_r': float(pnl_r),
-        'loss_streak': CONSEC_LOSSES
+        'loss_streak': CONSEC_LOSSES  # ← NEW FIELD
     }
     pnl_data.append(row)
     with open(PNL_LOG_FILE, 'a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=PNL_FIELDS)
+        writer = csv.DictWriter(f, fieldnames=row.keys())
         writer.writerow(row)
+    
     return row
-
-# === init_pnl_log FIXED ===
-def init_pnl_log():
-    if not os.path.exists(PNL_LOG_FILE):
-        with open(PNL_LOG_FILE, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=PNL_FIELDS)
-            writer.writeheader()
 
 # ------------------- LOGGING SETUP -------------------
 class CustomFormatter(logging.Formatter):
@@ -1020,8 +1049,9 @@ def aggregate_klines_to_45m(klines_15m):
     return aggregated
 # ------------------- SYMBOL FILTERS -------------------
 def get_symbol_filters(client: BinanceClient, symbol: str):
-    if symbol in symbol_filters_cache:
-        return symbol_filters_cache[symbol]
+    global symbol_filters_cache
+    if symbol_filters_cache is not None:
+        return symbol_filters_cache
     info = client.public_request("/fapi/v1/exchangeInfo")
     s = next((x for x in info.get("symbols", []) if x.get("symbol") == symbol.upper()), None)
     if not s:
@@ -1034,8 +1064,8 @@ def get_symbol_filters(client: BinanceClient, symbol: str):
     min_qty = Decimal(str(lot["minQty"]))
     tick_size = Decimal(str(filters.get("PRICE_FILTER", {}).get("tickSize", "0.00000001")))
     min_notional = Decimal(str(filters.get("MIN_NOTIONAL", {}).get("notional", "0")))
-    symbol_filters_cache[symbol] = {"stepSize": step_size, "minQty": min_qty, "tickSize": tick_size, "minNotional": min_notional}
-    return symbol_filters_cache[symbol]
+    symbol_filters_cache = {"stepSize": step_size, "minQty": min_qty, "tickSize": tick_size, "minNotional": min_notional}
+    return symbol_filters_cache
 
 # ------------------- ORDERS (REUSABLE) -------------------
 def place_orders(client, symbol, trade_state, tick_size, telegram_bot=None, telegram_chat_id=None):
@@ -1246,26 +1276,31 @@ def fetch_balance(client: BinanceClient):
         log(f"Balance fetch failed: {str(e)}")
         raise
     
-# === trading_allowed FIXED: correct call + pure risk calc ===
 def trading_allowed(client, symbol, telegram_bot, telegram_chat_id) -> bool:
+    """Simple check for weekly DD and consecutive loss guards"""
     global CONSEC_LOSSES
-    try:
-        current_balance = fetch_balance(client)
-        risk_multiplier = calculate_risk_multiplier(current_balance)
-        if risk_multiplier <= Decimal("0"):
-            # Only now do we emergency close
-            emergency_close_if_dd_breached(client, symbol, telegram_bot, telegram_chat_id)
-            return False
+    
+    # 1. Weekly DD Guard (20% hard stop)
+    current_balance = fetch_balance(client)
+    risk_allowed = get_current_risk_pct(
+        current_equity=current_balance,
+        client=client,
+        symbol=symbol,
+        telegram_bot=telegram_bot,
+        telegram_chat_id=telegram_chat_id
+    )
+    if risk_allowed <= Decimal("0"):
+        return False  # Weekly DD stop triggered
 
-        if USE_CONSEC_LOSS_GUARD and CONSEC_LOSSES >= MAX_CONSEC_LOSSES:
-            if not bot_state.consec_loss_guard_alert_sent:
-                log(f"CONSECUTIVE FULL LOSSES REACHED ({CONSEC_LOSSES}) — TRADING PAUSED", telegram_bot, telegram_chat_id)
-                bot_state.consec_loss_guard_alert_sent = True
-            return False
-        return True
-    except Exception as e:
-        log(f"trading_allowed error: {e}", telegram_bot, telegram_chat_id)
+    # 2. Consecutive Loss Guard
+    if USE_CONSEC_LOSS_GUARD and CONSEC_LOSSES >= MAX_CONSEC_LOSSES:
+        if not bot_state.consec_loss_guard_alert_sent:
+            log(f"CONSECUTIVE FULL LOSSES REACHED ({CONSEC_LOSSES}) — TRADING PAUSED UNTIL NEXT WEEK OR WIN", telegram_bot, telegram_chat_id)
+            bot_state.consec_loss_guard_alert_sent = True
         return False
+    
+    return True
+
 def has_active_position(client: BinanceClient, symbol: str, telegram_bot=None, telegram_chat_id=None):
     try:
         pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
