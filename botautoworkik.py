@@ -1422,18 +1422,34 @@ def send_closure_telegram(symbol, side, entry_price, exit_price, qty, pnl_usd, p
     )
     telegram_post(bot, chat_id, message)
 
-# ------------------- MONITOR TRADE (FIXED: Complete with all logic) -------------------
+def start_polling_mode(symbol, telegram_bot, telegram_chat_id):
+    global _polling_active
+    if _polling_active:
+        return
+    _polling_active = True
+    log(f"Now polling price every {POLLING_INTERVAL}s via REST API.", telegram_bot, telegram_chat_id)
+
+    def polling_loop():
+        while _polling_active and not STOP_REQUESTED:
+            try:
+                ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+                price = Decimal(str(ticker['price']))
+                _price_queue.put(price)
+            except Exception as e:
+                log(f"Polling failed: {e}. Will retry...", telegram_bot, telegram_chat_id)
+            time.sleep(POLLING_INTERVAL)
+
+    threading.Thread(target=polling_loop, daemon=True).start()
+
+# ------------------- MONITOR TRADE (FULLY CORRECTED) -------------------
 def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, current_candle_close_time):
     global _orders_cancelled, _polling_active, _ws_failed
-    
-    # Initialize all variables at top of function
-    trade_start_time = time.time()
+    log("Monitoring active trade...", telegram_bot, telegram_chat_id)
+    trade_start_time = time.time()  # ← This fixes the error
     last_recovery_check = 0
     current_price = None
     ws = None
     ws_running = False
-    
-    log("Monitoring active trade...", telegram_bot, telegram_chat_id)
 
     # === WEBSOCKET CALLBACKS ===
     def on_message(ws_app, message):
@@ -1452,14 +1468,14 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
             log("WebSocket connection failed. Switching to polling mode.", telegram_bot, telegram_chat_id)
             telegram_post(telegram_bot, telegram_chat_id, "WebSocket failed  Switched to REST polling (3s)")
             _ws_failed = True
-            start_polling_mode(client, symbol, telegram_bot, telegram_chat_id)
+            start_polling_mode(symbol, telegram_bot, telegram_chat_id)
 
     def on_close(ws_app, close_status_code, close_reason):
         global _ws_failed
         if not _ws_failed and trade_state.active:
             log("WebSocket closed. Switching to polling mode.", telegram_bot, telegram_chat_id)
             _ws_failed = True
-            start_polling_mode(client, symbol, telegram_bot, telegram_chat_id)
+            start_polling_mode(symbol, telegram_bot, telegram_chat_id)
 
     def on_open(ws_app):
         subscribe_msg = {
@@ -1474,7 +1490,7 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
         nonlocal ws, ws_running
         if ws_running:
             return
-        base_url = f"{client.ws_base}/ws"  # FIXED: Use client.ws_base
+        base_url = "wss://fstream.binance.com/ws" if client.use_live else "wss://stream.binancefuture.com/ws"
         log(f"Connecting to WebSocket: {base_url}", telegram_bot, telegram_chat_id)
         ws = websocket.WebSocketApp(
             base_url,
@@ -1492,6 +1508,7 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
         ws_running = True
 
     start_ws()
+
 
     try:
         while trade_state.active and not STOP_REQUESTED:
@@ -1730,26 +1747,6 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
             except Exception:
                 pass
 
-# ------------------- START POLLING MODE -------------------
-def start_polling_mode(client, symbol, telegram_bot, telegram_chat_id):
-    """Start polling mode with client passed as parameter."""
-    global _polling_active
-    if _polling_active:
-        return
-    _polling_active = True
-    log(f"Now polling price every {POLLING_INTERVAL}s via REST API.", telegram_bot, telegram_chat_id)
-
-    def polling_loop():
-        while _polling_active and not STOP_REQUESTED:
-            try:
-                ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
-                price = Decimal(str(ticker['price']))
-                _price_queue.put(price)
-            except Exception as e:
-                log(f"Polling failed: {e}. Will retry...", telegram_bot, telegram_chat_id)
-            time.sleep(POLLING_INTERVAL)
-
-    threading.Thread(target=polling_loop, daemon=True).start()
 # ------------------- TRADING LOOP (FIXED: Complete signature and consistent Decimal usage) -------------------
 def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, telegram_bot, telegram_chat_id):
     # FIXED: Complete function signature
