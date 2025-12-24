@@ -1504,16 +1504,11 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
             
             # === RECOVERY CHECK ===
             if time.time() - last_recovery_check >= RECOVERY_CHECK_INTERVAL:
-                # Optional: Brief status every minute to prove the check is alive
-                if int(time.time()) % 60 == 0:
-                    log("Periodic recovery check running...", telegram_bot, telegram_chat_id)
-                
-                recovered = debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
-                
+                try:
+                    debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
+                except Exception as e:
+                    log(f"Recovery check error: {e}", telegram_bot, telegram_chat_id)
                 last_recovery_check = time.time()
-                
-                if recovered:
-                    log("Recovery successful — missing protective orders restored.", telegram_bot, telegram_chat_id)
 
             # === GET LATEST PRICE ===
             try:
