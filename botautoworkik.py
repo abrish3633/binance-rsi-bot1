@@ -102,6 +102,8 @@ class BotState:
         self.klines_cache: Dict[str, Any] = {}
         self.klines_cache_time = Decimal("0")
         self.last_rate_limit_check = Decimal("0")
+        self._position_closure_in_progress = False
+    
         
         # PNL logging
         self.PNL_LOG_FILE = 'pnl_log.csv'
@@ -731,10 +733,14 @@ def _request_stop(signum: Optional[int] = None, frame: Any = None, symbol: Optio
             return
         bot_state.STOP_REQUESTED = True
     
+    # ADD THIS: Set flag to prevent monitor_trade from also processing closure
+    bot_state._position_closure_in_progress = True
+    
     log("Stop requested. Closing positions and cancelling orders...", telegram_bot, telegram_chat_id)
     
     if not bot_state.client or not symbol:
         log("Client or symbol not defined; skipping position closure and order cancellation.", telegram_bot, telegram_chat_id)
+        bot_state._position_closure_in_progress = False  # CLEAR FLAG
         return
     
     try:
@@ -825,7 +831,7 @@ def _request_stop(signum: Optional[int] = None, frame: Any = None, symbol: Optio
             except Exception as e:
                 log(f"Failed to cancel open orders: {e}", telegram_bot, telegram_chat_id)
             bot_state._orders_cancelled = True
-
+    bot_state._position_closure_in_progress = False
 # ------------------- TIME SYNC -------------------
 def check_time_offset(base_url: str) -> Optional[float]:
     try:
@@ -1470,6 +1476,10 @@ def debug_and_recover_expired_orders(client: BinanceClient, symbol: str, trade_s
     """Recover missing protective algo orders. Idempotent. Thread-safe."""
     global bot_state
     
+    # ADD THIS: Don't run recovery if we're in the middle of closing
+    if bot_state._position_closure_in_progress:
+        return False
+    
     if not trade_state.active:
         return False
   
@@ -1654,8 +1664,9 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
     def on_error(ws_app: Any, error: Any):
         global bot_state
         if not bot_state._ws_failed and trade_state.active:
-            log("WebSocket connection failed. Switching to polling mode.", telegram_bot, telegram_chat_id)
-            telegram_post(telegram_bot, telegram_chat_id, "WebSocket failed Switched to REST polling (3s)")
+            log(f"WebSocket connection error: {error}. Switching to polling mode.", telegram_bot, telegram_chat_id)
+            # REMOVE emergency telegram message - this is not an emergency
+            # telegram_post(telegram_bot, telegram_chat_id, "WebSocket failed Switched to REST polling (3s)")
             bot_state._ws_failed = True
             start_polling_mode(symbol, telegram_bot, telegram_chat_id)
     
@@ -1770,6 +1781,12 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
                     pos_amt = Decimal(str(pos_item.get("positionAmt", "0")))
               
                 if pos_amt == Decimal('0') and trade_state.active:
+                    # ADD THIS CHECK: If closure is already being handled by _request_stop, skip
+                    if bot_state._position_closure_in_progress:
+                        log("Position closure already in progress by stop handler. Skipping duplicate processing.", telegram_bot, telegram_chat_id)
+                        trade_state.active = False
+                        return  # Exit monitor_trade immediately
+                    
                     # === POSITION CLOSED – DETERMINE EXACT REASON & FILL PRICE ===
                     log("Position closed (verified via positionAmt == 0). Determining exit reason and exact fill price...", telegram_bot, telegram_chat_id)
                     trade_state.active = False
