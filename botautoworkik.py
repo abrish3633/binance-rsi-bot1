@@ -1,4 +1,4 @@
-# Binance Futures RSI Bot (Binance-Handled Trailing Stop, 30m Optimized, SOLUSDT)
+# Binance Futures RSI Bot (Binance-Handled Trailing Stop, 45m Optimized, SOLUSDT)
 # FINAL PRODUCTION VERSION — ALL 22 FIXES + WS → POLLING FALLBACK
 # ENHANCED: WebSocket failure → ONE-TIME TG + LOG → switch to REST polling (3s interval)
 # ENHANCED: Zero spam, thread-safe, idempotent, crash-proof
@@ -36,7 +36,7 @@ TRAIL_DISTANCE_MULT = Decimal("2") # 2.5R trailing distance
 VOL_SMA_PERIOD = 16
 RSI_PERIOD = 14
 MAX_TRADES_PER_DAY = 1
-INTERVAL_DEFAULT = "30m"
+INTERVAL_DEFAULT = "45m"
 ORDER_FILL_TIMEOUT = 15
 BUY_RSI_MIN = Decimal("55")
 BUY_RSI_MAX = Decimal("65")
@@ -420,12 +420,16 @@ def check_weekly_drawdown_stop(current_equity: Decimal, symbol: str, telegram_bo
     now = datetime.now(timezone.utc)
     current_monday = now - timedelta(days=now.weekday())
     current_monday = current_monday.replace(hour=0, minute=0, second=0, microsecond=0)
+    log(f"DEBUG: Today={now.date()} Weekday={now.weekday()} WeeklyStart={bot_state.weekly_start_time} ConsecLosses={bot_state.CONSEC_LOSSES}", telegram_bot, telegram_chat_id)
+    
+    current_week_monday = now - timedelta(days=now.weekday())
+    current_week_monday = current_week_monday.replace(hour=0, minute=0, second=0, microsecond=0)
     
     # === NEW WEEK DETECTED → RESET ===
-    if bot_state.weekly_start_time is None or now >= current_monday + timedelta(weeks=1):
+    if (bot_state.weekly_start_time is None or 
+        current_week_monday != bot_state.weekly_start_time):
         bot_state.weekly_start_time = current_monday
         bot_state.weekly_peak_equity = current_equity
-        bot_state.CONSEC_LOSSES = 0
         bot_state.weekly_dd_alert_triggered = False
         bot_state.consec_loss_guard_alert_sent = False
         if telegram_bot and telegram_chat_id:
@@ -2376,43 +2380,55 @@ def run_scheduler(bot: Optional[str], chat_id: Optional[str]):
     global bot_state
     last_month: Optional[int] = None
     
+    def daily_reset_job():
+        """Handles equity reset and logging at 00:00 UTC."""
+        try:
+            # Uses your existing fetch_balance function
+            current_balance = fetch_balance(bot_state.client)
+            if current_balance > 0:
+                bot_state.account_size = current_balance
+                bot_state.daily_start_equity = current_balance
+                log(f"DAILY RESET @ 00:00 UTC | New start equity: ${bot_state.daily_start_equity:.2f} USD", bot, chat_id)
+                telegram_post(bot, chat_id, f"🔄 *DAILY RESET*\nEquity: ${bot_state.daily_start_equity:.2f}")
+        except Exception as e:
+            log(f"Daily reset failed: {e}", bot, chat_id)
+
+    def weekly_reset_job():
+        """Clears consecutive loss streak on Monday 00:00 UTC."""
+        bot_state.CONSEC_LOSSES = 0
+        bot_state.consec_loss_guard_alert_sent = False
+        log("WEEKLY RESET: Consecutive loss streak cleared.", bot, chat_id)
+        telegram_post(bot, chat_id, "🔄 *WEEKLY RESET*\nConsecutive losses cleared. Trading guard reset.")
+
     def check_monthly_report():
         nonlocal last_month
         current_date = datetime.now(timezone.utc)
         if current_date.day == 1 and (last_month is None or current_date.month != last_month):
-            send_monthly_report(bot, chat_id)
+            send_monthly_report(bot, chat_id) 
             last_month = current_date.month
     
+    # Schedule all tasks using the schedule library for reliability
     schedule.every().day.at("23:59").do(lambda: send_daily_report(bot, chat_id))
     schedule.every().sunday.at("23:59").do(lambda: send_weekly_report(bot, chat_id))
+    schedule.every().day.at("00:00").do(daily_reset_job)
+    schedule.every().monday.at("00:00").do(weekly_reset_job)
     schedule.every().day.at("00:00").do(check_monthly_report)
     
-    global bot_state
-    while True:
-        # RESET @ 00:00 UTC
-        now_utc = datetime.now(timezone.utc)
-        if now_utc.hour == 0 and now_utc.minute < 5:
-            try:
-                current_balance = fetch_balance(bot_state.client)
-                bot_state.account_size = current_balance
-                bot_state.daily_start_equity = current_balance
-                log(f"DAILY RESET @ 00:00 UTC | New start equity: ${bot_state.daily_start_equity:.2f} USD", bot, chat_id)
-                telegram_post(bot, chat_id, f"DAILY RESET\nEquity: ${bot_state.daily_start_equity:.2f}")
-            except Exception as e:
-                log(f"Daily reset failed: {e}", bot, chat_id)
-            time.sleep(300)
-            continue
+    log("Scheduler Initialized: Daily/Weekly resets and reporting active.", bot, chat_id)
+
+    # Main loop that respects the bot's shutdown signal
+    while not bot_state.STOP_REQUESTED:
         schedule.run_pending()
-        time.sleep(60)
+        time.sleep(1)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Binance Futures RSI Bot (Binance Trailing, 30m Optimized, SOLUSDT)")
+    parser = argparse.ArgumentParser(description="Binance Futures RSI Bot (Binance Trailing, 45m Optimized, SOLUSDT)")
     parser.add_argument("--api-key", required=True, help="Binance API Key")
     parser.add_argument("--api-secret", required=True, help="Binance API Secret")
     parser.add_argument("--telegram-token", required=True, help="Telegram Bot Token")
     parser.add_argument("--chat-id", required=True, help="Telegram Chat ID")
     parser.add_argument("--symbol", default="SOLUSDT", help="Trading symbol (default: SOLUSDT)")
-    parser.add_argument("--timeframe", default="30m", help="Timeframe (default: 30m)")
+    parser.add_argument("--timeframe", default="45m", help="Timeframe (default: 45m)")
     parser.add_argument("--max-trades", type=int, default=1, help="Max trades per day (default: 1)")
     parser.add_argument("--risk-pct", type=float, default=6.8, help="Risk percentage per trade (default: 6.8%)")
     parser.add_argument("--max-loss-pct", type=float, default=6.8, help="Max daily loss percentage (default: 6.8%)")
