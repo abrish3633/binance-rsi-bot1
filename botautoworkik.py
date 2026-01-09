@@ -26,6 +26,7 @@ import json
 import queue
 import socket
 import platform
+import numpy as np
 
 # ------------------- CONFIGURATION -------------------
 RISK_PCT = Decimal("0.068") # 6.8% per trade
@@ -599,31 +600,48 @@ file_handler.setFormatter(CustomFormatter(fmt='[%(asctime)s] %(message)s'))
 logger.addHandler(file_handler)
 
 def log(message: str, telegram_bot: Optional[str] = None, telegram_chat_id: Optional[str] = None):
-    logger.info(message)
+    """
+    Safe logging - logs to console/file, tries Telegram but won't crash.
+    """
+    # 1. ALWAYS log to console/file
+    try:
+        logger.info(message)
+    except:
+        print(f"[LOG-FAIL] {message[:200]}")  # Truncate if crazy long
+    
+    # 2. Try Telegram if credentials exist
     if telegram_bot and telegram_chat_id:
         telegram_post(telegram_bot, telegram_chat_id, message)
 
-# ------------------- TELEGRAM (3x retry + backoff) -------------------
+# ------------------- TELEGRAM (BULLETPROOF - NEVER CRASHES) -------------------
 def telegram_post(token: Optional[str], chat_id: Optional[str], text: str, parse_mode: Optional[str] = None):
+    """
+    Send Telegram message. If ANYTHING goes wrong, just return silently.
+    Bot continues trading regardless of Telegram status.
+    """
+    # QUICK CHECKS
     if not token or not chat_id:
         return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    retries = 3
-    backoff = 1
-    for attempt in range(retries):
-        try:
-            response = requests.post(url, json=payload, timeout=10)
-            if response.status_code == 200:
-                return
-            else:
-                logger.error(f"Telegram send failed (attempt {attempt+1}): HTTP {response.status_code}: {response.text}")
-        except Exception as e:
-            logger.error(f"Telegram send failed (attempt {attempt+1}): {e}")
-        time.sleep(backoff)
-        backoff *= 2
+    
+    # Don't even try if token looks obviously wrong
+    if ':' not in token:
+        return
+    
+    try:
+        # Truncate if crazy long (Telegram limit: 4096 chars)
+        if len(text) > 4000:
+            text = text[:3900] + "\n...[truncated]"
+        
+        # One simple attempt with timeout
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        requests.post(
+            url, 
+            json={"chat_id": chat_id, "text": text}, 
+            timeout=(3, 5)  # 3s connect, 5s read timeout
+        )
+    except:
+        # IGNORE EVERYTHING - bot must not crash!
+        pass
 
 # ------------------- TELEGRAM MESSAGES WITH DECIMAL -------------------
 def send_trade_telegram(trade_details: Dict[str, Any], bot: Optional[str], chat_id: Optional[str]):
@@ -1100,10 +1118,11 @@ def sma(data: List[Decimal], period: int) -> Optional[Decimal]:
     # Use Decimal arithmetic
     return sum(data[-period:]) / Decimal(str(period))
 
-def quantize_qty(qty: Decimal, step_size: Decimal) -> Decimal:
+def quantize_qty(qty: Decimal, step_size: Decimal, min_qty: Decimal) -> Decimal:
+    """Quantize quantity respecting both stepSize AND minQty."""
     q = (qty // step_size) * step_size
-    if q == Decimal("0"):
-        q = step_size
+    if q < min_qty:
+        q = min_qty
     return q.quantize(step_size)
 
 def quantize_price(p: Decimal, tick_size: Decimal, rounding=ROUND_HALF_EVEN) -> Decimal:
