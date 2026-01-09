@@ -401,11 +401,20 @@ def check_volatility_abort(klines: List[List[Any]], period: int = 14) -> bool:
     if len(klines) < period + 1:
         return False
     import numpy as np
+    
     highs = np.array([float(k[2]) for k in klines[-period-20:]])
     lows = np.array([float(k[3]) for k in klines[-period-20:]])
     closes = np.array([float(k[4]) for k in klines[-period-20:]])
-    tr = np.maximum(highs[1:] - lows[1:], np.abs(highs[1:] - closes[:-1]),
-                    np.abs(lows[1:] - closes[:-1]))
+    
+    # FIXED: Use np.maximum for two arrays at a time
+    tr1 = highs[1:] - lows[1:]
+    tr2 = np.abs(highs[1:] - closes[:-1])
+    tr3 = np.abs(lows[1:] - closes[:-1])
+    
+    # Combine step by step
+    tr = np.maximum(tr1, tr2)
+    tr = np.maximum(tr, tr3)
+    
     atr = np.mean(tr[-period:])
     mean20 = np.mean(tr[-20:])
     return atr > mean20 * 3.0
@@ -1754,8 +1763,8 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
             # --- Recovery Check ---
             if Decimal(str(time.time())) - last_recovery_check >= Decimal(str(RECOVERY_CHECK_INTERVAL)):
                 # Optional: Brief status every minute to prove the check is alive
-                if int(time.time()) % 60 == 0:
-                    log("Periodic recovery check running...", telegram_bot, telegram_chat_id)
+                #if int(time.time()) % 60 == 0:
+                #    log("Periodic recovery check running...", telegram_bot, telegram_chat_id)
               
                 recovered = debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
               
