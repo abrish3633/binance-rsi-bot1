@@ -1118,11 +1118,10 @@ def sma(data: List[Decimal], period: int) -> Optional[Decimal]:
     # Use Decimal arithmetic
     return sum(data[-period:]) / Decimal(str(period))
 
-def quantize_qty(qty: Decimal, step_size: Decimal, min_qty: Decimal) -> Decimal:
-    """Quantize quantity respecting both stepSize AND minQty."""
+def quantize_qty(qty: Decimal, step_size: Decimal) -> Decimal:
     q = (qty // step_size) * step_size
-    if q < min_qty:
-        q = min_qty
+    if q == Decimal("0"):
+        q = step_size
     return q.quantize(step_size)
 
 def quantize_price(p: Decimal, tick_size: Decimal, rounding=ROUND_HALF_EVEN) -> Decimal:
