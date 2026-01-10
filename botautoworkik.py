@@ -1664,6 +1664,8 @@ def start_polling_mode(symbol: str, telegram_bot: Optional[str], telegram_chat_i
             try:
                 ticker = bot_state.client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
                 price = Decimal(str(ticker['price']))
+                if price <= 0 or price > Decimal('1000'):
+                    continue
                 bot_state._price_queue.put(price)
             except Exception as e:
                 log(f"Polling failed: {e}. Will retry...", telegram_bot, telegram_chat_id)
@@ -1687,8 +1689,11 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
         try:
             data = json.loads(message)
             if data.get('e') == 'trade' and 'p' in data:
-                current_price = Decimal(str(data['p']))
-                bot_state._price_queue.put(current_price)
+                price = Decimal(str(data['p']))
+                if price <= 0 or price > Decimal('1000'):
+                    return
+                current_price = price
+                bot_state._price_queue.put(price)        
         except Exception as e:
             log(f"WebSocket parse error: {e}", telegram_bot, telegram_chat_id)
     
