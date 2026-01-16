@@ -1962,7 +1962,7 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
                 time.sleep(2)
             
             # === HEARTBEAT MUST BE HERE (OUTSIDE BOTH try AND except) ===
-            if int(time.time()) % 60 == 0:  # 2700 seconds = 45 minutes
+            if int(time.time()) % 2700 == 0:  # 2700 seconds = 45 minutes
                 now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
                 price_now = current_price if current_price is not None else Decimal("0")
                 
