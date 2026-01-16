@@ -1962,40 +1962,31 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
                 time.sleep(2)
             
             # === HEARTBEAT MUST BE HERE (OUTSIDE BOTH try AND except) ===
-            # Heartbeat during active trade — every ~60 seconds
-            if int(time.time()) % 60 == 0:
-                log(f"[DEBUG] Heartbeat condition met! time={time.time()}, time%60={time.time() % 60}", telegram_bot, telegram_chat_id)
+            if int(time.time()) % 2700 == 0:  # 2700 seconds = 45 minutes
+                now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+                price_now = current_price if current_price is not None else Decimal("0")
+                
+                # Get memory usage
+                mem_str = "N/A"
                 try:
-                    now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-                    price_now = current_price if current_price is not None else Decimal("0")
-                    mem_str = "N/A"
-                    try:
-                        import psutil
-                        mem_str = f"{psutil.Process().memory_info().rss / 1024**2:.0f} MB"
-                        log(f"[DEBUG] Memory measured: {mem_str}", telegram_bot, telegram_chat_id)
-                    except ImportError:
-                        log("[DEBUG] psutil import failed", telegram_bot, telegram_chat_id)
-
-                    # Safely format values that might be None
-                    entry_str = f"{trade_state.entry_price:.4f}" if trade_state.entry_price else "N/A"
-                    sl_str = f"{trade_state.sl:.4f}" if trade_state.sl else "N/A"
-                    
-                    hb_msg = (
-                        f"[TRADE HB {now_str}] Monitoring {trade_state.side} | "
-                        f"Price: {price_now:.2f} | "
-                        f"Entry: {entry_str} | "
-                        f"SL: {sl_str} | "
-                        f"Mem: {mem_str}"
-                    )
-                    log(hb_msg, telegram_bot, telegram_chat_id)
+                    mem_str = f"{psutil.Process().memory_info().rss / 1024**2:.0f} MB"
                 except Exception as e:
-                    log(f"Trade HB failed: {str(e)}", telegram_bot, telegram_chat_id)
-            else:
-                # Optional: log every 5 minutes to show loop is alive
-                if int(time.time()) % 300 == 0:
-                    log(f"[ALIVE] Monitor loop running in polling mode, time={time.time()}", telegram_bot, telegram_chat_id)
+                    log(f"Memory check failed: {str(e)}", telegram_bot, telegram_chat_id)
+                
+                # Safely format values that might be None
+                entry_str = f"{trade_state.entry_price:.4f}" if trade_state.entry_price else "N/A"
+                sl_str = f"{trade_state.sl:.4f}" if trade_state.sl else "N/A"
+                
+                hb_msg = (
+                    f"[TRADE HB {now_str}] Monitoring {trade_state.side} | "
+                    f"Price: {price_now:.2f} | "
+                    f"Entry: {entry_str} | "
+                    f"SL: {sl_str} | "
+                    f"Mem: {mem_str}"
+                )
+                log(hb_msg, telegram_bot, telegram_chat_id)
             
-            time.sleep(1)  # <-- This should be at same level as heartbeat
+            time.sleep(1)
     finally:
         if not trade_state.active:
             bot_state._polling_active = False
