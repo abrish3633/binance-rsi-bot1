@@ -1970,7 +1970,6 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
                     price_now = current_price if current_price is not None else Decimal("0")
                     mem_str = "N/A"
                     try:
-                        import psutil
                         mem_str = f"{psutil.Process().memory_info().rss / 1024**2:.0f} MB"
                         log(f"[DEBUG] Memory measured: {mem_str}", telegram_bot, telegram_chat_id)
                     except ImportError:
