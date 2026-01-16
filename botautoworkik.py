@@ -224,15 +224,21 @@ def acquire_lock():
 LOCK_HANDLE = acquire_lock()
 
 # ------------------- MEMORY LIMIT (Linux / OCI only) -------------------
-if platform.system() != "Windows":
-    try:
-        import resource
-        SOFT = HARD = 680 * 1024 * 1024 # ~680 MB
-        resource.setrlimit(resource.RLIMIT_AS, (SOFT, HARD))
-        print(f"[Startup] Memory limit set to ~680 MB")
-    except Exception as e:
-        print(f"[Startup] Could not set memory limit: {e}")
-else:
+# Removed memory limit cap completely — let the OS manage it
+# (previously: resource.setrlimit capped at ~680 MB — caused OOM crashes)
+
+# Optional: Show current memory usage at startup (requires psutil)
+try:
+    import psutil
+    mem_mb = psutil.Process().memory_info().rss / 1024**2
+    print(f"[Startup] Initial memory usage: {mem_mb:.1f} MB")
+except ImportError:
+    print("[Startup] Install psutil to monitor memory: pip install psutil")
+except Exception as e:
+    print(f"[Startup] Could not read memory usage: {e}")
+
+# Keep the original Windows check if you ever run locally on Windows
+if platform.system() == "Windows":
     print("[Startup] Windows detected – skipping Unix-only features (normal for local testing)")
 
 # ---------------------------------------------------------------------------------------
@@ -1925,33 +1931,6 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
                         if trade_state.lowest_price is None or current_price < trade_state.lowest_price:
                             trade_state.lowest_price = current_price
                 
-                # --- Trailing Activation (WITH INSANE PRICE PROTECTION) ---
-                if (not trade_state.trail_activated and
-                    trade_state.trail_activation_price and
-                    current_price is not None and
-                    current_price > Decimal('1')):
-                    trail_activation_price_dec = trade_state.trail_activation_price  # Already Decimal
-                    if ((trade_state.side == "LONG" and current_price >= trail_activation_price_dec) or
-                        (trade_state.side == "SHORT" and current_price <= trail_activation_price_dec)):
-                        trade_state.trail_activated = True
-                        R_dec = trade_state.risk  # Already Decimal
-                        activation_dec = trade_state.trail_activation_price  # Already Decimal
-                        
-                        if trade_state.side == "LONG":
-                            init_stop_raw = activation_dec - (TRAIL_DISTANCE_MULT * R_dec)
-                            init_stop = quantize_price(init_stop_raw, tick_size, ROUND_DOWN)
-                        else:
-                            init_stop_raw = activation_dec + (TRAIL_DISTANCE_MULT * R_dec)
-                            init_stop = quantize_price(init_stop_raw, tick_size, ROUND_UP)
-                        
-                        send_trailing_activation_telegram(
-                            symbol, trade_state.side or "UNKNOWN",
-                            current_price, init_stop,
-                            telegram_bot, telegram_chat_id
-                        )
-                        trade_state.current_trail_stop = init_stop
-                        trade_state.last_trail_alert = Decimal(str(time.time()))
-                
                 # --- TRAILING UPDATES (NATIVE BINANCE TRACKING ONLY) ---
                 if trade_state.trail_activated and Decimal(str(time.time())) - trade_state.last_trail_alert >= TRAIL_UPDATE_THROTTLE and current_price is not None:
                     R_dec = trade_state.risk  # Already Decimal
@@ -1977,11 +1956,42 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
                         trade_state.current_trail_stop = new_stop
                         trade_state.last_trail_alert = Decimal(str(time.time()))
                         send_trailing_update_telegram(symbol, trade_state.side or "UNKNOWN", new_stop, telegram_bot, telegram_chat_id)
-                
-                time.sleep(1)
+                        
             except Exception as e:
                 log(f"Monitor error: {str(e)}", telegram_bot, telegram_chat_id)
                 time.sleep(2)
+            
+            # --- HEARTBEAT (MOVED OUTSIDE position check try-except) ---
+            # Heartbeat during active trade — every ~60 seconds
+            if int(time.time()) % 60 == 0:
+                log(f"[DEBUG] Heartbeat condition met! time={time.time()}, time%60={time.time() % 60}", telegram_bot, telegram_chat_id)
+                try:
+                    now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+                    price_now = current_price if current_price is not None else Decimal("0")
+                    mem_str = "N/A"
+                    try:
+                        import psutil
+                        mem_str = f"{psutil.Process().memory_info().rss / 1024**2:.0f} MB"
+                        log(f"[DEBUG] Memory measured: {mem_str}", telegram_bot, telegram_chat_id)
+                    except ImportError:
+                        log("[DEBUG] psutil import failed", telegram_bot, telegram_chat_id)
+
+                    hb_msg = (
+                        f"[TRADE HB {now_str}] Monitoring {trade_state.side} | "
+                        f"Price: {price_now:.2f} | "
+                        f"Entry: {trade_state.entry_price:.4f} | "
+                        f"SL: {trade_state.sl:.4f if trade_state.sl else 'N/A'} | "
+                        f"Mem: {mem_str}"
+                    )
+                    log(hb_msg, telegram_bot, telegram_chat_id)
+                except Exception as e:
+                    log(f"Trade HB failed: {str(e)}", telegram_bot, telegram_chat_id)
+            else:
+                # Optional: log every 5 minutes to show loop is alive
+                if int(time.time()) % 300 == 0:
+                    log(f"[ALIVE] Monitor loop running in polling mode, time={time.time()}", telegram_bot, telegram_chat_id)
+            
+            time.sleep(1)
     finally:
         if not trade_state.active:
             bot_state._polling_active = False
@@ -2101,6 +2111,44 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 continue
             
             bot_state.last_processed_close_ms = latest_close_ms
+            # ────────────────────────────────────────────────
+            # Heartbeat: log status once per candle (every ~45m)
+            # ────────────────────────────────────────────────
+            try:
+                now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+                price_now = Decimal("0")
+                pos_status = "Flat"
+
+                # Quick current price (non-blocking)
+                try:
+                    ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+                    price_now = Decimal(str(ticker.get("price", "0")))
+                except:
+                    price_now = close_price  # fallback to last close
+
+                # Position status
+                if trade_state.active:
+                    pos_status = f"Active {trade_state.side} @ {trade_state.entry_price:.4f}"
+
+                # Memory usage
+                mem_str = "N/A"
+                try:
+                    import psutil
+                    mem_str = f"{psutil.Process().memory_info().rss / 1024**2:.0f} MB"
+                except:
+                    pass
+
+                heartbeat_msg = (
+                    f"[HEARTBEAT {now_str}] {timeframe} cycle done | "
+                    f"Price: {price_now:.2f} | "
+                    f"Pos: {pos_status} | "
+                    f"Mem: {mem_str}"
+                )
+                log(heartbeat_msg, telegram_bot, telegram_chat_id)
+
+            except Exception as e:
+                log(f"Heartbeat failed: {str(e)}", telegram_bot, telegram_chat_id)
+
             dt = datetime.fromtimestamp(latest_close_ms / 1000, tz=timezone.utc)
             log(f"Aligned to {timeframe} candle close: {dt.strftime('%H:%M')} UTC", telegram_bot, telegram_chat_id)
           
