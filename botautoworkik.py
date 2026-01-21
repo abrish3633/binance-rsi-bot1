@@ -1144,45 +1144,65 @@ def quantize_price(p: Decimal, tick_size: Decimal, rounding=ROUND_HALF_EVEN) -> 
 
 # === 45m AGGREGATION + ALIGNMENT (BEST VERSION) ===
 def aggregate_klines_to_45m(klines_15m: List[List[Any]]) -> List[List[Any]]:
-    if len(klines_15m) < 3:
+    """
+    TradingView-aligned 45m aggregation using Pandas.
+    Returns data in same format as Binance API for Decimal conversion.
+    """
+    if not klines_15m or len(klines_15m) < 3:
         return []
-    aggregated: List[List[Any]] = []
-    EXPECTED = 45 * 60 * 1000
-    TOLERANCE = 5000  # 5-second tolerance (covers any Binance drift)
     
-    # Work backwards from the newest candle (guarantees we get the latest complete 45m candle)
-    for i in range(len(klines_15m) - 1, 1, -1):
-        # Align to every 45-minute boundary from the newest candle
-        close_time = int(klines_15m[i][6])
-        open_time_expected = close_time - EXPECTED
+    try:
+        import pandas as pd
         
-        # Find the oldest candle that matches the expected 45m window
-        for j in range(i - 2, -1, -1):
-            if abs(int(klines_15m[j][0]) - open_time_expected) <= TOLERANCE:
-                # Found a matching group of 3 candles
-                chunk = klines_15m[j:j+3]
-                if len(chunk) == 3:
-                    a, b, c = chunk
-                    high = max(float(a[2]), float(b[2]), float(c[2]))
-                    low = min(float(a[3]), float(b[3]), float(c[3]))
-                    volume = float(a[5]) + float(b[5]) + float(c[5])
-                    aggregated.append([
-                        int(a[0]),
-                        float(a[1]),
-                        high,
-                        low,
-                        float(c[4]),
-                        volume,
-                        int(c[6])
-                    ])
-                break
+        # Convert to DataFrame
+        df = pd.DataFrame(klines_15m, columns=[
+            'open_time', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_asset_volume', 'trades',
+            'taker_buy_base', 'taker_buy_quote', 'ignore'
+        ])
         
-        # Stop once we have enough history (we only need ~100 candles)
-        if len(aggregated) >= 500:
-            break
-    
-    aggregated.reverse()
-    return aggregated
+        # Convert timestamps from milliseconds to datetime (UTC)
+        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms', utc=True)
+        df['close_time'] = pd.to_datetime(df['close_time'], unit='ms', utc=True)
+        
+        # Convert numeric columns (Binance returns strings)
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        df.set_index('open_time', inplace=True)
+        
+        # FIXED: Use UTC timezone for origin
+        origin_utc = pd.Timestamp('1970-01-01', tz='UTC')
+        
+        # Resample with UTC origin to match TradingView
+        df_resampled = df.resample('45min', origin=origin_utc).agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum',
+            'close_time': 'last'
+        }).dropna()
+        
+        # Convert back to Binance klines format (list of lists)
+        aggregated = []
+        for idx, row in df_resampled.iterrows():
+            aggregated.append([
+                int(idx.timestamp() * 1000),           # open_time in ms
+                float(row['open']),                    # open price
+                float(row['high']),                    # high price
+                float(row['low']),                     # low price
+                float(row['close']),                   # close price
+                float(row['volume']),                  # volume
+                int(row['close_time'].timestamp() * 1000)  # close_time in ms
+            ])
+        
+        return aggregated
+        
+    except Exception as e:
+        log(f"Error in 45m aggregation: {e}", None, None)
+        return []
 
 # ------------------- SYMBOL FILTERS WITH PROPER CACHE -------------------
 def get_symbol_filters(client: BinanceClient, symbol: str) -> Dict[str, Decimal]:
@@ -1372,23 +1392,36 @@ def place_orders(client: BinanceClient, symbol: str, trade_state: TradeState, ti
         trade_state.active = False
 
 # ------------------- DATA FETCHING WITH DECIMAL -------------------
-def fetch_klines(client: BinanceClient, symbol: str, interval: str, limit: int = max(500, VOL_SMA_PERIOD * 3)) -> List[List[Any]]:
-    requested = interval
-    if requested == "45m":
-        interval = "15m"
-        limit = max(limit, 1500)  # Need enough 15m candles
+def fetch_klines(client: BinanceClient, symbol: str, interval: str, 
+                 limit: int = max(500, VOL_SMA_PERIOD * 3)) -> List[List[Any]]:
+    """
+    Fetch klines from Binance with TradingView-aligned 45m aggregation.
+    Optimized for RSI accuracy with sufficient warm-up data.
+    """
+    target_interval = interval
+    fetch_interval = interval
+    
+    if interval == "45m":
+        fetch_interval = "15m"
+        # For accurate RSI: 250 45m candles * 3 = 750 15m candles
+        fetch_limit = max(limit * 3, 750)
+    else:
+        # For other timeframes, keep existing logic
+        fetch_limit = limit
+    
     try:
         raw = client.public_request("/fapi/v1/klines", {
             "symbol": symbol,
-            "interval": interval,
-            "limit": limit
+            "interval": fetch_interval,
+            "limit": fetch_limit
         })
-        # === THIS IS THE CRITICAL FIX ===
-        if requested == "45m":
-            raw = aggregate_klines_to_45m(raw)  # ← DRIFT-PROOF VERSION APPLIED HERE
-            # Optional: one-time startup message
-            if len(raw) > 0 and len(raw) < 50:
-                log(f"45m aggregation complete — {len(raw)} candles ready (from 15m data)", None, None)
+        
+        # Apply TradingView-aligned aggregation for 45m
+        if target_interval == "45m":
+            raw = aggregate_klines_to_45m(raw)
+            if raw and len(raw) > 100:
+                log(f"45m: {len(raw)} candles ready (TradingView-aligned)", None, None)
+        
         return raw
     except Exception as e:
         log(f"Klines fetch failed: {e}", None, None)
