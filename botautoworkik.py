@@ -1143,66 +1143,75 @@ def quantize_price(p: Decimal, tick_size: Decimal, rounding=ROUND_HALF_EVEN) -> 
     return p.quantize(tick_size, rounding=rounding)
 
 # === 45m AGGREGATION + ALIGNMENT (BEST VERSION) ===
-def aggregate_klines_to_45m(klines_15m: List[List[Any]]) -> List[List[Any]]:
+def aggregate_klines_to_45m(klines_15m):
     """
-    TradingView-aligned 45m aggregation using Pandas.
-    Returns data in same format as Binance API for Decimal conversion.
+    100% TradingView-aligned 45m aggregation for Binance Futures.
+    - Base volume (SOL, BTC, etc.)
+    - UTC session alignment
+    - Closed candles only
     """
     if not klines_15m or len(klines_15m) < 3:
         return []
-    
-    try:
-        import pandas as pd
-        
-        # Convert to DataFrame
-        df = pd.DataFrame(klines_15m, columns=[
-            'open_time', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_asset_volume', 'trades',
-            'taker_buy_base', 'taker_buy_quote', 'ignore'
+
+    import pandas as pd
+
+    # Binance 15m kline structure
+    df = pd.DataFrame(klines_15m, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_asset_volume", "trades",
+        "taker_buy_base", "taker_buy_quote", "ignore"
+    ])
+
+    # Convert timestamps → UTC
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+
+    # Numeric conversion (BASE volume)
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Use open_time as index (TradingView logic)
+    df.set_index("open_time", inplace=True)
+
+    # === CRITICAL: TradingView 45m alignment ===
+    # 45m candles anchored at :00 UTC
+    resampled = (
+        df
+        .resample(
+            "45min",
+            label="right",
+            closed="right",
+            origin="start_day"
+        )
+        .agg({
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+            "close_time": "last"
+        })
+        .dropna()
+    )
+
+    # === DROP FORMING CANDLE (TradingView only uses CLOSED bars) ===
+    now_utc = pd.Timestamp.now(tz="UTC")
+    resampled = resampled[resampled["close_time"] <= now_utc]
+
+    # Convert back to Binance-style kline format
+    out = []
+    for idx, row in resampled.iterrows():
+        out.append([
+            int((idx - pd.Timedelta(minutes=45)).timestamp() * 1000),  # open_time
+            float(row["open"]),
+            float(row["high"]),
+            float(row["low"]),
+            float(row["close"]),
+            float(row["volume"]),                                      # BASE volume
+            int(row["close_time"].timestamp() * 1000)                  # close_time
         ])
-        
-        # Convert timestamps from milliseconds to datetime (UTC)
-        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms', utc=True)
-        df['close_time'] = pd.to_datetime(df['close_time'], unit='ms', utc=True)
-        
-        # Convert numeric columns (Binance returns strings)
-        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-        for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        df.set_index('open_time', inplace=True)
-        
-        # FIXED: Use UTC timezone for origin
-        origin_utc = pd.Timestamp('1970-01-01', tz='UTC')
-        
-        # Resample with UTC origin to match TradingView
-        df_resampled = df.resample('45min', origin=origin_utc).agg({
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last',
-            'volume': 'sum',
-            'close_time': 'last'
-        }).dropna()
-        
-        # Convert back to Binance klines format (list of lists)
-        aggregated = []
-        for idx, row in df_resampled.iterrows():
-            aggregated.append([
-                int(idx.timestamp() * 1000),           # open_time in ms
-                float(row['open']),                    # open price
-                float(row['high']),                    # high price
-                float(row['low']),                     # low price
-                float(row['close']),                   # close price
-                float(row['volume']),                  # volume
-                int(row['close_time'].timestamp() * 1000)  # close_time in ms
-            ])
-        
-        return aggregated
-        
-    except Exception as e:
-        log(f"Error in 45m aggregation: {e}", None, None)
-        return []
+
+    return out
 
 # ------------------- SYMBOL FILTERS WITH PROPER CACHE -------------------
 def get_symbol_filters(client: BinanceClient, symbol: str) -> Dict[str, Decimal]:
@@ -2684,3 +2693,4 @@ if __name__ == "__main__":
             except Exception as e2:
                 print(f"Error during crash logging: {e2}")
             time.sleep(15)
+
