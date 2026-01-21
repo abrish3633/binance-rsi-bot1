@@ -91,6 +91,7 @@ MAX_LEVERAGE = Decimal("9")
 
 # === WEEKLY SCALING QUICK TOGGLE ===
 ENABLE_WEEKLY_SCALING = True # ← Set to False to disable scaling completely
+HALF_R_THRESHOLD = Decimal("0.00375")  # 0.5R threshold (0.5 * 0.0075 = 0.375%)
 
 # ------------------- BOT STATE CLASS (BUNDLED GLOBALS) -------------------
 class BotState:
@@ -569,12 +570,14 @@ def log_pnl(trade_id: int, side: str, entry: Decimal, exit_price: Decimal, qty: 
     # === CONSECUTIVE LOSS TRACKING WITH DECIMAL ===
     denominator = entry * qty if entry and qty else Decimal("1")
     loss_pct = abs(pnl_usd) / denominator if pnl_usd < Decimal("0") else Decimal("0")
-    is_full_loss = loss_pct >= Decimal("0.0074")  # ~0.75% loss (1R)
-    
-    if pnl_usd < Decimal("0") and is_full_loss:
+    # Use the 0.5R threshold constant (0.375% loss instead of 0.75%)
+    is_half_r_loss = loss_pct >= HALF_R_THRESHOLD  # 0.5R loss
+
+    if pnl_usd < Decimal("0") and is_half_r_loss:
         bot_state.CONSEC_LOSSES += 1
+        log(f"Consecutive loss #{bot_state.CONSEC_LOSSES}: Loss = {loss_pct:.4%} (≥0.5R)", None, None)
     else:
-        bot_state.CONSEC_LOSSES = 0  # Any profit or partial loss resets streak
+        bot_state.CONSEC_LOSSES = 0  # Any profit or loss < 0.5R resets streak
     
     row = {
         'date': datetime.now(timezone.utc).isoformat(),
@@ -2646,7 +2649,7 @@ if __name__ == "__main__":
             # Format risk % safely and precisely with Decimal
             risk_pct_display = Decimal(str(args.risk_pct))
             log(f"Simple Weekly DD Guard: 20% hard stop", args.telegram_token, args.chat_id)
-            log(f"Consecutive Loss Guard: 3 full losses stop", args.telegram_token, args.chat_id)
+            log(f"Consecutive Loss Guard: 3 losses ≥0.5R stop", args.telegram_token, args.chat_id)
             log(f"Base Risk: {BASE_RISK_PCT*Decimal('100'):.2f}% per trade", args.telegram_token, args.chat_id)
             log(f"Fetched balance: ${balance:.2f} USDT", args.telegram_token, args.chat_id)
             
@@ -2693,4 +2696,5 @@ if __name__ == "__main__":
             except Exception as e2:
                 print(f"Error during crash logging: {e2}")
             time.sleep(15)
+
 
