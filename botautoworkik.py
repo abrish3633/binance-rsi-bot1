@@ -1644,6 +1644,36 @@ def debug_and_recover_expired_orders(client: BinanceClient, symbol: str, trade_s
         return False
       
 # === PRIVATE HELPERS (DRY + SAFE) ===
+# ------------------- HELPER FUNCTIONS FOR TIMING -------------------
+def get_tradingview_45m_grid(current_time_ms: int) -> Tuple[int, int]:
+    """
+    Get current and next TradingView 45m candle times.
+    Returns: (current_candle_close_ms, next_candle_close_ms)
+    """
+    # Convert to minutes since epoch
+    minutes = current_time_ms // 60000
+    
+    # TradingView 45m sequence: 45, 30, 15, 00 repeating
+    # Find position in sequence
+    sequence_position = minutes % 45  # 0-44
+    
+    if sequence_position < 15:
+        # In :00-:14 range → current candle started at :00
+        current_candle_start_minutes = (minutes // 45) * 45
+        next_candle_start = current_candle_start_minutes + 45
+    elif sequence_position < 30:
+        # In :15-:29 range → current candle started at :15
+        current_candle_start_minutes = (minutes // 45) * 45 + 15
+        next_candle_start = current_candle_start_minutes + 45
+    else:  # sequence_position < 45
+        # In :30-:44 range → current candle started at :30
+        current_candle_start_minutes = (minutes // 45) * 45 + 30
+        next_candle_start = current_candle_start_minutes + 45
+    
+    current_candle_close_ms = (current_candle_start_minutes + 45) * 60000
+    next_candle_close_ms = (next_candle_start + 45) * 60000
+    
+    return current_candle_close_ms, next_candle_close_ms
 def _calc_sl_price(entry: Optional[Decimal], side: Optional[str], tick_size: Decimal) -> Decimal:
     if entry is None or side is None:
         return Decimal("0")
@@ -2411,18 +2441,40 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 if not pending_entry:
                     log("No trade signal on candle close.", telegram_bot, telegram_chat_id)
             
-            # === PERFECT 45m WAIT — BINANCE SERVER TIME ALIGNED ===
+            # === PERFECT 45m WAIT — TRADINGVIEW ALIGNED ===
             if timeframe == "45m":
-                try:
-                    # get Binance server time (ms)
-                    server_time = int(client.public_request("/fapi/v1/time")["serverTime"])
-                except Exception as e:
-                    log(f"Failed to fetch server time: {e}", telegram_bot, telegram_chat_id)
-                    # fallback to local time
-                    server_time = int(time.time() * 1000)
-                # true 45-minute grid using server time
-                interval = interval_ms(timeframe)
-                next_close_ms = ((server_time // interval) * interval) + interval
+                # Get current time
+                current_time_ms = int(time.time() * 1000)
+                
+                # Get TradingView-aligned candle times
+                current_candle_close, next_candle_close = get_tradingview_45m_grid(current_time_ms)
+                
+                # Debug logging
+                log(f"DEBUG: current_time={datetime.fromtimestamp(current_time_ms/1000, tz=timezone.utc).strftime('%H:%M:%S')}", telegram_bot, telegram_chat_id)
+                log(f"DEBUG: current_candle_close={datetime.fromtimestamp(current_candle_close/1000, tz=timezone.utc).strftime('%H:%M:%S')}", telegram_bot, telegram_chat_id)
+                log(f"DEBUG: next_candle_close={datetime.fromtimestamp(next_candle_close/1000, tz=timezone.utc).strftime('%H:%M:%S')}", telegram_bot, telegram_chat_id)
+                log(f"DEBUG: last_processed={datetime.fromtimestamp(bot_state.last_processed_close_ms/1000, tz=timezone.utc).strftime('%H:%M:%S') if bot_state.last_processed_close_ms else 'None'}", telegram_bot, telegram_chat_id)
+                
+                # Only process if we haven't processed this candle yet
+                if (bot_state.last_processed_close_ms is None or 
+                    current_candle_close > bot_state.last_processed_close_ms):
+                    
+                    # Update that we've processed this candle
+                    bot_state.last_processed_close_ms = current_candle_close
+                    
+                    # Wait for NEXT candle (not current one!)
+                    next_close_ms = next_candle_close  # <-- FIXED!
+                    
+                    log(f"DEBUG: Processing candle, will wait for next at {datetime.fromtimestamp(next_close_ms/1000, tz=timezone.utc).strftime('%H:%M:%S')}", telegram_bot, telegram_chat_id)
+                else:
+                    # Already processed current candle, wait for next one
+                    next_close_ms = next_candle_close
+                    wait_sec = max(2.0, (next_close_ms - current_time_ms) / 1000.0 + 2.0)
+                    next_dt_log = datetime.fromtimestamp(next_close_ms / 1000, tz=timezone.utc)
+                    log(f"DEBUG: Already processed this candle, waiting for next", telegram_bot, telegram_chat_id)
+                    log(f"Waiting for next TradingView 45m candle at {next_dt_log.strftime('%H:%M')} UTC", telegram_bot, telegram_chat_id)
+                    _safe_sleep(wait_sec)
+                    continue  # Skip to next iteration
             else:
                 # Native Binance alignment for other timeframes
                 try:
@@ -2433,7 +2485,7 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 interval = interval_ms(timeframe)
                 next_close_ms = ((server_time // interval) * interval) + interval
             
-            # === WAIT ===
+            # === WAIT (for non-45m timeframes or after processing 45m candle) ===
             now_ms = int(time.time() * 1000)
             wait_sec = max(2.0, (next_close_ms - now_ms) / 1000.0 + 2.0)
             next_dt_log = datetime.fromtimestamp(next_close_ms / 1000, tz=timezone.utc)
@@ -2696,5 +2748,3 @@ if __name__ == "__main__":
             except Exception as e2:
                 print(f"Error during crash logging: {e2}")
             time.sleep(15)
-
-
