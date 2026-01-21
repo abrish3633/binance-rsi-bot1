@@ -2219,8 +2219,10 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
             except Exception as e:
                 log(f"Heartbeat failed: {str(e)}", telegram_bot, telegram_chat_id)
 
-            dt = datetime.fromtimestamp(latest_close_ms / 1000, tz=timezone.utc)
-            log(f"Aligned to {timeframe} candle close: {dt.strftime('%H:%M')} UTC", telegram_bot, telegram_chat_id)
+            # Get the TradingView-aligned candle time
+            current_candle_close, _ = get_tradingview_45m_grid(int(time.time() * 1000))
+            dt = datetime.fromtimestamp(current_candle_close / 1000, tz=timezone.utc)
+            log(f"Processing TradingView 45m candle that closed at: {dt.strftime('%H:%M')} UTC", telegram_bot, telegram_chat_id)
           
             close_price = Decimal(str(klines[-1][4]))
             open_price = Decimal(str(klines[-1][1]))
@@ -2748,3 +2750,4 @@ if __name__ == "__main__":
             except Exception as e2:
                 print(f"Error during crash logging: {e2}")
             time.sleep(15)
+
