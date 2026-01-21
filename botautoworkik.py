@@ -570,14 +570,12 @@ def log_pnl(trade_id: int, side: str, entry: Decimal, exit_price: Decimal, qty: 
     # === CONSECUTIVE LOSS TRACKING WITH DECIMAL ===
     denominator = entry * qty if entry and qty else Decimal("1")
     loss_pct = abs(pnl_usd) / denominator if pnl_usd < Decimal("0") else Decimal("0")
-    # Use the 0.5R threshold constant (0.375% loss instead of 0.75%)
-    is_half_r_loss = loss_pct >= HALF_R_THRESHOLD  # 0.5R loss
-
-    if pnl_usd < Decimal("0") and is_half_r_loss:
+    is_full_loss = loss_pct >= Decimal("0.0074")  # ~0.75% loss (1R)
+    
+    if pnl_usd < Decimal("0") and is_full_loss:
         bot_state.CONSEC_LOSSES += 1
-        log(f"Consecutive loss #{bot_state.CONSEC_LOSSES}: Loss = {loss_pct:.4%} (≥0.5R)", None, None)
     else:
-        bot_state.CONSEC_LOSSES = 0  # Any profit or loss < 0.5R resets streak
+        bot_state.CONSEC_LOSSES = 0  # Any profit or partial loss resets streak
     
     row = {
         'date': datetime.now(timezone.utc).isoformat(),
@@ -1146,75 +1144,46 @@ def quantize_price(p: Decimal, tick_size: Decimal, rounding=ROUND_HALF_EVEN) -> 
     return p.quantize(tick_size, rounding=rounding)
 
 # === 45m AGGREGATION + ALIGNMENT (BEST VERSION) ===
-def aggregate_klines_to_45m(klines_15m):
-    """
-    100% TradingView-aligned 45m aggregation for Binance Futures.
-    - Base volume (SOL, BTC, etc.)
-    - UTC session alignment
-    - Closed candles only
-    """
-    if not klines_15m or len(klines_15m) < 3:
+def aggregate_klines_to_45m(klines_15m: List[List[Any]]) -> List[List[Any]]:
+    if len(klines_15m) < 3:
         return []
-
-    import pandas as pd
-
-    # Binance 15m kline structure
-    df = pd.DataFrame(klines_15m, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_asset_volume", "trades",
-        "taker_buy_base", "taker_buy_quote", "ignore"
-    ])
-
-    # Convert timestamps → UTC
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-
-    # Numeric conversion (BASE volume)
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Use open_time as index (TradingView logic)
-    df.set_index("open_time", inplace=True)
-
-    # === CRITICAL: TradingView 45m alignment ===
-    # 45m candles anchored at :00 UTC
-    resampled = (
-        df
-        .resample(
-            "45min",
-            label="right",
-            closed="right",
-            origin="start_day"
-        )
-        .agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-            "close_time": "last"
-        })
-        .dropna()
-    )
-
-    # === DROP FORMING CANDLE (TradingView only uses CLOSED bars) ===
-    now_utc = pd.Timestamp.now(tz="UTC")
-    resampled = resampled[resampled["close_time"] <= now_utc]
-
-    # Convert back to Binance-style kline format
-    out = []
-    for idx, row in resampled.iterrows():
-        out.append([
-            int((idx - pd.Timedelta(minutes=45)).timestamp() * 1000),  # open_time
-            float(row["open"]),
-            float(row["high"]),
-            float(row["low"]),
-            float(row["close"]),
-            float(row["volume"]),                                      # BASE volume
-            int(row["close_time"].timestamp() * 1000)                  # close_time
-        ])
-
-    return out
+    aggregated: List[List[Any]] = []
+    EXPECTED = 45 * 60 * 1000
+    TOLERANCE = 5000  # 5-second tolerance (covers any Binance drift)
+    
+    # Work backwards from the newest candle (guarantees we get the latest complete 45m candle)
+    for i in range(len(klines_15m) - 1, 1, -1):
+        # Align to every 45-minute boundary from the newest candle
+        close_time = int(klines_15m[i][6])
+        open_time_expected = close_time - EXPECTED
+        
+        # Find the oldest candle that matches the expected 45m window
+        for j in range(i - 2, -1, -1):
+            if abs(int(klines_15m[j][0]) - open_time_expected) <= TOLERANCE:
+                # Found a matching group of 3 candles
+                chunk = klines_15m[j:j+3]
+                if len(chunk) == 3:
+                    a, b, c = chunk
+                    high = max(float(a[2]), float(b[2]), float(c[2]))
+                    low = min(float(a[3]), float(b[3]), float(c[3]))
+                    volume = float(a[5]) + float(b[5]) + float(c[5])
+                    aggregated.append([
+                        int(a[0]),
+                        float(a[1]),
+                        high,
+                        low,
+                        float(c[4]),
+                        volume,
+                        int(c[6])
+                    ])
+                break
+        
+        # Stop once we have enough history (we only need ~100 candles)
+        if len(aggregated) >= 500:
+            break
+    
+    aggregated.reverse()
+    return aggregated
 
 # ------------------- SYMBOL FILTERS WITH PROPER CACHE -------------------
 def get_symbol_filters(client: BinanceClient, symbol: str) -> Dict[str, Decimal]:
@@ -1404,36 +1373,23 @@ def place_orders(client: BinanceClient, symbol: str, trade_state: TradeState, ti
         trade_state.active = False
 
 # ------------------- DATA FETCHING WITH DECIMAL -------------------
-def fetch_klines(client: BinanceClient, symbol: str, interval: str, 
-                 limit: int = max(500, VOL_SMA_PERIOD * 3)) -> List[List[Any]]:
-    """
-    Fetch klines from Binance with TradingView-aligned 45m aggregation.
-    Optimized for RSI accuracy with sufficient warm-up data.
-    """
-    target_interval = interval
-    fetch_interval = interval
-    
-    if interval == "45m":
-        fetch_interval = "15m"
-        # For accurate RSI: 250 45m candles * 3 = 750 15m candles
-        fetch_limit = max(limit * 3, 750)
-    else:
-        # For other timeframes, keep existing logic
-        fetch_limit = limit
-    
+def fetch_klines(client: BinanceClient, symbol: str, interval: str, limit: int = max(500, VOL_SMA_PERIOD * 3)) -> List[List[Any]]:
+    requested = interval
+    if requested == "45m":
+        interval = "15m"
+        limit = max(limit, 1500)  # Need enough 15m candles
     try:
         raw = client.public_request("/fapi/v1/klines", {
             "symbol": symbol,
-            "interval": fetch_interval,
-            "limit": fetch_limit
+            "interval": interval,
+            "limit": limit
         })
-        
-        # Apply TradingView-aligned aggregation for 45m
-        if target_interval == "45m":
-            raw = aggregate_klines_to_45m(raw)
-            if raw and len(raw) > 100:
-                log(f"45m: {len(raw)} candles ready (TradingView-aligned)", None, None)
-        
+        # === THIS IS THE CRITICAL FIX ===
+        if requested == "45m":
+            raw = aggregate_klines_to_45m(raw)  # ← DRIFT-PROOF VERSION APPLIED HERE
+            # Optional: one-time startup message
+            if len(raw) > 0 and len(raw) < 50:
+                log(f"45m aggregation complete — {len(raw)} candles ready (from 15m data)", None, None)
         return raw
     except Exception as e:
         log(f"Klines fetch failed: {e}", None, None)
@@ -1644,36 +1600,6 @@ def debug_and_recover_expired_orders(client: BinanceClient, symbol: str, trade_s
         return False
       
 # === PRIVATE HELPERS (DRY + SAFE) ===
-# ------------------- HELPER FUNCTIONS FOR TIMING -------------------
-def get_tradingview_45m_grid(current_time_ms: int) -> Tuple[int, int]:
-    """
-    Get current and next TradingView 45m candle times.
-    Returns: (current_candle_close_ms, next_candle_close_ms)
-    """
-    # Convert to minutes since epoch
-    minutes = current_time_ms // 60000
-    
-    # TradingView 45m sequence: 45, 30, 15, 00 repeating
-    # Find position in sequence
-    sequence_position = minutes % 45  # 0-44
-    
-    if sequence_position < 15:
-        # In :00-:14 range → current candle started at :00
-        current_candle_start_minutes = (minutes // 45) * 45
-        next_candle_start = current_candle_start_minutes + 45
-    elif sequence_position < 30:
-        # In :15-:29 range → current candle started at :15
-        current_candle_start_minutes = (minutes // 45) * 45 + 15
-        next_candle_start = current_candle_start_minutes + 45
-    else:  # sequence_position < 45
-        # In :30-:44 range → current candle started at :30
-        current_candle_start_minutes = (minutes // 45) * 45 + 30
-        next_candle_start = current_candle_start_minutes + 45
-    
-    current_candle_close_ms = (current_candle_start_minutes + 45) * 60000
-    next_candle_close_ms = (next_candle_start + 45) * 60000
-    
-    return current_candle_close_ms, next_candle_close_ms
 def _calc_sl_price(entry: Optional[Decimal], side: Optional[str], tick_size: Decimal) -> Decimal:
     if entry is None or side is None:
         return Decimal("0")
@@ -2219,10 +2145,8 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
             except Exception as e:
                 log(f"Heartbeat failed: {str(e)}", telegram_bot, telegram_chat_id)
 
-            # Get the TradingView-aligned candle time
-            current_candle_close, _ = get_tradingview_45m_grid(int(time.time() * 1000))
-            dt = datetime.fromtimestamp(current_candle_close / 1000, tz=timezone.utc)
-            log(f"Processing TradingView 45m candle that closed at: {dt.strftime('%H:%M')} UTC", telegram_bot, telegram_chat_id)
+            dt = datetime.fromtimestamp(latest_close_ms / 1000, tz=timezone.utc)
+            log(f"Aligned to {timeframe} candle close: {dt.strftime('%H:%M')} UTC", telegram_bot, telegram_chat_id)
           
             close_price = Decimal(str(klines[-1][4]))
             open_price = Decimal(str(klines[-1][1]))
@@ -2443,40 +2367,18 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 if not pending_entry:
                     log("No trade signal on candle close.", telegram_bot, telegram_chat_id)
             
-            # === PERFECT 45m WAIT — TRADINGVIEW ALIGNED ===
+            # === PERFECT 45m WAIT — BINANCE SERVER TIME ALIGNED ===
             if timeframe == "45m":
-                # Get current time
-                current_time_ms = int(time.time() * 1000)
-                
-                # Get TradingView-aligned candle times
-                current_candle_close, next_candle_close = get_tradingview_45m_grid(current_time_ms)
-                
-                # Debug logging
-                log(f"DEBUG: current_time={datetime.fromtimestamp(current_time_ms/1000, tz=timezone.utc).strftime('%H:%M:%S')}", telegram_bot, telegram_chat_id)
-                log(f"DEBUG: current_candle_close={datetime.fromtimestamp(current_candle_close/1000, tz=timezone.utc).strftime('%H:%M:%S')}", telegram_bot, telegram_chat_id)
-                log(f"DEBUG: next_candle_close={datetime.fromtimestamp(next_candle_close/1000, tz=timezone.utc).strftime('%H:%M:%S')}", telegram_bot, telegram_chat_id)
-                log(f"DEBUG: last_processed={datetime.fromtimestamp(bot_state.last_processed_close_ms/1000, tz=timezone.utc).strftime('%H:%M:%S') if bot_state.last_processed_close_ms else 'None'}", telegram_bot, telegram_chat_id)
-                
-                # Only process if we haven't processed this candle yet
-                if (bot_state.last_processed_close_ms is None or 
-                    current_candle_close > bot_state.last_processed_close_ms):
-                    
-                    # Update that we've processed this candle
-                    bot_state.last_processed_close_ms = current_candle_close
-                    
-                    # Wait for NEXT candle (not current one!)
-                    next_close_ms = next_candle_close  # <-- FIXED!
-                    
-                    log(f"DEBUG: Processing candle, will wait for next at {datetime.fromtimestamp(next_close_ms/1000, tz=timezone.utc).strftime('%H:%M:%S')}", telegram_bot, telegram_chat_id)
-                else:
-                    # Already processed current candle, wait for next one
-                    next_close_ms = next_candle_close
-                    wait_sec = max(2.0, (next_close_ms - current_time_ms) / 1000.0 + 2.0)
-                    next_dt_log = datetime.fromtimestamp(next_close_ms / 1000, tz=timezone.utc)
-                    log(f"DEBUG: Already processed this candle, waiting for next", telegram_bot, telegram_chat_id)
-                    log(f"Waiting for next TradingView 45m candle at {next_dt_log.strftime('%H:%M')} UTC", telegram_bot, telegram_chat_id)
-                    _safe_sleep(wait_sec)
-                    continue  # Skip to next iteration
+                try:
+                    # get Binance server time (ms)
+                    server_time = int(client.public_request("/fapi/v1/time")["serverTime"])
+                except Exception as e:
+                    log(f"Failed to fetch server time: {e}", telegram_bot, telegram_chat_id)
+                    # fallback to local time
+                    server_time = int(time.time() * 1000)
+                # true 45-minute grid using server time
+                interval = interval_ms(timeframe)
+                next_close_ms = ((server_time // interval) * interval) + interval
             else:
                 # Native Binance alignment for other timeframes
                 try:
@@ -2487,7 +2389,7 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 interval = interval_ms(timeframe)
                 next_close_ms = ((server_time // interval) * interval) + interval
             
-            # === WAIT (for non-45m timeframes or after processing 45m candle) ===
+            # === WAIT ===
             now_ms = int(time.time() * 1000)
             wait_sec = max(2.0, (next_close_ms - now_ms) / 1000.0 + 2.0)
             next_dt_log = datetime.fromtimestamp(next_close_ms / 1000, tz=timezone.utc)
@@ -2750,4 +2652,3 @@ if __name__ == "__main__":
             except Exception as e2:
                 print(f"Error during crash logging: {e2}")
             time.sleep(15)
-
