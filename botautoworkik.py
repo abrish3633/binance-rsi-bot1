@@ -2255,7 +2255,7 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 qty_raw = risk_amount_usd / R
                 qty = min(qty_raw, max_qty_by_leverage)
                 qty = qty * Decimal("0.75")
-                qty = min(qty, current_balance * Decimal("0.5") / entry_price)  # Max 50% of account
+                qty = min(qty, Decimal("25"))  # Hard cap of 250
                 qty_api = quantize_qty(qty, step_size)
                 
                 # MIN_NOTIONAL check with Decimal
