@@ -1447,6 +1447,7 @@ def fetch_balance(client: BinanceClient) -> Decimal:
 def trading_allowed(client: BinanceClient, symbol: str, telegram_bot: Optional[str], telegram_chat_id: Optional[str]) -> bool:
     """Simple check for weekly DD and consecutive loss guards"""
     global bot_state
+    return True  # ← Always allow trading, ignoring all guards
     
     # 1. Weekly DD Guard (20% hard stop)
     current_balance = fetch_balance(client)
@@ -2253,7 +2254,8 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 max_qty_by_leverage = max_notional_by_leverage / entry_price
                 qty_raw = risk_amount_usd / R
                 qty = min(qty_raw, max_qty_by_leverage)
-                qty = qty * Decimal("0.7")
+                qty = qty * Decimal("0.75")
+                qty = min(qty, current_balance * Decimal("0.5") / entry_price)  # Max 50% of account
                 qty_api = quantize_qty(qty, step_size)
                 
                 # MIN_NOTIONAL check with Decimal
