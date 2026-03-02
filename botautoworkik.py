@@ -2484,13 +2484,42 @@ def run_scheduler(bot: Optional[str], chat_id: Optional[str]):
         if current_date.day == 1 and (last_month is None or current_date.month != last_month):
             send_monthly_report(bot, chat_id) 
             last_month = current_date.month
-    
+    def monthly_cleanup_job():
+        """Monthly memory cleanup after PnL report"""
+        import gc
+        import psutil
+        
+        try:
+            # Get memory before cleanup
+            process = psutil.Process()
+            mem_before = process.memory_info().rss / 1024 / 1024
+            
+            log("🧹 Starting monthly memory cleanup...", bot, chat_id)
+            
+            # Force garbage collection
+            gc.collect()
+            
+            # Clear symbol filters cache
+            if hasattr(bot_state, 'symbol_filters_cache') and len(bot_state.symbol_filters_cache) > 10:
+                with bot_state._trade_lock:
+                    bot_state.symbol_filters_cache.clear()
+            
+            # Get memory after cleanup
+            mem_after = process.memory_info().rss / 1024 / 1024
+            mem_freed = mem_before - mem_after
+            
+            log(f"✅ Monthly cleanup complete - Memory: {mem_before:.1f}MB → {mem_after:.1f}MB (freed {mem_freed:.1f}MB)", 
+                bot, chat_id)
+                
+        except Exception as e:
+            log(f"❌ Monthly cleanup error: {e}", bot, chat_id)
     # Schedule all tasks using the schedule library for reliability
     schedule.every().day.at("23:59").do(lambda: send_daily_report(bot, chat_id))
     schedule.every().sunday.at("23:59").do(lambda: send_weekly_report(bot, chat_id))
     schedule.every().day.at("00:00").do(daily_reset_job)
     schedule.every().monday.at("00:00").do(weekly_reset_job)
     schedule.every().day.at("00:00").do(check_monthly_report)
+    schedule.every().day.at("00:02").do(monthly_cleanup_job)    # Add this
     
     log("Scheduler Initialized: Daily/Weekly resets and reporting active.", bot, chat_id)
 
@@ -2498,6 +2527,7 @@ def run_scheduler(bot: Optional[str], chat_id: Optional[str]):
     while not bot_state.STOP_REQUESTED:
         schedule.run_pending()
         time.sleep(1)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Binance Futures RSI Bot (Binance Trailing, 45m Optimized, SOLUSDT)")
@@ -2654,3 +2684,4 @@ if __name__ == "__main__":
             except Exception as e2:
                 print(f"Error during crash logging: {e2}")
             time.sleep(15)
+
