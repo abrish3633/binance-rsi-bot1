@@ -145,7 +145,8 @@ class BotState:
         self.consec_loss_guard_alert_sent = False
         self.last_processed_close_ms: Optional[int] = None
         self.last_candle_state: Optional[str] = None
-        
+        self.current_trade: Optional['TradeState'] = None  # ← ADD THIS
+
         # Performance tracking
         self.max_trades_alert_sent = False
         self.daily_start_equity: Optional[Decimal] = None
@@ -2453,6 +2454,70 @@ def _safe_sleep(total_seconds: float):
         sleep_time = min(Decimal("1"), remaining)
         time.sleep(float(sleep_time))
         remaining -= Decimal("1")
+# ------------------- PERSISTENT STATE MANAGEMENT (ADD THIS) -------------------
+import pickle
+STATE_FILE = 'edison_bot_state.pkl'
+
+def save_bot_state():
+    """Save critical bot state to disk"""
+    global bot_state
+    try:
+        persistent_data = {
+            'pnl_data': bot_state.pnl_data[-1000:] if hasattr(bot_state, 'pnl_data') else [],
+            'last_trade_date': getattr(bot_state, 'last_trade_date', None),
+            'CONSEC_LOSSES': getattr(bot_state, 'CONSEC_LOSSES', 0),
+            'weekly_peak_equity': getattr(bot_state, 'weekly_peak_equity', None),
+            'weekly_start_time': getattr(bot_state, 'weekly_start_time', None),
+            'account_size': getattr(bot_state, 'account_size', None),
+            'daily_start_equity': getattr(bot_state, 'daily_start_equity', None)
+        }
+        
+        with open(STATE_FILE, 'wb') as f:
+            pickle.dump(persistent_data, f)
+        log("💾 Edison bot state saved to disk", None, None)
+    except Exception as e:
+        log(f"❌ Failed to save state: {e}", None, None)
+
+def load_bot_state():
+    """Load critical bot state from disk"""
+    global bot_state
+    if not os.path.exists(STATE_FILE):
+        log("📂 No saved state found - starting fresh", None, None)
+        return
+    
+    try:
+        with open(STATE_FILE, 'rb') as f:
+            data = pickle.load(f)
+        
+        bot_state.pnl_data = data.get('pnl_data', [])
+        bot_state.last_trade_date = data.get('last_trade_date')
+        bot_state.CONSEC_LOSSES = data.get('CONSEC_LOSSES', 0)
+        bot_state.weekly_peak_equity = data.get('weekly_peak_equity')
+        bot_state.weekly_start_time = data.get('weekly_start_time')
+        bot_state.account_size = data.get('account_size')
+        bot_state.daily_start_equity = data.get('daily_start_equity')
+        
+        log(f"💾 Edison bot state loaded - {len(bot_state.pnl_data)} trades restored", None, None)
+    except Exception as e:
+        log(f"❌ Failed to load state: {e}", None, None)
+
+def daily_restart_job(bot_token, chat_id):
+    """Clean daily restart at 00:02 UTC"""
+    log("🔄 EDISON DAILY RESTART: Starting scheduled restart...", bot_token, chat_id)
+    telegram_post(bot_token, chat_id, "🔄 Edison bot daily restart - orders remain active")
+    
+    # Save state before restart
+    save_bot_state()
+    log("💾 Edison state saved - trades preserved", bot_token, chat_id)
+    
+    # Log that orders remain active
+    log("✅ Orders remain active on Binance - SL/TP untouched", bot_token, chat_id)
+    
+    # Wait a moment for logs to send
+    time.sleep(5)
+    
+    # Exit - main loop will restart
+    os._exit(0)
 
 def run_scheduler(bot: Optional[str], chat_id: Optional[str]):
     global bot_state
@@ -2461,7 +2526,6 @@ def run_scheduler(bot: Optional[str], chat_id: Optional[str]):
     def daily_reset_job():
         """Handles equity reset and logging at 00:00 UTC."""
         try:
-            # Uses your existing fetch_balance function
             current_balance = fetch_balance(bot_state.client)
             if current_balance > 0:
                 bot_state.account_size = current_balance
@@ -2484,50 +2548,20 @@ def run_scheduler(bot: Optional[str], chat_id: Optional[str]):
         if current_date.day == 1 and (last_month is None or current_date.month != last_month):
             send_monthly_report(bot, chat_id) 
             last_month = current_date.month
-    def monthly_cleanup_job():
-        """Monthly memory cleanup after PnL report"""
-        import gc
-        import psutil
-        
-        try:
-            # Get memory before cleanup
-            process = psutil.Process()
-            mem_before = process.memory_info().rss / 1024 / 1024
-            
-            log("🧹 Starting monthly memory cleanup...", bot, chat_id)
-            
-            # Force garbage collection
-            gc.collect()
-            
-            # Clear symbol filters cache
-            if hasattr(bot_state, 'symbol_filters_cache') and len(bot_state.symbol_filters_cache) > 10:
-                with bot_state._trade_lock:
-                    bot_state.symbol_filters_cache.clear()
-            
-            # Get memory after cleanup
-            mem_after = process.memory_info().rss / 1024 / 1024
-            mem_freed = mem_before - mem_after
-            
-            log(f"✅ Monthly cleanup complete - Memory: {mem_before:.1f}MB → {mem_after:.1f}MB (freed {mem_freed:.1f}MB)", 
-                bot, chat_id)
-                
-        except Exception as e:
-            log(f"❌ Monthly cleanup error: {e}", bot, chat_id)
-    # Schedule all tasks using the schedule library for reliability
+
+    # Schedule all tasks
     schedule.every().day.at("23:59").do(lambda: send_daily_report(bot, chat_id))
     schedule.every().sunday.at("23:59").do(lambda: send_weekly_report(bot, chat_id))
     schedule.every().day.at("00:00").do(daily_reset_job)
     schedule.every().monday.at("00:00").do(weekly_reset_job)
     schedule.every().day.at("00:00").do(check_monthly_report)
-    schedule.every().day.at("00:02").do(monthly_cleanup_job)    # Add this
+    schedule.every().day.at("00:02").do(lambda: daily_restart_job(bot, chat_id))  # ← DAILY RESTART!
     
-    log("Scheduler Initialized: Daily/Weekly resets and reporting active.", bot, chat_id)
+    log("📅 Edison Scheduler Initialized - Daily restart at 00:02 UTC", bot, chat_id)
 
-    # Main loop that respects the bot's shutdown signal
     while not bot_state.STOP_REQUESTED:
         schedule.run_pending()
         time.sleep(1)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Binance Futures RSI Bot (Binance Trailing, 45m Optimized, SOLUSDT)")
@@ -2559,6 +2593,7 @@ if __name__ == "__main__":
         NEWS_GUARD_ENABLED = True
     
     init_pnl_log()
+    load_bot_state()  # ← ADD THIS
     
     # ======================== SINGLE, BULLETPROOF SHUTDOWN ========================
     _shutdown_done = False
@@ -2652,7 +2687,7 @@ if __name__ == "__main__":
                 f"Volume Filter: {'ON' if args.use_volume_filter else 'OFF'} | "
                 f"Mode: {'LIVE' if args.live else 'TESTNET'}",
                 args.telegram_token, args.chat_id)
-            
+            log(f"🚀 Edison Bot started - PID: {os.getpid()}", args.telegram_token, args.chat_id)  # ← ADD THIS
             threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
             
             trading_loop(
