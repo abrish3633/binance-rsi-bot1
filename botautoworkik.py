@@ -27,6 +27,7 @@ import queue
 import socket
 import platform
 import numpy as np
+from telegram.ext.filters import COMMAND
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 import asyncio
@@ -2976,6 +2977,8 @@ if __name__ == "__main__":
                             # Add command handlers
                             application.add_handler(CommandHandler("restart", cmd_restart))
                             application.add_handler(CommandHandler("status", cmd_status))
+                            application.add_handler(CommandHandler("help", cmd_help))
+                            application.add_handler(MessageHandler(COMMAND, unknown))
                             
                             log(f"📱 Telegram listener starting (attempt {retry_count+1})...", 
                                 args.telegram_token, args.chat_id)
