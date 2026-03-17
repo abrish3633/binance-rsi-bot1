@@ -2736,6 +2736,22 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("\n".join(status_lines), parse_mode='Markdown')
 
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command: /help — show available commands"""
+    chat_id = str(update.effective_chat.id)
+    
+    if chat_id != str(args.chat_id):
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    
+    help_text = (
+        "🤖 *Available Commands:*\n\n"
+        "/status - Show bot status (balance, position, memory)\n"
+        "/restart - Gracefully restart the bot (preserves positions)\n"
+        "/help - Show this help message"
+    )
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
 # Handle all messages that aren't commands
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -2744,6 +2760,10 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Only respond to actual commands
     if update.message and update.message.text and update.message.text.startswith('/'):
         await update.message.reply_text("❓ Unknown command. Try /help")
+
+# In your handler setup:
+application.add_handler(MessageHandler(None, unknown))  # None means all messages
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Binance Futures RSI Bot (Binance Trailing, 45m Optimized, SOLUSDT)")
@@ -2962,7 +2982,7 @@ if __name__ == "__main__":
                             application.add_handler(CommandHandler("restart", cmd_restart))
                             application.add_handler(CommandHandler("status", cmd_status))
                             application.add_handler(CommandHandler("help", cmd_help))
-                            application.add_handler(MessageHandler(None, unknown))  # None means all messages
+                            application.add_handler(MessageHandler(COMMAND, unknown))
                             
                             log(f"📱 Telegram listener starting (attempt {retry_count+1})...", 
                                 args.telegram_token, args.chat_id)
