@@ -27,6 +27,10 @@ import queue
 import socket
 import platform
 import numpy as np
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+import asyncio
+import telegram
 
 # ------------------- CONFIGURATION -------------------
 RISK_PCT = Decimal("0.068") # 6.8% per trade
@@ -150,6 +154,12 @@ class BotState:
         self.max_trades_alert_sent = False
         self.daily_start_equity: Optional[Decimal] = None
         self.account_size: Optional[Decimal] = None
+        
+        # Add these to the BotState __init__ method:
+        self.RESTART_REQUESTED = False
+        self._restart_lock = threading.Lock()
+        self.start_time = datetime.now(timezone.utc)
+        self.current_trade = None  # Will hold the active trade state
 
 # Initialize global bot state
 bot_state = BotState()
@@ -761,7 +771,23 @@ def send_monthly_report(bot: Optional[str], chat_id: Optional[str]):
     report = calculate_pnl_report('monthly')
     subject = f"Monthly PnL Report - {datetime.now(timezone.utc).strftime('%Y-%m')}"
     telegram_post(bot, chat_id, f"{subject}\n{report}")
-
+def daily_memory_log(bot: Optional[str] = None, chat_id: Optional[str] = None):
+    """Log current memory usage once per day at 00:01 UTC"""
+    global bot_state, args
+    try:
+        import psutil
+        import gc
+        process = psutil.Process()
+        mem_mb = process.memory_info().rss / 1024 / 1024
+        obj_count = len(gc.get_objects())
+        
+        log(f"📊 DAILY MEMORY USAGE: {mem_mb:.1f} MB | Objects: {obj_count:,}", bot, chat_id)
+        
+        if mem_mb > 800:
+            log(f"⚠️ High memory warning: {mem_mb:.1f} MB", bot, chat_id)
+            
+    except Exception as e:
+        log(f"❌ Memory log error: {e}", bot, chat_id)
 # ------------------- STOP HANDLER (IDEMPOTENT) WITH DECIMAL -------------------
 def _request_stop(signum: Optional[int] = None, frame: Any = None, symbol: Optional[str] = None, telegram_bot: Optional[str] = None, telegram_chat_id: Optional[str] = None):
     global bot_state
@@ -1681,9 +1707,62 @@ def start_polling_mode(symbol: str, telegram_bot: Optional[str], telegram_chat_i
     
     threading.Thread(target=polling_loop, daemon=True).start()
 
+def get_position_amt(client: BinanceClient, symbol: str, telegram_bot: Optional[str] = None, telegram_chat_id: Optional[str] = None) -> Decimal:
+    """Get current position amount for a symbol"""
+    try:
+        pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+        positions = pos_resp['data'] if isinstance(pos_resp, dict) and 'data' in pos_resp else pos_resp if isinstance(pos_resp, list) else []
+        for p in positions:
+            if isinstance(p, dict) and p.get("symbol") == symbol:
+                return Decimal(str(p.get("positionAmt", "0")))
+        return Decimal('0')
+    except Exception as e:
+        log(f"Failed to get position amount: {e}", telegram_bot, telegram_chat_id)
+        return Decimal('0')
+    
+def recover_existing_positions(client, symbol, tick_size, telegram_bot, telegram_chat_id):
+    """Recover and monitor existing position - orders already on Binance"""
+    global bot_state
+    try:
+        pos_amt = get_position_amt(client, symbol, telegram_bot, telegram_chat_id)
+        if pos_amt != Decimal('0'):
+            log(f"📊 Found existing position: {abs(pos_amt)} SOL (orders active on Binance)", 
+                telegram_bot, telegram_chat_id)
+            
+            # Get position details
+            pos = fetch_open_positions_details(client, symbol, telegram_bot, telegram_chat_id)
+            if pos:
+                entry_price = Decimal(str(pos.get('entryPrice', '0')))
+                
+                # Create trade state for monitoring only
+                trade_state = TradeState()
+                trade_state.active = True
+                trade_state.side = "LONG" if pos_amt > 0 else "SHORT"
+                trade_state.qty = abs(pos_amt)
+                trade_state.entry_price = entry_price
+                trade_state.risk = entry_price * SL_PCT
+                trade_state.entry_close_time = int(time.time() * 1000)
+                
+                # Store in bot_state
+                with bot_state._restart_lock:  # Use existing restart_lock
+                    bot_state.current_trade = trade_state
+                
+                # Start monitoring (orders already on Binance!)
+                threading.Thread(
+                    target=monitor_trade,
+                    args=(client, symbol, trade_state, tick_size, 
+                          telegram_bot, telegram_chat_id, int(time.time() * 1000)),
+                    daemon=True
+                ).start()
+                
+                log("✅ Position recovery complete - monitoring resumed (orders untouched)", 
+                    telegram_bot, telegram_chat_id)
+    except Exception as e:
+        log(f"❌ Position recovery error: {e}", telegram_bot, telegram_chat_id)
 # ------------------- MONITOR TRADE WITH DECIMAL -------------------
 def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, tick_size: Decimal, telegram_bot: Optional[str], telegram_chat_id: Optional[str], current_candle_close_time: int):
     global bot_state
+    import psutil  # ← ADD THIS LINE
     log("Monitoring active trade...", telegram_bot, telegram_chat_id)
     trade_start_time = Decimal(str(time.time()))
     last_recovery_check = Decimal("0")
@@ -2025,24 +2104,6 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
     signal.signal(signal.SIGINT, lambda s, f: _request_stop(s, f, symbol, telegram_bot, telegram_chat_id))
     signal.signal(signal.SIGTERM, lambda s, f: _request_stop(s, f, symbol, telegram_bot, telegram_chat_id))
     log(f"Starting bot with symbol={symbol}, timeframe={timeframe}, risk_pct={risk_pct*Decimal('100'):.1f}%")
-    
-    # === RECOVER EXISTING POSITION ON STARTUP ===
-    if has_active_position(client, symbol):
-        pos = fetch_open_positions_details(client, symbol, telegram_bot, telegram_chat_id)
-        if pos:
-            pos_amt = Decimal(str(pos.get("positionAmt", "0")))
-            if pos_amt != Decimal("0"):
-                trade_state.active = True
-                trade_state.side = "LONG" if pos_amt > Decimal("0") else "SHORT"
-                trade_state.qty = abs(pos_amt)
-                trade_state.entry_price = Decimal(str(pos.get("entryPrice", "0")))
-                trade_state.risk = trade_state.entry_price * SL_PCT
-                trade_state.sl_order_id = None
-                trade_state.tp_order_id = None
-                trade_state.trail_order_id = None
-                log("Existing position detected on startup. Recovering orders...", telegram_bot, telegram_chat_id)
-                debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
-                monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, int(time.time() * 1000))
     
     # === MAIN TRADING LOOP — WITH DECIMAL CONSISTENCY ===
     while not bot_state.STOP_REQUESTED and not os.path.exists("stop.txt"):
@@ -2454,6 +2515,54 @@ def _safe_sleep(total_seconds: float):
         time.sleep(float(sleep_time))
         remaining -= Decimal("1")
 
+import pickle
+
+# ------------------- PERSISTENT STATE MANAGEMENT -------------------
+STATE_FILE = 'bot_state.pkl'
+
+def save_bot_state():
+    """Save critical bot state to disk"""
+    global bot_state
+    try:
+        persistent_data = {
+            'pnl_data': bot_state.pnl_data[-1000:] if hasattr(bot_state, 'pnl_data') else [],
+            'last_trade_date': getattr(bot_state, 'last_trade_date', None),
+            'CONSEC_LOSSES': getattr(bot_state, 'CONSEC_LOSSES', 0),
+            'weekly_peak_equity': getattr(bot_state, 'weekly_peak_equity', None),
+            'weekly_start_time': getattr(bot_state, 'weekly_start_time', None),
+            'account_size': getattr(bot_state, 'account_size', None),
+            'daily_start_equity': getattr(bot_state, 'daily_start_equity', None)
+        }
+        
+        with open(STATE_FILE, 'wb') as f:
+            pickle.dump(persistent_data, f)
+        log("💾 Bot state saved to disk", None, None)
+    except Exception as e:
+        log(f"❌ Failed to save state: {e}", None, None)
+
+def load_bot_state():
+    """Load critical bot state from disk"""
+    global bot_state
+    if not os.path.exists(STATE_FILE):
+        log("📂 No saved state found - starting fresh", None, None)
+        return
+    
+    try:
+        with open(STATE_FILE, 'rb') as f:
+            data = pickle.load(f)
+        
+        bot_state.pnl_data = data.get('pnl_data', [])
+        bot_state.last_trade_date = data.get('last_trade_date')
+        bot_state.CONSEC_LOSSES = data.get('CONSEC_LOSSES', 0)
+        bot_state.weekly_peak_equity = data.get('weekly_peak_equity')
+        bot_state.weekly_start_time = data.get('weekly_start_time')
+        bot_state.account_size = data.get('account_size')
+        bot_state.daily_start_equity = data.get('daily_start_equity')
+        
+        log(f"💾 Bot state loaded - {len(bot_state.pnl_data)} trades restored", None, None)
+    except Exception as e:
+        log(f"❌ Failed to load state: {e}", None, None)
+        
 def run_scheduler(bot: Optional[str], chat_id: Optional[str]):
     global bot_state
     last_month: Optional[int] = None
@@ -2484,42 +2593,57 @@ def run_scheduler(bot: Optional[str], chat_id: Optional[str]):
         if current_date.day == 1 and (last_month is None or current_date.month != last_month):
             send_monthly_report(bot, chat_id) 
             last_month = current_date.month
-    def monthly_cleanup_job():
-        """Monthly memory cleanup after PnL report"""
-        import gc
-        import psutil
+    def daily_restart_job():
+        """Safe daily restart - preserves positions, really restarts process"""
+        global bot_state
         
+        # Check for active position
+        has_position = False
+        position_details = ""
+        if (bot_state.client and hasattr(bot_state, 'current_trade') and 
+            bot_state.current_trade and bot_state.current_trade.active and bot_state.current_trade.qty):
+            has_position = True
+            position_details = (f"{bot_state.current_trade.side} "
+                               f"{bot_state.current_trade.qty} SOL "
+                               f"@ {bot_state.current_trade.entry_price:.2f}")
+        
+        log("🔄 DAILY RESTART: Starting real process restart...", 
+            bot, chat_id)
+        
+        # Save state
         try:
-            # Get memory before cleanup
-            process = psutil.Process()
-            mem_before = process.memory_info().rss / 1024 / 1024
-            
-            log("🧹 Starting monthly memory cleanup...", bot, chat_id)
-            
-            # Force garbage collection
-            gc.collect()
-            
-            # Clear symbol filters cache
-            if hasattr(bot_state, 'symbol_filters_cache') and len(bot_state.symbol_filters_cache) > 10:
-                with bot_state._trade_lock:
-                    bot_state.symbol_filters_cache.clear()
-            
-            # Get memory after cleanup
-            mem_after = process.memory_info().rss / 1024 / 1024
-            mem_freed = mem_before - mem_after
-            
-            log(f"✅ Monthly cleanup complete - Memory: {mem_before:.1f}MB → {mem_after:.1f}MB (freed {mem_freed:.1f}MB)", 
-                bot, chat_id)
-                
+            save_bot_state()
+            log("💾 State saved - trades preserved", bot, chat_id)
         except Exception as e:
-            log(f"❌ Monthly cleanup error: {e}", bot, chat_id)
+            log(f"⚠️ State save warning: {e}", bot, chat_id)
+        
+        # Notify about position status
+        if has_position:
+            msg = (f"🔄 Daily restart - POSITION PRESERVED!\n"
+                   f"{position_details}\n"
+                   f"SL/TP orders remain active on Binance")
+            telegram_post(bot, chat_id, msg)
+            log(f"✅ Active position preserved: {position_details}", 
+                bot, chat_id)
+        else:
+            telegram_post(bot, chat_id, 
+                         "🔄 Daily restart - no active positions")
+        
+        time.sleep(2)  # Let messages send
+        
+        # ===== REAL PROCESS RESTART =====
+        log("🚀 Restarting Python process NOW - positions safe on Binance", 
+            bot, chat_id)
+        import os, sys
+        os.execv(sys.executable, [sys.executable] + sys.argv)
     # Schedule all tasks using the schedule library for reliability
     schedule.every().day.at("23:59").do(lambda: send_daily_report(bot, chat_id))
     schedule.every().sunday.at("23:59").do(lambda: send_weekly_report(bot, chat_id))
     schedule.every().day.at("00:00").do(daily_reset_job)
+    schedule.every().day.at("00:01").do(lambda: daily_memory_log(bot, chat_id))
+    schedule.every().day.at("00:02").do(daily_restart_job)  # Daily restart at 00:02
     schedule.every().monday.at("00:00").do(weekly_reset_job)
     schedule.every().day.at("00:00").do(check_monthly_report)
-    schedule.every().day.at("00:02").do(monthly_cleanup_job)    # Add this
     
     log("Scheduler Initialized: Daily/Weekly resets and reporting active.", bot, chat_id)
 
@@ -2528,6 +2652,113 @@ def run_scheduler(bot: Optional[str], chat_id: Optional[str]):
         schedule.run_pending()
         time.sleep(1)
 
+# ==================== TELEGRAM COMMAND HANDLERS ====================
+async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Telegram /restart - safely restarts bot, preserves positions"""
+    global bot_state, args
+    
+    chat_id = str(update.effective_chat.id)
+    
+    # Security check
+    if chat_id != str(args.chat_id):
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    
+    # Check for active position
+    has_position = False
+    position_details = ""
+    if (bot_state.client and hasattr(bot_state, 'current_trade') and 
+        bot_state.current_trade and bot_state.current_trade.active and bot_state.current_trade.qty):
+        has_position = True
+        position_details = (f"{bot_state.current_trade.side} "
+                           f"{bot_state.current_trade.qty} SOL "
+                           f"@ {bot_state.current_trade.entry_price:.2f}")
+    
+    # Reply with position info
+    if has_position:
+        await update.message.reply_text(
+            f"🔄 *Restarting with ACTIVE POSITION*\n\n"
+            f"📊 *Position:* {position_details}\n"
+            f"🛡️ *SL/TP orders stay on Binance*\n"
+            f"🤖 Bot will resume monitoring after restart\n\n"
+            f"Restarting in 2 seconds...",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text("🔄 Restarting bot now...")
+    
+    # Save state
+    try:
+        save_bot_state()
+        await update.message.reply_text("💾 Trade history saved")
+    except:
+        await update.message.reply_text("⚠️ Save warning - restarting anyway")
+    
+    log("🔧 Manual restart via Telegram", args.telegram_token, args.chat_id)
+    
+    await asyncio.sleep(2)  # Let messages send
+    
+    # ===== REAL PROCESS RESTART =====
+    import os, sys
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command: /status — quick bot health check"""
+    global bot_state, args
+    
+    chat_id = str(update.effective_chat.id)
+    
+    if chat_id != str(args.chat_id):
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    
+    # Get current status
+    balance = fetch_balance(bot_state.client) if bot_state.client else Decimal("0")
+    pos_amt = get_position_amt(bot_state.client, args.symbol, args.telegram_token, args.chat_id) if bot_state.client else Decimal("0")
+    
+    # Get memory usage
+    import psutil
+    process = psutil.Process()
+    mem_mb = process.memory_info().rss / 1024 / 1024
+    
+    status_lines = [
+        f"🤖 *Edison Bot Status*",
+        f"",
+        f"📊 *Balance:* `${float(balance):.2f}`",
+        f"📈 *Position:* `{float(pos_amt):.2f} SOL`",
+        f"🔄 *Active Trade:* `{'Yes' if bot_state.current_trade and bot_state.current_trade.active else 'No'}`",
+        f"💾 *Trades Stored:* `{len(bot_state.pnl_data)}`",
+        f"🧠 *Memory:* `{mem_mb:.1f} MB`",
+        f"🆔 *PID:* `{os.getpid()}`",
+        f"⏰ *Uptime:* `{datetime.now(timezone.utc) - bot_state.start_time}`" if hasattr(bot_state, 'start_time') else ""
+    ]
+    
+    await update.message.reply_text("\n".join(status_lines), parse_mode='Markdown')
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command: /help — show available commands"""
+    chat_id = str(update.effective_chat.id)
+    
+    if chat_id != str(args.chat_id):
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    
+    help_text = (
+        "🤖 *Available Commands:*\n\n"
+        "/status - Show bot status (balance, position, memory)\n"
+        "/restart - Gracefully restart the bot (preserves positions)\n"
+        "/help - Show this help message"
+    )
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle unknown commands"""
+    chat_id = str(update.effective_chat.id)
+    
+    if chat_id != str(args.chat_id):
+        return
+    
+    await update.message.reply_text("❓ Unknown command. Try /help")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Binance Futures RSI Bot (Binance Trailing, 45m Optimized, SOLUSDT)")
@@ -2560,11 +2791,14 @@ if __name__ == "__main__":
     
     init_pnl_log()
     
+    # ======================== LOAD SAVED STATE ========================
+    load_bot_state()  # <-- ADD THIS LINE
+    
     # ======================== SINGLE, BULLETPROOF SHUTDOWN ========================
     _shutdown_done = False
     
     def graceful_shutdown(sig: Optional[int] = None, frame: Any = None):
-        global _shutdown_done
+        global _shutdown_done, bot_state, args  # <-- ADD bot_state and args
         if _shutdown_done:
             return
         _shutdown_done = True
@@ -2577,6 +2811,43 @@ if __name__ == "__main__":
         if os.path.exists("/tmp/STOP_BOT_NOW"):
             reason = "KILL FLAG / Manual stop"
         
+        log(f"🛑 Shutdown requested ({reason}). Cleaning up...", 
+            args.telegram_token, args.chat_id)
+        
+        # Save state before shutdown
+        save_bot_state()  # <-- ADD THIS
+        
+        # Check for active position
+        has_active_position = False
+        pos_amt = Decimal('0')
+        
+        if bot_state.client and args.symbol:
+            try:
+                pos_amt = get_position_amt(bot_state.client, args.symbol, args.telegram_token, args.chat_id)
+                has_active_position = pos_amt != Decimal('0')
+            except:
+                pass
+        
+        # If this is a restart (triggered by daily job or /restart command), preserve positions
+        # We detect restart by checking if we're exiting and there's an active position
+        # The restart commands already notify the user, so we just need to skip closing
+        
+        if has_active_position:
+            # This is likely a restart with active position - don't close
+            log("🔄 RESTARTING WITH ACTIVE POSITION - PRESERVING POSITION", 
+                args.telegram_token, args.chat_id)
+            log(f"✅ Position: {abs(float(pos_amt)):.2f} SOL remains open - orders stay on Binance", 
+                args.telegram_token, args.chat_id)
+            # Skip ALL position closing
+        else:
+            # Normal shutdown or restart with no position - safe to clean up
+            log("Normal shutdown - cleaning up orders", args.telegram_token, args.chat_id)
+            if bot_state.client and args.symbol:
+                try:
+                    bot_state.client.cancel_all_open_orders(args.symbol)
+                except Exception as e:
+                    log(f"Order cleanup error: {e}", args.telegram_token, args.chat_id)
+        
         goodbye = (
             f"RSI BOT STOPPED\n"
             f"Symbol: {args.symbol}\n"
@@ -2584,6 +2855,9 @@ if __name__ == "__main__":
             f"Reason: {reason}\n"
             f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
         )
+        
+        if has_active_position:
+            goodbye += "\n✅ POSITION PRESERVED - Orders remain active"
         
         try:
             log(goodbye, args.telegram_token, args.chat_id)
@@ -2652,6 +2926,63 @@ if __name__ == "__main__":
                 f"Volume Filter: {'ON' if args.use_volume_filter else 'OFF'} | "
                 f"Mode: {'LIVE' if args.live else 'TESTNET'}",
                 args.telegram_token, args.chat_id)
+            
+            # ========== ADD THIS SECTION - POSITION RECOVERY ==========
+            # Get tick_size for position recovery
+            filters = get_symbol_filters(bot_state.client, args.symbol)
+            tick_size = filters['tickSize']
+            
+            # Check for and recover any existing positions
+            recover_existing_positions(bot_state.client, args.symbol, tick_size, 
+                                      args.telegram_token, args.chat_id)
+            
+            # ========== ADD THIS SECTION - TELEGRAM COMMAND LISTENER ==========
+            if args.telegram_token and args.chat_id:
+                # Clean up old sessions
+                try:
+                    requests.post(
+                        f"https://api.telegram.org/bot{args.telegram_token}/deleteWebhook",
+                        timeout=5
+                    )
+                    log("Cleaned up any old Telegram webhook/polling sessions",
+                        args.telegram_token, args.chat_id)
+                    time.sleep(3)
+                except Exception as e:
+                    log(f"Cleanup old Telegram sessions failed: {e}",
+                        args.telegram_token, args.chat_id)
+                
+                # Start listener
+                def start_telegram_listener():
+                    try:
+                        application = Application.builder().token(args.telegram_token).build()
+                        
+                        application.add_handler(CommandHandler("restart", cmd_restart))
+                        application.add_handler(CommandHandler("status", cmd_status))
+                        application.add_handler(CommandHandler("help", cmd_help))
+                        application.add_handler(MessageHandler(filters.COMMAND, unknown))
+                        
+                        log("📱 Telegram command listener starting...", 
+                            args.telegram_token, args.chat_id)
+                        
+                        application.run_polling(drop_pending_updates=True, stop_signals=None)
+                        
+                    except Exception as e:
+                        log(f"Telegram listener error: {e}", args.telegram_token, args.chat_id)
+                
+                threading.Thread(
+                    target=start_telegram_listener,
+                    daemon=True,
+                    name="TelegramListener"
+                ).start()
+                
+                log("📱 Telegram command listener activated (/restart, /status, /help)",
+                    args.telegram_token, args.chat_id)
+            
+            # ========== ADD THIS - MEMORY USAGE ON STARTUP ==========
+            import psutil
+            mem_mb = psutil.Process().memory_info().rss / 1024 / 1024
+            log(f"🧠 Fresh process memory: {mem_mb:.1f} MB", args.telegram_token, args.chat_id)
+            log(f"🚀 Bot started - PID: {os.getpid()}", args.telegram_token, args.chat_id)
             
             threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
             
