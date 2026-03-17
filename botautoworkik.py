@@ -27,6 +27,7 @@ import queue
 import socket
 import platform
 import numpy as np
+from telegram.ext.filters import COMMAND
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 import asyncio
@@ -2959,7 +2960,7 @@ if __name__ == "__main__":
                         application.add_handler(CommandHandler("restart", cmd_restart))
                         application.add_handler(CommandHandler("status", cmd_status))
                         application.add_handler(CommandHandler("help", cmd_help))
-                        application.add_handler(MessageHandler(filters.COMMAND, unknown))
+                        application.add_handler(MessageHandler(COMMAND, unknown))
                         
                         log("📱 Telegram command listener starting...", 
                             args.telegram_token, args.chat_id)
@@ -3015,4 +3016,3 @@ if __name__ == "__main__":
             except Exception as e2:
                 print(f"Error during crash logging: {e2}")
             time.sleep(15)
-
