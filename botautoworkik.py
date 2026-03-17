@@ -2978,7 +2978,7 @@ if __name__ == "__main__":
                             application.add_handler(CommandHandler("restart", cmd_restart))
                             application.add_handler(CommandHandler("status", cmd_status))
                             application.add_handler(CommandHandler("help", cmd_help))
-                            application.add_handler(MessageHandler(COMMAND, unknown))
+                            application.add_handler(MessageHandler(None, unknown))
                             
                             log(f"📱 Telegram listener starting (attempt {retry_count+1})...", 
                                 args.telegram_token, args.chat_id)
