@@ -2761,10 +2761,6 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and update.message.text and update.message.text.startswith('/'):
         await update.message.reply_text("❓ Unknown command. Try /help")
 
-# In your handler setup:
-application.add_handler(MessageHandler(None, unknown))  # None means all messages
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Binance Futures RSI Bot (Binance Trailing, 45m Optimized, SOLUSDT)")
     parser.add_argument("--api-key", required=True, help="Binance API Key")
