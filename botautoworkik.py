@@ -2952,26 +2952,52 @@ if __name__ == "__main__":
                     log(f"Cleanup old Telegram sessions failed: {e}",
                         args.telegram_token, args.chat_id)
                 
-                # Start listener
-                def start_telegram_listener():
-                    try:
-                        application = Application.builder().token(args.telegram_token).build()
-                        
-                        application.add_handler(CommandHandler("restart", cmd_restart))
-                        application.add_handler(CommandHandler("status", cmd_status))
-                        application.add_handler(CommandHandler("help", cmd_help))
-                        application.add_handler(MessageHandler(COMMAND, unknown))
-                        
-                        log("📱 Telegram command listener starting...", 
-                            args.telegram_token, args.chat_id)
-                        
-                        application.run_polling(drop_pending_updates=True, stop_signals=None)
-                        
-                    except Exception as e:
-                        log(f"Telegram listener error: {e}", args.telegram_token, args.chat_id)
+            # ========== TELEGRAM COMMAND LISTENER (with retry) ==========
+            if args.telegram_token and args.chat_id:
+                # Clean up old sessions
+                try:
+                    requests.post(
+                        f"https://api.telegram.org/bot{args.telegram_token}/deleteWebhook",
+                        timeout=5
+                    )
+                    log("Cleaned up any old Telegram webhook/polling sessions",
+                        args.telegram_token, args.chat_id)
+                    time.sleep(3)
+                except Exception as e:
+                    log(f"Cleanup old Telegram sessions failed: {e}",
+                        args.telegram_token, args.chat_id)
+                
+                # Start listener with built-in retry on conflict
+                def start_telegram_listener_with_retry():
+                    retry_count = 0
+                    while retry_count < 5:  # allow more retries
+                        try:
+                            application = Application.builder().token(args.telegram_token).build()
+                            
+                            # Add command handlers
+                            application.add_handler(CommandHandler("restart", cmd_restart))
+                            application.add_handler(CommandHandler("status", cmd_status))
+                            application.add_handler(CommandHandler("help", cmd_help))
+                            application.add_handler(MessageHandler(filters.COMMAND, unknown))
+                            
+                            log(f"📱 Telegram listener starting (attempt {retry_count+1})...", 
+                                args.telegram_token, args.chat_id)
+                            
+                            application.run_polling(drop_pending_updates=True, stop_signals=None)
+                            break  # success
+                            
+                        except telegram.error.Conflict as e:
+                            retry_count += 1
+                            log(f"Telegram conflict (attempt {retry_count}/5) - retrying in 5s...",
+                                args.telegram_token, args.chat_id)
+                            time.sleep(5)
+                        except Exception as e:
+                            log(f"Telegram listener fatal error: {e}", 
+                                args.telegram_token, args.chat_id)
+                            break
                 
                 threading.Thread(
-                    target=start_telegram_listener,
+                    target=start_telegram_listener_with_retry,
                     daemon=True,
                     name="TelegramListener"
                 ).start()
