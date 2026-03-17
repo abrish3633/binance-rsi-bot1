@@ -2972,6 +2972,10 @@ if __name__ == "__main__":
                     retry_count = 0
                     while retry_count < 5:  # allow more retries
                         try:
+                            # Create new event loop for this thread
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            
                             application = Application.builder().token(args.telegram_token).build()
                             
                             # Add command handlers
@@ -2995,6 +2999,11 @@ if __name__ == "__main__":
                             log(f"Telegram listener fatal error: {e}", 
                                 args.telegram_token, args.chat_id)
                             break
+                        finally:
+                            try:
+                                loop.close()
+                            except:
+                                pass
                 
                 threading.Thread(
                     target=start_telegram_listener_with_retry,
