@@ -2654,7 +2654,7 @@ def run_scheduler(bot: Optional[str], chat_id: Optional[str]):
 # ==================== TELEGRAM COMMAND HANDLERS ====================
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Telegram /restart - safely restarts bot, preserves positions"""
-    global bot_state, args
+    global bot_state, args, LOCK_HANDLE  # Add LOCK_HANDLE here
     
     chat_id = str(update.effective_chat.id)
     
@@ -2697,8 +2697,16 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await asyncio.sleep(2)  # Let messages send
     
-    # ===== IMPORTANT: Small delay to ensure all logs are sent =====
-    import time
+    # ===== CRITICAL: Close the lock handle BEFORE restart =====
+    try:
+        if LOCK_HANDLE:
+            LOCK_HANDLE.close()
+            print("Lock handle closed successfully for restart")
+        # Don't delete the lock file, just close the handle
+    except Exception as e:
+        print(f"Error closing lock handle during restart: {e}")
+    
+    # Small delay to ensure everything is cleaned up
     time.sleep(1)
     
     # ===== REAL PROCESS RESTART =====
