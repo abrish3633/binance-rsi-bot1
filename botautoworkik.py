@@ -2697,6 +2697,10 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await asyncio.sleep(2)  # Let messages send
     
+    # ===== IMPORTANT: Small delay to ensure all logs are sent =====
+    import time
+    time.sleep(1)
+    
     # ===== REAL PROCESS RESTART =====
     import os, sys
     os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -2800,7 +2804,7 @@ if __name__ == "__main__":
                           symbol: Optional[str] = None, 
                           telegram_bot: Optional[str] = None, 
                           telegram_chat_id: Optional[str] = None):
-        global _shutdown_done, bot_state, args
+        global _shutdown_done, bot_state, args, LOCK_HANDLE
         
         # Use passed values or fall back to args
         symbol = symbol or args.symbol
@@ -2865,17 +2869,20 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Error during goodbye log: {e}")
         
-        # Clean lock file
-        try:
-            if LOCK_HANDLE:
-                try:
-                    LOCK_HANDLE.close()
-                except:
-                    pass
-            if os.path.exists(LOCK_FILE):
-                os.unlink(LOCK_FILE)
-        except Exception as e:
-            print(f"Error cleaning lock file: {e}")
+        # Only clean lock file on actual shutdown (signal received), not during restart
+        # sig is None when called from atexit (restart), not None when from signal
+        if sig is not None:
+            try:
+                if LOCK_HANDLE:
+                    try:
+                        LOCK_HANDLE.close()
+                    except:
+                        pass
+                if os.path.exists(LOCK_FILE):
+                    os.unlink(LOCK_FILE)
+                    log(f"Lock file removed: {LOCK_FILE}", telegram_bot, telegram_chat_id)
+            except Exception as e:
+                print(f"Error cleaning lock file: {e}")
         
         # Remove kill flag
         try:
@@ -2885,8 +2892,6 @@ if __name__ == "__main__":
             print(f"Error removing kill flag: {e}")
         
         os._exit(0)
-    
-    # Register signal handlers with wrapper function
     def signal_handler_wrapper(sig, frame):
         graceful_shutdown(sig, frame, args.symbol, args.telegram_token, args.chat_id)
     
