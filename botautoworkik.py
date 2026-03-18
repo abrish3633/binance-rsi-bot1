@@ -164,14 +164,15 @@ class BotState:
 
 # Initialize global bot state
 bot_state = BotState()
-# ------------------- SINGLE INSTANCE LOCK WITH PID CHECK -------------------
-LOCK_HANDLE = None  # Global lock handle
+LOCK_HANDLE = None  # Add this line
 
+# ------------------- SINGLE INSTANCE LOCK WITH PID CHECK -------------------
 def acquire_lock():
-    """Acquire single instance lock with PID check and restart support."""
+    """Acquire single instance lock with PID check to prevent stale locks."""
     global LOCK_HANDLE
     
     try:
+        # Check if lock file exists and contains a valid PID
         if os.path.exists(LOCK_FILE):
             try:
                 with open(LOCK_FILE, 'r') as f:
@@ -179,82 +180,88 @@ def acquire_lock():
                     if pid_str and pid_str.isdigit():
                         pid = int(pid_str)
                         
-                        # Allow restart if same PID (this is a restarted instance)
+                        # Special case: if it's the same PID as current process, it's a restart
                         if pid == os.getpid():
-                            log(f"Same PID {pid} detected - this is a restart, continuing...",
-                                CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
-                            # Keep existing lock file
-                            return None
-                        
-                        # Check if process is still alive
-                        process_alive = False
-                        if platform.system() == "Windows":
-                            try:
+                            print(f"Same PID {pid} - this is a restart, continuing...")
+                            # Just use the existing lock file
+                            pass
+                        else:
+                            # Check if process is still running
+                            process_exists = False
+                            if platform.system() == "Windows":
                                 import psutil
-                                psutil.Process(pid)
-                                process_alive = True
-                            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                                pass
-                        else:
-                            try:
-                                os.kill(pid, 0)
-                                process_alive = True
-                            except OSError:
-                                pass
-                        
-                        if process_alive:
-                            msg = f"Another instance already running (PID {pid})! Exiting."
-                            log(msg, CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
-                            print(msg)
-                            sys.exit(1)
-                        else:
-                            msg = f"Removing stale lock from dead PID {pid}"
-                            log(msg, CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
-                            print(msg)
-                            os.unlink(LOCK_FILE)
+                                try:
+                                    psutil.Process(pid)
+                                    process_exists = True
+                                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                    process_exists = False
+                            else:
+                                # Unix: try sending signal 0 to check if process exists
+                                try:
+                                    os.kill(pid, 0)
+                                    process_exists = True
+                                except OSError:
+                                    process_exists = False
+                            
+                            if process_exists:
+                                # Process exists, another instance is running
+                                print(f"Another instance is already running with PID {pid}! Exiting.")
+                                sys.exit(1)
+                            else:
+                                # Process doesn't exist, stale lock file
+                                print(f"Removing stale lock file from PID {pid}")
+                                os.unlink(LOCK_FILE)
             except Exception as e:
-                msg = f"Error reading lock file: {e} - removing it"
-                log(msg, CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
-                print(msg)
+                print(f"Error reading lock file: {e}")
+                # If we can't read/parse the lock file, remove it and continue
                 try:
                     os.unlink(LOCK_FILE)
                 except:
                     pass
         
         # Create new lock file with current PID
-        os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
         with open(LOCK_FILE, 'w') as f:
             f.write(str(os.getpid()))
             f.flush()
-            os.fsync(f.fileno())  # Ensure written to disk
+            os.fsync(f.fileno())  # Ensure it's written to disk
         
-        log(f"Lock acquired with PID {os.getpid()}", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+        print(f"Lock file created with PID {os.getpid()}")
         
-        # Unix: try file locking
+        # On Unix systems, add file locking
         if platform.system() != "Windows":
             try:
                 import fcntl
                 lock_handle = open(LOCK_FILE, 'r+')
                 fcntl.lockf(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                log("Exclusive file lock acquired (Unix)", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
-                LOCK_HANDLE = lock_handle  # Keep open for lifetime
+                print(f"Exclusive file lock acquired")
+                # Keep lock file open while bot runs
                 return lock_handle
-            except Exception as e:
-                log(f"Unix file lock failed (non-fatal): {e}", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
-                # Continue anyway if our PID matches
+            except (IOError, OSError) as e:
+                print(f"Failed to acquire file lock: {e}")
+                # If we can't get the lock, another instance might have it
+                # Check if it's our own PID
                 with open(LOCK_FILE, 'r') as f:
-                    if int(f.read().strip()) == os.getpid():
-                        log("Lock file has our PID - continuing", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                    file_pid = int(f.read().strip())
+                    if file_pid == os.getpid():
+                        print("Lock file has our PID but couldn't get lock - continuing anyway")
                         return None
+                sys.exit(1)
+            except Exception as e:
+                print(f"Unexpected error acquiring lock: {e}")
                 sys.exit(1)
         
         return None
         
-    except Exception as e:
-        msg = f"Fatal lock acquisition error: {e}"
-        log(msg, CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
-        print(msg)
+    except FileExistsError:
+        print("Another instance is already running! Exiting.")
         sys.exit(1)
+    except FileNotFoundError:
+        # Directory may not exist
+        os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+        with open(LOCK_FILE, 'w') as f:
+            f.write(str(os.getpid()))
+        return None
+
 # ------------------- MEMORY LIMIT (Linux / OCI only) -------------------
 # Removed memory limit cap completely — let the OS manage it
 # (previously: resource.setrlimit capped at ~680 MB — caused OOM crashes)
@@ -2815,6 +2822,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # Acquire lock AFTER parsing arguments
+
     LOCK_HANDLE = acquire_lock()
     
     if args.no_news_guard:
