@@ -2799,6 +2799,7 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❓ Unknown command. Try /help")
          
 if __name__ == "__main__":
+    global LOCK_HANDLE
     parser = argparse.ArgumentParser(description="Binance Futures RSI Bot (Binance Trailing, 45m Optimized, SOLUSDT)")
     parser.add_argument("--api-key", required=True, help="Binance API Key")
     parser.add_argument("--api-secret", required=True, help="Binance API Secret")
@@ -2822,7 +2823,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # Acquire lock AFTER parsing arguments
-    global LOCK_HANDLE
     LOCK_HANDLE = acquire_lock()
     
     if args.no_news_guard:
