@@ -164,10 +164,13 @@ class BotState:
 
 # Initialize global bot state
 bot_state = BotState()
+LOCK_HANDLE = None  # Add this line
 
 # ------------------- SINGLE INSTANCE LOCK WITH PID CHECK -------------------
 def acquire_lock():
     """Acquire single instance lock with PID check to prevent stale locks."""
+    global LOCK_HANDLE
+    
     try:
         # Check if lock file exists and contains a valid PID
         if os.path.exists(LOCK_FILE):
@@ -176,28 +179,40 @@ def acquire_lock():
                     pid_str = f.read().strip()
                     if pid_str and pid_str.isdigit():
                         pid = int(pid_str)
-                        # Check if process is still running
-                        if platform.system() == "Windows":
-                            import psutil
-                            try:
-                                psutil.Process(pid)
-                                # Process exists, another instance is running
-                                print("Another instance is already running! Exiting.")
-                                sys.exit(1)
-                            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                                # Process doesn't exist, stale lock file
-                                os.unlink(LOCK_FILE)
+                        
+                        # Special case: if it's the same PID as current process, it's a restart
+                        if pid == os.getpid():
+                            print(f"Same PID {pid} - this is a restart, continuing...")
+                            # Just use the existing lock file
+                            pass
                         else:
-                            # Unix: try sending signal 0 to check if process exists
-                            try:
-                                os.kill(pid, 0)
+                            # Check if process is still running
+                            process_exists = False
+                            if platform.system() == "Windows":
+                                import psutil
+                                try:
+                                    psutil.Process(pid)
+                                    process_exists = True
+                                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                    process_exists = False
+                            else:
+                                # Unix: try sending signal 0 to check if process exists
+                                try:
+                                    os.kill(pid, 0)
+                                    process_exists = True
+                                except OSError:
+                                    process_exists = False
+                            
+                            if process_exists:
                                 # Process exists, another instance is running
-                                print("Another instance is already running! Exiting.")
+                                print(f"Another instance is already running with PID {pid}! Exiting.")
                                 sys.exit(1)
-                            except OSError:
+                            else:
                                 # Process doesn't exist, stale lock file
+                                print(f"Removing stale lock file from PID {pid}")
                                 os.unlink(LOCK_FILE)
             except Exception as e:
+                print(f"Error reading lock file: {e}")
                 # If we can't read/parse the lock file, remove it and continue
                 try:
                     os.unlink(LOCK_FILE)
@@ -207,6 +222,10 @@ def acquire_lock():
         # Create new lock file with current PID
         with open(LOCK_FILE, 'w') as f:
             f.write(str(os.getpid()))
+            f.flush()
+            os.fsync(f.fileno())  # Ensure it's written to disk
+        
+        print(f"Lock file created with PID {os.getpid()}")
         
         # On Unix systems, add file locking
         if platform.system() != "Windows":
@@ -214,10 +233,21 @@ def acquire_lock():
                 import fcntl
                 lock_handle = open(LOCK_FILE, 'r+')
                 fcntl.lockf(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                print(f"Exclusive file lock acquired")
                 # Keep lock file open while bot runs
                 return lock_handle
-            except Exception as e:
+            except (IOError, OSError) as e:
                 print(f"Failed to acquire file lock: {e}")
+                # If we can't get the lock, another instance might have it
+                # Check if it's our own PID
+                with open(LOCK_FILE, 'r') as f:
+                    file_pid = int(f.read().strip())
+                    if file_pid == os.getpid():
+                        print("Lock file has our PID but couldn't get lock - continuing anyway")
+                        return None
+                sys.exit(1)
+            except Exception as e:
+                print(f"Unexpected error acquiring lock: {e}")
                 sys.exit(1)
         
         return None
@@ -226,14 +256,11 @@ def acquire_lock():
         print("Another instance is already running! Exiting.")
         sys.exit(1)
     except FileNotFoundError:
-        # Windows TEMP may not exist
+        # Directory may not exist
         os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
         with open(LOCK_FILE, 'w') as f:
             f.write(str(os.getpid()))
         return None
-
-# Acquire lock at startup
-LOCK_HANDLE = acquire_lock()
 
 # ------------------- MEMORY LIMIT (Linux / OCI only) -------------------
 # Removed memory limit cap completely — let the OS manage it
@@ -2770,7 +2797,7 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Only respond to actual commands
     if update.message and update.message.text and update.message.text.startswith('/'):
         await update.message.reply_text("❓ Unknown command. Try /help")
-
+         
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Binance Futures RSI Bot (Binance Trailing, 45m Optimized, SOLUSDT)")
     parser.add_argument("--api-key", required=True, help="Binance API Key")
@@ -2793,6 +2820,10 @@ if __name__ == "__main__":
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--no-news-guard", action="store_true", help="Completely disable news/economic calendar guard")
     args = parser.parse_args()
+    
+    # Acquire lock AFTER parsing arguments
+    global LOCK_HANDLE
+    LOCK_HANDLE = acquire_lock()
     
     if args.no_news_guard:
         NEWS_GUARD_ENABLED = False
