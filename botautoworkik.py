@@ -2102,8 +2102,6 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
   
     last_trade_date = datetime.now(timezone.utc).date()
     log(f"Bot started on {last_trade_date}. Trades today: {trades_today}", telegram_bot, telegram_chat_id)
-    signal.signal(signal.SIGINT, lambda s, f: _request_stop(s, f, symbol, telegram_bot, telegram_chat_id))
-    signal.signal(signal.SIGTERM, lambda s, f: _request_stop(s, f, symbol, telegram_bot, telegram_chat_id))
     log(f"Starting bot with symbol={symbol}, timeframe={timeframe}, risk_pct={risk_pct*Decimal('100'):.1f}%")
     
     # === MAIN TRADING LOOP — WITH DECIMAL CONSISTENCY ===
@@ -2798,8 +2796,17 @@ if __name__ == "__main__":
     # ======================== SINGLE, BULLETPROOF SHUTDOWN ========================
     _shutdown_done = False
     
-    def graceful_shutdown(sig: Optional[int] = None, frame: Any = None):
+    def graceful_shutdown(sig: Optional[int] = None, frame: Any = None, 
+                          symbol: Optional[str] = None, 
+                          telegram_bot: Optional[str] = None, 
+                          telegram_chat_id: Optional[str] = None):
         global _shutdown_done, bot_state, args
+        
+        # Use passed values or fall back to args
+        symbol = symbol or args.symbol
+        telegram_bot = telegram_bot or args.telegram_token
+        telegram_chat_id = telegram_chat_id or args.chat_id
+        
         if _shutdown_done:
             return
         _shutdown_done = True
@@ -2813,7 +2820,7 @@ if __name__ == "__main__":
             reason = "KILL FLAG / Manual stop"
         
         log(f"🛑 Shutdown requested ({reason}). Cleaning up...", 
-            args.telegram_token, args.chat_id)
+            telegram_bot, telegram_chat_id)
         
         # Save state before shutdown
         save_bot_state()
@@ -2822,29 +2829,29 @@ if __name__ == "__main__":
         has_active_position = False
         pos_amt = Decimal('0')
         
-        if bot_state.client and args.symbol:
+        if bot_state.client and symbol:
             try:
-                pos_amt = get_position_amt(bot_state.client, args.symbol, args.telegram_token, args.chat_id)
+                pos_amt = get_position_amt(bot_state.client, symbol, telegram_bot, telegram_chat_id)
                 has_active_position = pos_amt != Decimal('0')
             except:
                 pass
         
         if has_active_position:
             log("🔄 RESTARTING WITH ACTIVE POSITION - PRESERVING POSITION", 
-                args.telegram_token, args.chat_id)
+                telegram_bot, telegram_chat_id)
             log(f"✅ Position: {abs(float(pos_amt)):.2f} SOL remains open - orders stay on Binance", 
-                args.telegram_token, args.chat_id)
+                telegram_bot, telegram_chat_id)
         else:
-            log("Normal shutdown - cleaning up orders", args.telegram_token, args.chat_id)
-            if bot_state.client and args.symbol:
+            log("Normal shutdown - cleaning up orders", telegram_bot, telegram_chat_id)
+            if bot_state.client and symbol:
                 try:
-                    bot_state.client.cancel_all_open_orders(args.symbol)
+                    bot_state.client.cancel_all_open_orders(symbol)
                 except Exception as e:
-                    log(f"Order cleanup error: {e}", args.telegram_token, args.chat_id)
+                    log(f"Order cleanup error: {e}", telegram_bot, telegram_chat_id)
         
         goodbye = (
             f"RSI BOT STOPPED\n"
-            f"Symbol: {args.symbol}\n"
+            f"Symbol: {symbol}\n"
             f"Timeframe: {args.timeframe}\n"
             f"Reason: {reason}\n"
             f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
@@ -2854,7 +2861,7 @@ if __name__ == "__main__":
             goodbye += "\n✅ POSITION PRESERVED - Orders remain active"
         
         try:
-            log(goodbye, args.telegram_token, args.chat_id)
+            log(goodbye, telegram_bot, telegram_chat_id)
         except Exception as e:
             print(f"Error during goodbye log: {e}")
         
@@ -2879,16 +2886,19 @@ if __name__ == "__main__":
         
         os._exit(0)
     
-    # Register exactly once
-    signal.signal(signal.SIGINT, graceful_shutdown)
-    signal.signal(signal.SIGTERM, graceful_shutdown)
-    atexit.register(graceful_shutdown)
+    # Register signal handlers with wrapper function
+    def signal_handler_wrapper(sig, frame):
+        graceful_shutdown(sig, frame, args.symbol, args.telegram_token, args.chat_id)
+    
+    signal.signal(signal.SIGINT, signal_handler_wrapper)
+    signal.signal(signal.SIGTERM, signal_handler_wrapper)
+    atexit.register(lambda: graceful_shutdown(None, None, args.symbol, args.telegram_token, args.chat_id))
     
     # ======================== IMMORTAL BOT LOOP ========================
     while True:
         if os.path.exists("/tmp/STOP_BOT_NOW"):
             log("STOP_BOT_NOW flag detected – shutting down permanently", args.telegram_token, args.chat_id)
-            graceful_shutdown()
+            graceful_shutdown(None, None, args.symbol, args.telegram_token, args.chat_id)
             break
         
         try:
