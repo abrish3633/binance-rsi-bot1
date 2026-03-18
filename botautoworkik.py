@@ -164,15 +164,14 @@ class BotState:
 
 # Initialize global bot state
 bot_state = BotState()
-LOCK_HANDLE = None  # Add this line
-
 # ------------------- SINGLE INSTANCE LOCK WITH PID CHECK -------------------
+LOCK_HANDLE = None  # Global lock handle
+
 def acquire_lock():
-    """Acquire single instance lock with PID check to prevent stale locks."""
+    """Acquire single instance lock with PID check and restart support."""
     global LOCK_HANDLE
     
     try:
-        # Check if lock file exists and contains a valid PID
         if os.path.exists(LOCK_FILE):
             try:
                 with open(LOCK_FILE, 'r') as f:
@@ -180,88 +179,82 @@ def acquire_lock():
                     if pid_str and pid_str.isdigit():
                         pid = int(pid_str)
                         
-                        # Special case: if it's the same PID as current process, it's a restart
+                        # Allow restart if same PID (this is a restarted instance)
                         if pid == os.getpid():
-                            print(f"Same PID {pid} - this is a restart, continuing...")
-                            # Just use the existing lock file
-                            pass
-                        else:
-                            # Check if process is still running
-                            process_exists = False
-                            if platform.system() == "Windows":
+                            log(f"Same PID {pid} detected - this is a restart, continuing...",
+                                CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                            # Keep existing lock file
+                            return None
+                        
+                        # Check if process is still alive
+                        process_alive = False
+                        if platform.system() == "Windows":
+                            try:
                                 import psutil
-                                try:
-                                    psutil.Process(pid)
-                                    process_exists = True
-                                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                                    process_exists = False
-                            else:
-                                # Unix: try sending signal 0 to check if process exists
-                                try:
-                                    os.kill(pid, 0)
-                                    process_exists = True
-                                except OSError:
-                                    process_exists = False
-                            
-                            if process_exists:
-                                # Process exists, another instance is running
-                                print(f"Another instance is already running with PID {pid}! Exiting.")
-                                sys.exit(1)
-                            else:
-                                # Process doesn't exist, stale lock file
-                                print(f"Removing stale lock file from PID {pid}")
-                                os.unlink(LOCK_FILE)
+                                psutil.Process(pid)
+                                process_alive = True
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                pass
+                        else:
+                            try:
+                                os.kill(pid, 0)
+                                process_alive = True
+                            except OSError:
+                                pass
+                        
+                        if process_alive:
+                            msg = f"Another instance already running (PID {pid})! Exiting."
+                            log(msg, CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                            print(msg)
+                            sys.exit(1)
+                        else:
+                            msg = f"Removing stale lock from dead PID {pid}"
+                            log(msg, CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                            print(msg)
+                            os.unlink(LOCK_FILE)
             except Exception as e:
-                print(f"Error reading lock file: {e}")
-                # If we can't read/parse the lock file, remove it and continue
+                msg = f"Error reading lock file: {e} - removing it"
+                log(msg, CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                print(msg)
                 try:
                     os.unlink(LOCK_FILE)
                 except:
                     pass
         
         # Create new lock file with current PID
+        os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
         with open(LOCK_FILE, 'w') as f:
             f.write(str(os.getpid()))
             f.flush()
-            os.fsync(f.fileno())  # Ensure it's written to disk
+            os.fsync(f.fileno())  # Ensure written to disk
         
-        print(f"Lock file created with PID {os.getpid()}")
+        log(f"Lock acquired with PID {os.getpid()}", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
         
-        # On Unix systems, add file locking
+        # Unix: try file locking
         if platform.system() != "Windows":
             try:
                 import fcntl
                 lock_handle = open(LOCK_FILE, 'r+')
                 fcntl.lockf(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                print(f"Exclusive file lock acquired")
-                # Keep lock file open while bot runs
+                log("Exclusive file lock acquired (Unix)", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                LOCK_HANDLE = lock_handle  # Keep open for lifetime
                 return lock_handle
-            except (IOError, OSError) as e:
-                print(f"Failed to acquire file lock: {e}")
-                # If we can't get the lock, another instance might have it
-                # Check if it's our own PID
+            except Exception as e:
+                log(f"Unix file lock failed (non-fatal): {e}", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                # Continue anyway if our PID matches
                 with open(LOCK_FILE, 'r') as f:
-                    file_pid = int(f.read().strip())
-                    if file_pid == os.getpid():
-                        print("Lock file has our PID but couldn't get lock - continuing anyway")
+                    if int(f.read().strip()) == os.getpid():
+                        log("Lock file has our PID - continuing", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
                         return None
                 sys.exit(1)
-            except Exception as e:
-                print(f"Unexpected error acquiring lock: {e}")
-                sys.exit(1)
         
         return None
         
-    except FileExistsError:
-        print("Another instance is already running! Exiting.")
+    except Exception as e:
+        msg = f"Fatal lock acquisition error: {e}"
+        log(msg, CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+        print(msg)
         sys.exit(1)
-    except FileNotFoundError:
-        # Directory may not exist
-        os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
-        with open(LOCK_FILE, 'w') as f:
-            f.write(str(os.getpid()))
-        return None
-
 # ------------------- MEMORY LIMIT (Linux / OCI only) -------------------
 # Removed memory limit cap completely — let the OS manage it
 # (previously: resource.setrlimit capped at ~680 MB — caused OOM crashes)
@@ -2799,7 +2792,6 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❓ Unknown command. Try /help")
          
 if __name__ == "__main__":
-    global LOCK_HANDLE
     parser = argparse.ArgumentParser(description="Binance Futures RSI Bot (Binance Trailing, 45m Optimized, SOLUSDT)")
     parser.add_argument("--api-key", required=True, help="Binance API Key")
     parser.add_argument("--api-secret", required=True, help="Binance API Secret")
