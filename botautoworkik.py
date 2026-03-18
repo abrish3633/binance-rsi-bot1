@@ -2736,6 +2736,22 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("\n".join(status_lines), parse_mode='Markdown')
 
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command: /help — show available commands"""
+    chat_id = str(update.effective_chat.id)
+    
+    if chat_id != str(args.chat_id):
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    
+    help_text = (
+        "🤖 *Available Commands:*\n\n"
+        "/status - Show bot status (balance, position, memory)\n"
+        "/restart - Gracefully restart the bot (preserves positions)\n"
+        "/help - Show this help message"
+    )
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
 # Handle all messages that aren't commands
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -2767,72 +2783,66 @@ if __name__ == "__main__":
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--no-news-guard", action="store_true", help="Completely disable news/economic calendar guard")
     args = parser.parse_args()
-    
+   
     if args.no_news_guard:
         NEWS_GUARD_ENABLED = False
         print("[CONFIG] News Guard FULLY DISABLED via --no-news-guard")
     else:
         NEWS_GUARD_ENABLED = True
-    
+   
     init_pnl_log()
-    
-    # ======================== LOAD SAVED STATE ========================
-    load_bot_state()  # <-- ADD THIS LINE
-    
+   
+    # Load saved state if exists
+    load_bot_state()
+   
     # ======================== SINGLE, BULLETPROOF SHUTDOWN ========================
     _shutdown_done = False
-    
+   
     def graceful_shutdown(sig: Optional[int] = None, frame: Any = None):
-        global _shutdown_done, bot_state, args  # <-- ADD bot_state and args
+        global _shutdown_done, bot_state, args
         if _shutdown_done:
             return
         _shutdown_done = True
-        
+       
         reason = {
             signal.SIGINT: "Ctrl+C",
             signal.SIGTERM: "SIGTERM / systemd",
         }.get(sig, "Clean exit")
-        
+       
         if os.path.exists("/tmp/STOP_BOT_NOW"):
             reason = "KILL FLAG / Manual stop"
-        
-        log(f"🛑 Shutdown requested ({reason}). Cleaning up...", 
+       
+        log(f"🛑 Shutdown requested ({reason}). Cleaning up...",
             args.telegram_token, args.chat_id)
-        
+       
         # Save state before shutdown
-        save_bot_state()  # <-- ADD THIS
-        
+        save_bot_state()
+       
         # Check for active position
         has_active_position = False
         pos_amt = Decimal('0')
-        
+       
         if bot_state.client and args.symbol:
             try:
-                pos_amt = get_position_amt(bot_state.client, args.symbol, args.telegram_token, args.chat_id)
+                pos_amt = get_position_amt(bot_state.client, args.symbol)
                 has_active_position = pos_amt != Decimal('0')
             except:
                 pass
-        
-        # If this is a restart (triggered by daily job or /restart command), preserve positions
-        # We detect restart by checking if we're exiting and there's an active position
-        # The restart commands already notify the user, so we just need to skip closing
-        
+       
+        # During restart (daily or /restart) - preserve positions
         if has_active_position:
-            # This is likely a restart with active position - don't close
-            log("🔄 RESTARTING WITH ACTIVE POSITION - PRESERVING POSITION", 
+            log("🔄 RESTARTING WITH ACTIVE POSITION - PRESERVING POSITION",
                 args.telegram_token, args.chat_id)
-            log(f"✅ Position: {abs(float(pos_amt)):.2f} SOL remains open - orders stay on Binance", 
+            log(f"✅ Position: {abs(float(pos_amt)):.2f} SOL remains open - orders stay on Binance",
                 args.telegram_token, args.chat_id)
-            # Skip ALL position closing
         else:
-            # Normal shutdown or restart with no position - safe to clean up
             log("Normal shutdown - cleaning up orders", args.telegram_token, args.chat_id)
             if bot_state.client and args.symbol:
                 try:
                     bot_state.client.cancel_all_open_orders(args.symbol)
                 except Exception as e:
                     log(f"Order cleanup error: {e}", args.telegram_token, args.chat_id)
-        
+       
         goodbye = (
             f"RSI BOT STOPPED\n"
             f"Symbol: {args.symbol}\n"
@@ -2840,15 +2850,15 @@ if __name__ == "__main__":
             f"Reason: {reason}\n"
             f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
         )
-        
+       
         if has_active_position:
             goodbye += "\n✅ POSITION PRESERVED - Orders remain active"
-        
+       
         try:
             log(goodbye, args.telegram_token, args.chat_id)
         except Exception as e:
             print(f"Error during goodbye log: {e}")
-        
+       
         # Clean lock file
         try:
             if LOCK_HANDLE:
@@ -2860,162 +2870,132 @@ if __name__ == "__main__":
                 os.unlink(LOCK_FILE)
         except Exception as e:
             print(f"Error cleaning lock file: {e}")
-        
+       
         # Remove kill flag
         try:
             if os.path.exists("/tmp/STOP_BOT_NOW"):
                 os.unlink("/tmp/STOP_BOT_NOW")
         except Exception as e:
             print(f"Error removing kill flag: {e}")
-        
-        os._exit(0)
-    
-    # Register exactly once
+       
+        sys.exit(0)  # Changed from os._exit(0) - allows atexit to run
+   
     signal.signal(signal.SIGINT, graceful_shutdown)
     signal.signal(signal.SIGTERM, graceful_shutdown)
     atexit.register(graceful_shutdown)
-    
+   
     # ======================== IMMORTAL BOT LOOP ========================
     while True:
         if os.path.exists("/tmp/STOP_BOT_NOW"):
             log("STOP_BOT_NOW flag detected – shutting down permanently", args.telegram_token, args.chat_id)
             graceful_shutdown()
             break
-        
+       
+        # Check restart flag (before startup)
+        with bot_state._restart_lock:
+            if bot_state.RESTART_REQUESTED:
+                log("🔄 Restart flag detected - performing clean restart",
+                    args.telegram_token, args.chat_id)
+                bot_state.RESTART_REQUESTED = False
+                save_bot_state()
+                log("💾 State saved - restarting...", args.telegram_token, args.chat_id)
+                time.sleep(2)
+                continue
+       
         try:
             bot_state.client = BinanceClient(args.api_key, args.api_secret, use_live=args.live, base_override=args.base_url)
             balance = fetch_balance(bot_state.client)
             bot_state.account_size = balance
             bot_state.daily_start_equity = balance
-          
-            # Set leverage on Binance
-            leverage_to_set = 9  # or whatever you want
+           
+            leverage_to_set = 9
             bot_state.client.set_leverage(args.symbol, leverage_to_set)
             log(f"Set Binance leverage to {leverage_to_set}x for {args.symbol}", args.telegram_token, args.chat_id)
-            
-            # Format risk % safely and precisely with Decimal
+           
             risk_pct_display = Decimal(str(args.risk_pct))
             log(f"Simple Weekly DD Guard: 20% hard stop", args.telegram_token, args.chat_id)
             log(f"Consecutive Loss Guard: 3 losses ≥0.5R stop", args.telegram_token, args.chat_id)
             log(f"Base Risk: {BASE_RISK_PCT*Decimal('100'):.2f}% per trade", args.telegram_token, args.chat_id)
             log(f"Fetched balance: ${balance:.2f} USDT", args.telegram_token, args.chat_id)
-            
+           
             if NEWS_GUARD_ENABLED:
                 threading.Thread(target=news_heartbeat, daemon=True).start()
                 log("Economic calendar monitoring: ENABLED", args.telegram_token, args.chat_id)
             else:
                 log("Economic calendar monitoring: DISABLED (--no-news-guard)", args.telegram_token, args.chat_id)
-            
+           
             log(f"STARTING BOT → {args.symbol} | {args.timeframe} | "
                 f"Risk: {risk_pct_display:.3f}% | "
                 f"Volume Filter: {'ON' if args.use_volume_filter else 'OFF'} | "
                 f"Mode: {'LIVE' if args.live else 'TESTNET'}",
                 args.telegram_token, args.chat_id)
-            
-            # ========== ADD THIS SECTION - POSITION RECOVERY ==========
-            # Get tick_size for position recovery
+           
+            # Position recovery
             filters = get_symbol_filters(bot_state.client, args.symbol)
             tick_size = filters['tickSize']
-            
-            # Check for and recover any existing positions
-            recover_existing_positions(bot_state.client, args.symbol, tick_size, 
+            recover_existing_positions(bot_state.client, args.symbol, tick_size,
                                       args.telegram_token, args.chat_id)
-            
-            # ========== ADD THIS SECTION - TELEGRAM COMMAND LISTENER ==========
-            if args.telegram_token and args.chat_id:
-                # Clean up old sessions
-                try:
-                    requests.post(
-                        f"https://api.telegram.org/bot{args.telegram_token}/deleteWebhook",
-                        timeout=5
-                    )
-                    log("Cleaned up any old Telegram webhook/polling sessions",
-                        args.telegram_token, args.chat_id)
-                    time.sleep(3)
-                except Exception as e:
-                    log(f"Cleanup old Telegram sessions failed: {e}",
-                        args.telegram_token, args.chat_id)
-                
-            # ========== TELEGRAM COMMAND LISTENER (with retry) ==========
-            if args.telegram_token and args.chat_id:
-                # Clean up old sessions
-                try:
-                    requests.post(
-                        f"https://api.telegram.org/bot{args.telegram_token}/deleteWebhook",
-                        timeout=5
-                    )
-                    log("Cleaned up any old Telegram webhook/polling sessions",
-                        args.telegram_token, args.chat_id)
-                    time.sleep(3)
-                except Exception as e:
-                    log(f"Cleanup old Telegram sessions failed: {e}",
-                        args.telegram_token, args.chat_id)
-                
-                # Start listener with built-in retry on conflict
-                def start_telegram_listener_with_retry():
-                    retry_count = 0
-                    while retry_count < 5:  # allow more retries
-                        try:
-                            application = Application.builder().token(args.telegram_token).build()
-                            
-                            # Add command handlers
-                            application.add_handler(CommandHandler("restart", cmd_restart))
-                            application.add_handler(CommandHandler("status", cmd_status))
-                            application.add_handler(MessageHandler(None, unknown))
-                            
-                            log(f"📱 Telegram listener starting (attempt {retry_count+1})...", 
-                                args.telegram_token, args.chat_id)
-                            
-                            application.run_polling(drop_pending_updates=True, stop_signals=None)
-                            break  # success
-                            
-                        except telegram.error.Conflict as e:
-                            retry_count += 1
-                            log(f"Telegram conflict (attempt {retry_count}/5) - retrying in 5s...",
-                                args.telegram_token, args.chat_id)
-                            time.sleep(5)
-                        except Exception as e:
-                            log(f"Telegram listener fatal error: {e}", 
-                                args.telegram_token, args.chat_id)
-                            break
-                
-                threading.Thread(
-                    target=start_telegram_listener_with_retry,
-                    daemon=True,
-                    name="TelegramListener"
-                ).start()
-                
-                log("📱 Telegram command listener activated (/restart, /status, /help)",
-                    args.telegram_token, args.chat_id)
-            
-            # ========== ADD THIS - MEMORY USAGE ON STARTUP ==========
+           
+            # Memory log at startup
             import psutil
             mem_mb = psutil.Process().memory_info().rss / 1024 / 1024
             log(f"🧠 Fresh process memory: {mem_mb:.1f} MB", args.telegram_token, args.chat_id)
             log(f"🚀 Bot started - PID: {os.getpid()}", args.telegram_token, args.chat_id)
-            
+           
+            # Start scheduler
             threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
-            
-            trading_loop(
-                client=bot_state.client,
-                symbol=args.symbol,
-                timeframe=args.timeframe,
-                max_trades_per_day=args.max_trades,
-                risk_pct=Decimal(str(args.risk_pct)) / Decimal("100"),
-                max_daily_loss_pct=Decimal(str(args.max_loss_pct)),
-                tp_mult=Decimal(str(args.tp_mult)),
-                use_trailing=args.use_trailing,
-                prevent_same_bar=args.prevent_same_bar,
-                require_no_pos=args.require_no_pos,
-                use_max_loss=args.use_max_loss,
-                use_volume_filter=args.use_volume_filter,
-                telegram_bot=args.telegram_token,
-                telegram_chat_id=args.chat_id
+           
+            # ========== TELEGRAM LISTENER - RUNNING IN MAIN THREAD ==========
+            if args.telegram_token and args.chat_id:
+                try:
+                    requests.post(
+                        f"https://api.telegram.org/bot{args.telegram_token}/deleteWebhook",
+                        timeout=5
+                    )
+                    log("Cleaned up any old Telegram webhook/polling sessions",
+                        args.telegram_token, args.chat_id)
+                    time.sleep(2)
+                except Exception as e:
+                    log(f"Cleanup old Telegram sessions failed (usually harmless): {e}",
+                        args.telegram_token, args.chat_id)
+               
+                application = Application.builder().token(args.telegram_token).build()
+               
+                application.add_handler(CommandHandler("restart", cmd_restart))
+                application.add_handler(CommandHandler("status", cmd_status))
+                # Add other handlers as needed
+               
+                log("📱 Telegram command listener starting in main thread (/restart, /status, ...)",
+                    args.telegram_token, args.chat_id)
+               
+                try:
+                    application.run_polling(
+                        drop_pending_updates=True,
+                        stop_signals=None,
+                        allowed_updates=Update.ALL_TYPES
+                    )
+                except Exception as e:
+                    log(f"Telegram polling stopped: {e}", args.telegram_token, args.chat_id)
+           
+            # Start trading loop in background thread (since main thread is blocked by polling)
+            trading_thread = threading.Thread(
+                target=trading_loop,
+                args=(
+                    bot_state.client,
+                    args.symbol,
+                    args.telegram_token,
+                    args.chat_id
+                ),
+                daemon=True,
+                name="TradingLoop"
             )
-            
-            log("Bot stopped cleanly – exiting.", args.telegram_token, args.chat_id)
-            break
-        
+            trading_thread.start()
+            log("🚀 Trading loop started in background thread", args.telegram_token, args.chat_id)
+           
+            # Main thread is now blocked by Telegram polling
+            # Restart will happen when trading_loop exits on flag
+            # No break here - polling keeps main thread alive
+       
         except Exception as e:
             import traceback
             error_msg = f"BOT CRASHED → RESTARTING IN 15s\n{traceback.format_exc()}"
