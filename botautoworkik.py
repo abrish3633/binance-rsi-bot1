@@ -2736,22 +2736,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("\n".join(status_lines), parse_mode='Markdown')
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command: /help — show available commands"""
-    chat_id = str(update.effective_chat.id)
-    
-    if chat_id != str(args.chat_id):
-        await update.message.reply_text("❌ Unauthorized.")
-        return
-    
-    help_text = (
-        "🤖 *Available Commands:*\n\n"
-        "/status - Show bot status (balance, position, memory)\n"
-        "/restart - Gracefully restart the bot (preserves positions)\n"
-        "/help - Show this help message"
-    )
-    await update.message.reply_text(help_text, parse_mode='Markdown')
-
 # Handle all messages that aren't commands
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -2972,16 +2956,11 @@ if __name__ == "__main__":
                     retry_count = 0
                     while retry_count < 5:  # allow more retries
                         try:
-                            # Create new event loop for this thread
-                            loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(loop)
-                            
                             application = Application.builder().token(args.telegram_token).build()
                             
                             # Add command handlers
                             application.add_handler(CommandHandler("restart", cmd_restart))
                             application.add_handler(CommandHandler("status", cmd_status))
-                            application.add_handler(CommandHandler("help", cmd_help))
                             application.add_handler(MessageHandler(None, unknown))
                             
                             log(f"📱 Telegram listener starting (attempt {retry_count+1})...", 
@@ -2999,11 +2978,6 @@ if __name__ == "__main__":
                             log(f"Telegram listener fatal error: {e}", 
                                 args.telegram_token, args.chat_id)
                             break
-                        finally:
-                            try:
-                                loop.close()
-                            except:
-                                pass
                 
                 threading.Thread(
                     target=start_telegram_listener_with_retry,
