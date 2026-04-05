@@ -2402,10 +2402,22 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                     log("❌ Fill failed or too small (qty < 0.1) - skipping trade", telegram_bot, telegram_chat_id)
                     pending_entry = False
                     continue
-                if actual_fill_price is None:
-                    actual_fill_price = entry_price
                 
-                actual_fill_price_dec = actual_fill_price  # Keep as Decimal
+                # === FIX: Define actual_fill_price ===
+                actual_fill_price = entry_price  # Use candle close as default
+                
+                # Try to get actual fill price from Binance
+                try:
+                    trades = client.send_signed_request("GET", "/fapi/v1/userTrades", {
+                        "symbol": symbol,
+                        "limit": 1
+                    })
+                    if trades and len(trades) > 0:
+                        actual_fill_price = Decimal(str(trades[-1].get("price", str(entry_price))))
+                except Exception as e:
+                    log(f"Could not fetch fill price, using entry_price: {e}", telegram_bot, telegram_chat_id)
+                
+                actual_fill_price_dec = actual_fill_price
                 
                 # === RECALCULATE ALL LEVELS WITH ACTUAL FILL PRICE ===
                 R = actual_fill_price_dec * SL_PCT
