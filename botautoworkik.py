@@ -936,16 +936,6 @@ def _request_stop(signum: Optional[int] = None, frame: Any = None, symbol: Optio
             bot_state._orders_cancelled = True
     bot_state._position_closure_in_progress = False
     
-    # Final cleanup
-    with bot_state._stop_lock:
-        if not bot_state._orders_cancelled:
-            try:
-                bot_state.client.cancel_all_open_orders(symbol)
-                log(f"All open orders cancelled for {symbol}.", telegram_bot, telegram_chat_id)
-            except Exception as e:
-                log(f"Failed to cancel open orders: {e}", telegram_bot, telegram_chat_id)
-            bot_state._orders_cancelled = True
-    bot_state._position_closure_in_progress = False
 # ------------------- TIME SYNC -------------------
 def check_time_offset(base_url: str) -> Optional[float]:
     try:
