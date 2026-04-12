@@ -817,6 +817,7 @@ def daily_memory_log(bot: Optional[str] = None, chat_id: Optional[str] = None):
     except Exception as e:
         log(f"❌ Memory log error: {e}", bot, chat_id)
 # ------------------- STOP HANDLER (IDEMPOTENT) WITH DECIMAL -------------------
+# ------------------- STOP HANDLER (IDEMPOTENT) WITH DECIMAL -------------------
 def _request_stop(signum: Optional[int] = None, frame: Any = None, symbol: Optional[str] = None, telegram_bot: Optional[str] = None, telegram_chat_id: Optional[str] = None):
     global bot_state
     with bot_state._stop_lock:
@@ -825,42 +826,56 @@ def _request_stop(signum: Optional[int] = None, frame: Any = None, symbol: Optio
             return
         bot_state.STOP_REQUESTED = True
     
-    # ADD THIS: Set flag to prevent monitor_trade from also processing closure
     bot_state._position_closure_in_progress = True
     
     log("Stop requested. Closing positions and cancelling orders...", telegram_bot, telegram_chat_id)
     
     if not bot_state.client or not symbol:
-        log("Client or symbol not defined; skipping position closure and order cancellation.", telegram_bot, telegram_chat_id)
-        bot_state._position_closure_in_progress = False  # CLEAR FLAG
+        log("Client or symbol not defined; skipping position closure.", telegram_bot, telegram_chat_id)
+        bot_state._position_closure_in_progress = False
         return
     
     try:
         pos_resp = bot_state.client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-        positions = pos_resp['data'] if isinstance(pos_resp, dict) and 'data' in pos_resp else pos_resp if isinstance(pos_resp, list) else []
-        pos_item = next((p for p in positions if p.get("symbol") == symbol), None)
-        pos_amt = Decimal(str(pos_item.get("positionAmt", "0"))) if pos_item else Decimal('0')
+        positions = pos_resp.get('data') if isinstance(pos_resp, dict) and 'data' in pos_resp else (pos_resp if isinstance(pos_resp, list) else [])
         
-        if pos_amt != Decimal('0'):
+        for p in positions if isinstance(positions, list) else [positions]:
+            if not isinstance(p, dict) or p.get("symbol") != symbol:
+                continue
+                
+            pos_amt = Decimal(str(p.get("positionAmt", "0")))
+            if pos_amt == Decimal('0'):
+                continue
+                
             side = "SELL" if pos_amt > Decimal('0') else "BUY"
             qty = abs(pos_amt)
-            entry_price_dec = Decimal(str(pos_item.get("entryPrice", "0"))) if pos_item else Decimal('0')
-            entry_price_f = float(entry_price_dec)
+            entry_price_dec = Decimal(str(p.get("entryPrice", "0")))
             
-            # Place market close
+            # Min notional guard
+            try:
+                price = Decimal(str(bot_state.client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})["price"]))
+                notional = qty * price
+                if notional < Decimal('5'):
+                    log(f"⚠️ Position too small (${notional:.2f}) - skip close", telegram_bot, telegram_chat_id)
+                    continue
+            except:
+                pass
+            
+            # Safe close with reduceOnly - THIS FIXES THE -4164 ERROR
             response = bot_state.client.send_signed_request("POST", "/fapi/v1/order", {
                 "symbol": symbol,
                 "side": side,
                 "type": "MARKET",
-                "quantity": str(qty)
+                "quantity": str(qty),
+                "reduceOnly": "true"
             })
             market_order_id = response.get("orderId")
-            log(f"Closed position: qty={qty} {side} (orderId: {market_order_id})", telegram_bot, telegram_chat_id)
+            log(f"Closed position: qty={qty} {side} (reduceOnly)", telegram_bot, telegram_chat_id)
             
-            # === Get EXACT fill price from userTrades (not ticker fallback) ===
+            # === Get EXACT fill price from userTrades ===
             exit_price_dec: Optional[Decimal] = None
             if market_order_id:
-                time.sleep(0.8) # Allow fill propagation
+                time.sleep(0.8)
                 try:
                     trades = bot_state.client.send_signed_request("GET", "/fapi/v1/userTrades", {
                         "symbol": symbol,
@@ -869,7 +884,6 @@ def _request_stop(signum: Optional[int] = None, frame: Any = None, symbol: Optio
                     })
                     filled_trades = [t for t in trades if Decimal(str(t.get("qty", "0"))) > Decimal('0')]
                     if filled_trades:
-                        # Use last fill (most accurate)
                         exit_price_dec = Decimal(str(filled_trades[-1]["price"]))
                 except Exception as e:
                     log(f"Failed to fetch exact fill from userTrades: {e}", telegram_bot, telegram_chat_id)
@@ -882,9 +896,6 @@ def _request_stop(signum: Optional[int] = None, frame: Any = None, symbol: Optio
                 except Exception as e:
                     log(f"Ticker fallback failed: {e}", telegram_bot, telegram_chat_id)
                     exit_price_dec = Decimal("0")
-            
-            exit_price_f = float(exit_price_dec)
-            R_float = float(entry_price_dec * SL_PCT)
             
             # Log PNL with Decimal values
             pnl_row = log_pnl(
@@ -924,6 +935,7 @@ def _request_stop(signum: Optional[int] = None, frame: Any = None, symbol: Optio
                 log(f"Failed to cancel open orders: {e}", telegram_bot, telegram_chat_id)
             bot_state._orders_cancelled = True
     bot_state._position_closure_in_progress = False
+    
 # ------------------- TIME SYNC -------------------
 def check_time_offset(base_url: str) -> Optional[float]:
     try:
@@ -1757,12 +1769,10 @@ def recover_existing_positions(client, symbol, tick_size, telegram_bot, telegram
             log(f"📊 Found existing position: {abs(pos_amt)} SOL (orders active on Binance)", 
                 telegram_bot, telegram_chat_id)
             
-            # Get position details
             pos = fetch_open_positions_details(client, symbol, telegram_bot, telegram_chat_id)
             if pos:
                 entry_price = Decimal(str(pos.get('entryPrice', '0')))
                 
-                # Create trade state for monitoring only
                 trade_state = TradeState()
                 trade_state.active = True
                 trade_state.side = "LONG" if pos_amt > 0 else "SHORT"
@@ -1770,20 +1780,17 @@ def recover_existing_positions(client, symbol, tick_size, telegram_bot, telegram
                 trade_state.entry_price = entry_price
                 trade_state.risk = entry_price * SL_PCT
                 trade_state.entry_close_time = int(time.time() * 1000)
+                trade_state.sl = entry_price * (Decimal("1") - SL_PCT) if trade_state.side == "LONG" else entry_price * (Decimal("1") + SL_PCT)
+                trade_state.initial_sl = trade_state.sl
                 
-                # Store in bot_state
-                with bot_state._restart_lock:  # Use existing restart_lock
+                log(f"Recovered {trade_state.side} | Entry: {entry_price:.4f} | Qty: {abs(pos_amt)} | SL restored", 
+                    telegram_bot, telegram_chat_id)
+                
+                with bot_state._restart_lock:
                     bot_state.current_trade = trade_state
                 
-                # Start monitoring (orders already on Binance!)
-                threading.Thread(
-                    target=monitor_trade,
-                    args=(client, symbol, trade_state, tick_size, 
-                          telegram_bot, telegram_chat_id, int(time.time() * 1000)),
-                    daemon=True
-                ).start()
-                
-                log("✅ Position recovery complete - monitoring resumed (orders untouched)", 
+                # REMOVED: threading.Thread start - let trading loop handle monitoring
+                log("✅ Position recovered - trading loop will resume monitoring", 
                     telegram_bot, telegram_chat_id)
     except Exception as e:
         log(f"❌ Position recovery error: {e}", telegram_bot, telegram_chat_id)
@@ -1941,6 +1948,8 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
                     # === POSITION CLOSED – DETERMINE EXACT REASON & FILL PRICE ===
                     log("Position closed (verified via positionAmt == 0). Determining exit reason and exact fill price...", telegram_bot, telegram_chat_id)
                     trade_state.active = False
+                    bot_state.current_trade = None          # ← ADD THIS LINE
+                    bot_state._polling_active = False
                     # Give Binance time to finalize internal state
                     time.sleep(1.2)
                     reason = "Unknown"
@@ -2106,16 +2115,20 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
             except Exception as e:
                 log(f"Error closing WebSocket: {e}", telegram_bot, telegram_chat_id)
 
-# ------------------- TRADING LOOP WITH DECIMAL -------------------
 def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_per_day: int, risk_pct: Decimal, max_daily_loss_pct: Decimal, tp_mult: Decimal, use_trailing: bool, prevent_same_bar: bool, require_no_pos: bool, use_max_loss: bool, use_volume_filter: bool, telegram_bot: Optional[str], telegram_chat_id: Optional[str]):
     global bot_state
-    global last_news_guard_msg, news_guard_was_active
-    global last_no_klines_log
   
-    interval_seconds = interval_ms(timeframe) / 1000.0
     trades_today = 0
-    last_processed_time = 0
-    trade_state = TradeState()
+    last_trade_date = datetime.now(timezone.utc).date()
+    
+    # === CRITICAL: Link to recovered trade state ===
+    if bot_state.current_trade and bot_state.current_trade.active:
+        trade_state = bot_state.current_trade
+        log(f"🔄 Using RECOVERED {trade_state.side} position @ {trade_state.entry_price:.4f} — monitoring only", 
+            telegram_bot, telegram_chat_id)
+    else:
+        trade_state = TradeState()
+
     qty_api: Optional[Decimal] = None
     pending_entry = False
   
@@ -2127,22 +2140,53 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
     min_notional = filters['minNotional']
     bot_state.max_trades_alert_sent = False
   
-    last_trade_date = datetime.now(timezone.utc).date()
     log(f"Bot started on {last_trade_date}. Trades today: {trades_today}", telegram_bot, telegram_chat_id)
     log(f"Starting bot with symbol={symbol}, timeframe={timeframe}, risk_pct={risk_pct*Decimal('100'):.1f}%")
     
-    # === MAIN TRADING LOOP — WITH DECIMAL CONSISTENCY ===
+    # === MAIN TRADING LOOP ===
     while not bot_state.STOP_REQUESTED and not os.path.exists("stop.txt"):
         try:
-            # === IF IN TRADE → STAY COMPLETELY SILENT UNTIL EXIT ===
+            # === DESYNC RECOVERY: Re-sync with Binance if state is desynced ===
+            # This handles restarts mid-day or unexpected position changes
+            if not trade_state.active:
+                actual_pos_amt = get_position_amt(client, symbol, telegram_bot, telegram_chat_id)
+                if actual_pos_amt != Decimal('0') and not bot_state._position_closure_in_progress:
+                    log(f"🔄 DESYNC DETECTED: Bot thinks flat but Binance has {actual_pos_amt} SOL. Recovering...",
+                        telegram_bot, telegram_chat_id)
+                    # Recover the position
+                    pos = fetch_open_positions_details(client, symbol, telegram_bot, telegram_chat_id)
+                    if pos:
+                        entry_price = Decimal(str(pos.get('entryPrice', '0')))
+                        trade_state.active = True
+                        trade_state.side = "LONG" if actual_pos_amt > 0 else "SHORT"
+                        trade_state.qty = abs(actual_pos_amt)
+                        trade_state.entry_price = entry_price
+                        trade_state.risk = entry_price * SL_PCT
+                        trade_state.entry_close_time = int(time.time() * 1000)
+                        trade_state.sl = entry_price * (Decimal("1") - SL_PCT) if trade_state.side == "LONG" else entry_price * (Decimal("1") + SL_PCT)
+                        trade_state.initial_sl = trade_state.sl
+                        bot_state.current_trade = trade_state
+                        log(f"✅ Desync recovered: {trade_state.side} @ {entry_price:.4f}",
+                            telegram_bot, telegram_chat_id)
+                        # Continue to monitor_trade below
+                    else:
+                        log("⚠️ Could not recover desync - position data missing", telegram_bot, telegram_chat_id)
+                        time.sleep(5)
+                        continue
+
+            # === IF IN TRADE → MONITOR ONLY ===
             if trade_state.active:
                 monitor_trade(
                     client, symbol, trade_state, tick_size,
                     telegram_bot, telegram_chat_id,
                     trade_state.entry_close_time or int(time.time() * 1000)
                 )
-                continue  # Back to loop after trade ends
-            
+                # After monitor_trade returns, trade_state.active is False
+                # Continue to next iteration - don't immediately enter new trade
+                # Give Binance time to fully settle
+                time.sleep(2)
+                continue
+
             # === DAILY RESET ===
             now_date = datetime.now(timezone.utc).date()
             if last_trade_date != now_date:
@@ -2152,14 +2196,16 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 bot_state.max_trades_alert_sent = False
                 daily_start_balance = fetch_balance(client)
                 log(f"NEW DAY → {old_date} → {now_date} | Trades reset | Equity: ${daily_start_balance:.2f}", telegram_bot, telegram_chat_id)
-            
+
+            # === MAX TRADES CHECK ===
             if trades_today >= max_trades_per_day:
                 if not bot_state.max_trades_alert_sent:
                     log(f"Max trades reached ({max_trades_per_day}). No more today.", telegram_bot, telegram_chat_id)
                     bot_state.max_trades_alert_sent = True
                 time.sleep(60)
                 continue
-            
+
+            # === TRADING ALLOWED CHECK ===
             if not trading_allowed(client, symbol, telegram_bot, telegram_chat_id):
                 time.sleep(1)
                 continue
@@ -2169,7 +2215,6 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
             
             # === FETCH KLINES & VALIDATE QUALITY ===
             klines = fetch_klines(client, symbol, timeframe)
-            # Rough detection based on key pattern (testnet keys often start with specific prefixes)
             bot_state.is_testnet = True
             is_good, msg = ensure_tv_quality_data(klines, timeframe, is_testnet=bot_state.is_testnet)
             if not is_good:
@@ -2178,10 +2223,10 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 continue
             
             latest_close_ms = int(klines[-1][6])
-            # Optional: Warn if data appears stale (non-blocking, just visibility)
+            # Warn if data appears stale (non-blocking)
             now_ms = int(time.time() * 1000)
             stale_minutes = (now_ms - latest_close_ms) / 60000
-            if stale_minutes > 90:  # More than 1.5 hours behind → likely connection issue
+            if stale_minutes > 90:
                 log(f"⚠️ Warning: Latest candle is {stale_minutes:.1f} minutes old — possible delay in data feed",
                     telegram_bot, telegram_chat_id)
             
@@ -2195,26 +2240,19 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 continue
             
             bot_state.last_processed_close_ms = latest_close_ms
-            # ────────────────────────────────────────────────
-            # Heartbeat: log status once per candle (every ~45m)
-            # ────────────────────────────────────────────────
+            
+            # === HEARTBEAT LOG ===
             try:
                 now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
                 price_now = Decimal("0")
                 pos_status = "Flat"
 
-                # Quick current price (non-blocking)
                 try:
                     ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
                     price_now = Decimal(str(ticker.get("price", "0")))
                 except:
-                    price_now = close_price  # fallback to last close
+                    price_now = close_price
 
-                # Position status
-                if trade_state.active:
-                    pos_status = f"Active {trade_state.side} @ {trade_state.entry_price:.4f}"
-
-                # Memory usage
                 mem_str = "N/A"
                 try:
                     import psutil
@@ -2242,25 +2280,22 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
             is_green_candle = close_price > open_price
             closes, volumes, _, _ = closes_and_volumes_from_klines(klines)
             
-            # RSI calculation now uses Decimal list
+            # === INDICATORS ===
             rsi = compute_rsi(closes)
-            
-            # SMA calculation now uses Decimal list
             vol_sma15 = sma(volumes, VOL_SMA_PERIOD) if len(volumes) >= VOL_SMA_PERIOD else None
             
-            # Format state string with Decimal values
+            # Format state string
             rsi_str = f"{rsi:.2f}" if rsi else "None"
             vol_sma15_str = f"{vol_sma15:.2f}" if vol_sma15 else "None"
             state = f"{close_price:.4f}|{rsi_str}|{curr_vol:.0f}|{vol_sma15_str}|{'G' if is_green_candle else 'R'}"
             
             if bot_state.last_candle_state is None or state != bot_state.last_candle_state:
-                # Create display variables for the log message
                 rsi_display = f"{rsi:.2f}" if rsi else "N/A"
                 vol_sma15_display = f"{vol_sma15:.2f}" if vol_sma15 else "N/A"
                 log(f"Candle: {close_price:.4f} RSI={rsi_display} Vol={curr_vol:.0f} SMA15={vol_sma15_display} {'Green' if is_green_candle else 'Red'}", telegram_bot, telegram_chat_id)
                 bot_state.last_candle_state = state
             
-            # Volume comparison uses Decimal
+            # === SIGNAL DETECTION ===
             buy_signal = (rsi and BUY_RSI_MIN <= rsi <= BUY_RSI_MAX and is_green_candle and (not use_volume_filter or (vol_sma15 and curr_vol > vol_sma15)))
             sell_signal = (rsi and SELL_RSI_MIN <= rsi <= SELL_RSI_MAX and not is_green_candle and (not use_volume_filter or (vol_sma15 and curr_vol > vol_sma15)))
             
@@ -2268,7 +2303,7 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 side_text = "BUY" if buy_signal else "SELL"
                 log(f"Signal on candle close → {side_text}. Preparing entry.", telegram_bot, telegram_chat_id)
                 pending_entry = True
-                entry_price = close_price  # Already Decimal
+                entry_price = close_price
                 
                 # === SLIPPAGE GUARD ===
                 MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")
@@ -2298,7 +2333,6 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                         slippage_pct = Decimal("0")
                         source = "none (disabled)"
                 
-                # Final decision with Decimal comparison
                 if slippage_pct and slippage_pct > MAX_ENTRY_SLIPPAGE_PCT:
                     current_price_str = f"{current_price:.4f}" if current_price else "N/A"
                     log(
@@ -2319,7 +2353,7 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                         telegram_bot, telegram_chat_id
                     )
                 
-                # === CALCULATE RISK & LEVELS WITH DECIMAL ===
+                # === CALCULATE RISK & LEVELS ===
                 if buy_signal:
                     sl_price_dec = entry_price * (Decimal("1") - SL_PCT)
                     R = entry_price * SL_PCT
@@ -2342,10 +2376,9 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 qty_raw = risk_amount_usd / R
                 qty = min(qty_raw, max_qty_by_leverage)
                 qty = qty * Decimal("0.75")
-                qty = min(qty, Decimal("25"))  # Hard cap of 250
+                qty = min(qty, Decimal("25"))
                 qty_api = quantize_qty(qty, step_size)
                 
-                # MIN_NOTIONAL check with Decimal
                 if (qty_api * entry_price) < min_notional:
                     log(f"Qty too small → SKIP (Notional: {qty_api * entry_price:.2f} < Min: {min_notional:.2f})", telegram_bot, telegram_chat_id)
                     pending_entry = False
@@ -2365,34 +2398,38 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 log(f"Market order placed: {order_res}", telegram_bot, telegram_chat_id)
                 
                 start_time = time.time()
-                actual_qty: Optional[Decimal] = None
+                actual_qty = None
                 
-                while not bot_state.STOP_REQUESTED:
-                    pos = fetch_open_positions_details(client, symbol)
-                    pos_amt = Decimal(str(pos.get("positionAmt", "0"))) if pos else Decimal('0')
-                    if pos_amt != Decimal('0'):
+                while time.time() - start_time < ORDER_FILL_TIMEOUT:
+                    pos_amt = get_position_amt(client, symbol)
+                    if abs(pos_amt) > Decimal('0.1'):
                         actual_qty = abs(pos_amt)
                         break
-                    if time.time() - start_time > ORDER_FILL_TIMEOUT:
-                        log("Order fill timeout. Cancelling.", telegram_bot, telegram_chat_id)
-                        pending_entry = False
-                        break
-                    time.sleep(0.5)
+                    time.sleep(0.4)
                 
-                if actual_qty is None:
+                if actual_qty is None or actual_qty < Decimal('0.1'):
+                    log("❌ Fill failed or too small (qty < 0.1) - skipping trade", telegram_bot, telegram_chat_id)
                     pending_entry = False
                     continue
                 
-                actual_fill_price = client.get_latest_fill_price(symbol, order_res.get("orderId"))
-                if actual_fill_price is None:
-                    actual_fill_price = entry_price
+                # Get actual fill price
+                actual_fill_price = entry_price
+                try:
+                    trades = client.send_signed_request("GET", "/fapi/v1/userTrades", {
+                        "symbol": symbol,
+                        "limit": 1
+                    })
+                    if trades and len(trades) > 0:
+                        actual_fill_price = Decimal(str(trades[-1].get("price", str(entry_price))))
+                except Exception as e:
+                    log(f"Could not fetch fill price, using entry_price: {e}", telegram_bot, telegram_chat_id)
                 
-                actual_fill_price_dec = actual_fill_price  # Keep as Decimal
+                actual_fill_price_dec = actual_fill_price
                 
                 # === RECALCULATE ALL LEVELS WITH ACTUAL FILL PRICE ===
                 R = actual_fill_price_dec * SL_PCT
                 
-                if buy_signal:  # LONG
+                if buy_signal:
                     sl_price_dec = actual_fill_price_dec * (Decimal("1") - SL_PCT)
                     sl_rounding = ROUND_DOWN
                     tp_price_dec = actual_fill_price_dec + (TP_MULT * R)
@@ -2400,7 +2437,7 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                     trail_raw = actual_fill_price_dec + (TRAIL_TRIGGER_MULT * R)
                     trail_buffered = trail_raw + TRAIL_PRICE_BUFFER
                     trail_activation_quant = quantize_price(trail_buffered, tick_size, ROUND_UP)
-                else:  # SHORT
+                else:
                     sl_price_dec = actual_fill_price_dec * (Decimal("1") + SL_PCT)
                     sl_rounding = ROUND_UP
                     tp_price_dec = actual_fill_price_dec - (TP_MULT * R)
@@ -2411,27 +2448,30 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 
                 sl_price_quant = quantize_price(sl_price_dec, tick_size, sl_rounding)
                 tp_price_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
-                final_trail_activation = trail_activation_quant  # Already Decimal
+                final_trail_activation = trail_activation_quant
                 
-                # === ACTIVATE TRADE STATE WITH DECIMAL VALUES ===
+                # === ACTIVATE TRADE STATE ===
                 trade_state.active = True
-                trade_state.entry_price = actual_fill_price_dec  # Store as Decimal
-                trade_state.risk = R  # Store as Decimal
-                trade_state.qty = actual_qty  # Store as Decimal
+                trade_state.entry_price = actual_fill_price_dec
+                trade_state.risk = R
+                trade_state.qty = actual_qty
                 trade_state.side = "LONG" if buy_signal else "SHORT"
                 trade_state.entry_close_time = latest_close_ms
-                trade_state.initial_sl = sl_price_quant  # Store as Decimal
-                trade_state.sl = sl_price_quant  # Store as Decimal
-                trade_state.tp = tp_price_quant  # Store as Decimal
+                trade_state.initial_sl = sl_price_quant
+                trade_state.sl = sl_price_quant
+                trade_state.tp = tp_price_quant
                 trade_state.trail_activated = False
-                trade_state.trail_activation_price = final_trail_activation  # Store as Decimal
+                trade_state.trail_activation_price = final_trail_activation
+                
+                # Store in global state for recovery
+                bot_state.current_trade = trade_state
                 
                 log(f"DEBUG: Stored trail_activation_price = {final_trail_activation:.4f} in trade_state", telegram_bot, telegram_chat_id)
                 log(f"Position opened: {trade_state.side}, qty={actual_qty}, entry={actual_fill_price_dec:.4f}, "
                     f"sl={sl_price_quant:.4f}, tp={tp_price_quant:.4f}, trail_activation={final_trail_activation:.4f}",
                     telegram_bot, telegram_chat_id)
                 
-                # Telegram message with Decimal values
+                # Telegram message
                 tg_msg = (
                     f"NEW TRADE\n"
                     f"━━━━━━━━━━━━━━━━\n"
@@ -2451,25 +2491,24 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 place_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
                 trades_today += 1
                 pending_entry = False
+                
+                # Start monitoring
                 monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, latest_close_ms)
+                
             else:
                 if not pending_entry:
                     log("No trade signal on candle close.", telegram_bot, telegram_chat_id)
             
-            # === PERFECT 45m WAIT — BINANCE SERVER TIME ALIGNED ===
+            # === WAIT FOR NEXT CANDLE ===
             if timeframe == "45m":
                 try:
-                    # get Binance server time (ms)
                     server_time = int(client.public_request("/fapi/v1/time")["serverTime"])
                 except Exception as e:
                     log(f"Failed to fetch server time: {e}", telegram_bot, telegram_chat_id)
-                    # fallback to local time
                     server_time = int(time.time() * 1000)
-                # true 45-minute grid using server time
                 interval = interval_ms(timeframe)
                 next_close_ms = ((server_time // interval) * interval) + interval
             else:
-                # Native Binance alignment for other timeframes
                 try:
                     server_time = int(client.public_request("/fapi/v1/time")["serverTime"])
                 except Exception as e:
@@ -2478,7 +2517,6 @@ def trading_loop(client: BinanceClient, symbol: str, timeframe: str, max_trades_
                 interval = interval_ms(timeframe)
                 next_close_ms = ((server_time // interval) * interval) + interval
             
-            # === WAIT ===
             now_ms = int(time.time() * 1000)
             wait_sec = max(2.0, (next_close_ms - now_ms) / 1000.0 + 2.0)
             next_dt_log = datetime.fromtimestamp(next_close_ms / 1000, tz=timezone.utc)
@@ -2544,7 +2582,7 @@ def _safe_sleep(total_seconds: float):
 import pickle
 
 # ------------------- PERSISTENT STATE MANAGEMENT -------------------
-STATE_FILE = 'bot_state.pkl'
+STATE_FILE = 'bot_state_rsi.pkl'
 
 def save_bot_state():
     """Save critical bot state to disk"""
@@ -2620,58 +2658,46 @@ def run_scheduler(bot: Optional[str], chat_id: Optional[str]):
             send_monthly_report(bot, chat_id) 
             last_month = current_date.month
     def daily_restart_job():
-        """Safe daily restart - preserves positions + forces One-Way mode after restart"""
+        """Safe daily restart - preserves positions, really restarts process"""
         global bot_state
         
-        log("🔄 Daily restart triggered...", bot, chat_id)
+        # Check for active position
+        has_position = False
+        position_details = ""
+        if (bot_state.client and hasattr(bot_state, 'current_trade') and 
+            bot_state.current_trade and bot_state.current_trade.active and bot_state.current_trade.qty):
+            has_position = True
+            position_details = (f"{bot_state.current_trade.side} "
+                               f"{bot_state.current_trade.qty} SOL "
+                               f"@ {bot_state.current_trade.entry_price:.2f}")
         
-        # === Save state first ===
+        log("🔄 DAILY RESTART: Starting real process restart...", 
+            bot, chat_id)
+        
+        # Save state
         try:
             save_bot_state()
-            log("💾 Bot state saved before restart", bot, chat_id)
+            log("💾 State saved - trades preserved", bot, chat_id)
         except Exception as e:
             log(f"⚠️ State save warning: {e}", bot, chat_id)
-
-        # === Check for active position (more reliable) ===
-        has_position = False
-        position_details = "No active position"
         
-        try:
-            # Check bot internal state
-            if (bot_state.current_trade and 
-                bot_state.current_trade.active and 
-                bot_state.current_trade.qty):
-                has_position = True
-                position_details = (f"{bot_state.current_trade.side} "
-                                  f"{bot_state.current_trade.qty:.4f} SOL "
-                                  f"@ {bot_state.current_trade.entry_price:.4f}")
-            
-            # Also double-check real Binance position
-            real_pos = get_position_amt(bot_state.client, args.symbol) if bot_state.client else Decimal('0')
-            if real_pos != Decimal('0'):
-                has_position = True
-                position_details = f"Binance position: {abs(real_pos):.4f} SOL (orders preserved)"
-        except Exception as e:
-            log(f"Position check during restart failed: {e}", bot, chat_id)
-
-        # === Notify user ===
+        # Notify about position status
         if has_position:
-            msg = (f"🔄 **Daily Restart**\n"
-                   f"📊 Position will be **preserved**\n"
+            msg = (f"🔄 Daily restart - POSITION PRESERVED!\n"
                    f"{position_details}\n"
-                   f"SL/TP/Trailing orders remain active on Binance\n"
-                   f"One-Way mode will be re-forced after restart.")
+                   f"SL/TP orders remain active on Binance")
             telegram_post(bot, chat_id, msg)
-            log(f"✅ Active position preserved: {position_details}", bot, chat_id)
+            log(f"✅ Active position preserved: {position_details}", 
+                bot, chat_id)
         else:
-            telegram_post(bot, chat_id, "🔄 Daily restart starting - no active positions detected")
-
-        time.sleep(3)  # Give Telegram time to send messages
-
-        log("🚀 Executing process restart now (One-Way mode will be forced on next start)", 
-            bot, chat_id)
-
+            telegram_post(bot, chat_id, 
+                         "🔄 Daily restart - no active positions")
+        
+        time.sleep(2)  # Let messages send
+        
         # ===== REAL PROCESS RESTART =====
+        log("🚀 Restarting Python process NOW - positions safe on Binance", 
+            bot, chat_id)
         import os, sys
         os.execv(sys.executable, [sys.executable] + sys.argv)
     # Schedule all tasks using the schedule library for reliability
@@ -2749,8 +2775,6 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     time.sleep(1)
     
     # ===== REAL PROCESS RESTART =====
-    log("🚀 Executing manual restart now (One-Way mode will be forced)", 
-        args.telegram_token, args.chat_id)
     import os, sys
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
